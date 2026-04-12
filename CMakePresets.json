@@ -1,0 +1,34 @@
+{
+  "version": 8,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 28,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "windows-x64",
+      "displayName": "Windows x64",
+      "description": "Build for Windows x64 using MSVC",
+      "binaryDir": "${sourceDir}/build_x64",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "warnings": {
+        "dev": true,
+        "deprecated": true
+      },
+      "cacheVariables": {
+        "ENABLE_FRONTEND_API": true
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "windows-x64",
+      "configurePreset": "windows-x64",
+      "displayName": "Windows x64",
+      "description": "Windows build for x64",
+      "configuration": "RelWithDebInfo"
+    }
+  ]
+}

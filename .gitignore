@@ -1,0 +1,45 @@
+# CMake
+CMakeCache.txt
+CMakeFiles
+CMakeScripts
+Testing
+Makefile
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+_deps
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Visual Studio
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.obj
+*.exe
+*.dll
+*.lib
+*.ilk
+*.pdb
+
+# Build output
+build_x64/
+out/
+bin/
+
+# IDEs
+.idea/
+.vscode/
+
+# VS Code / Cursor AI
+.gemini/
