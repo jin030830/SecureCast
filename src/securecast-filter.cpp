@@ -65,16 +65,21 @@ void FrameRingBuffer::pushFrame(obs_source_t* source, uint64_t timestamp)
     // HEAD 슬롯의 텍스처를 렌더 타겟(RT)으로 설정
     gs_texture_t* rt = m_slots[m_head].texture;
     gs_set_render_target(rt, nullptr);
+    gs_viewport(0, 0, m_width, m_height);
+    
+    // [Fix] 투영 행렬을 텍스처 좌표계(0,0 ~ w,h)에 맞게 설정
+    gs_matrix_push();
+    gs_matrix_identity();
+    gs_ortho(0.0f, (float)m_width, 0.0f, (float)m_height, -100.0f, 100.0f);
 
-    // [P0 수정] gs_clear에 반드시 유효한 vec4* 전달 (nullptr 전달 시 크래시)
     struct vec4 clearColor;
     vec4_zero(&clearColor);
     gs_clear(GS_CLEAR_COLOR, &clearColor, 1.0f, 0);
 
-    // 상위(Parent) 소스의 현재 프레임을 RT에 복사 (OBS 내장 함수)
+    // 상위(Parent) 소스의 현재 프레임을 RT에 복사
     obs_source_video_render(source);
 
-    // 렌더 타겟 해제 (OBS 기본 RT로 복귀)
+    gs_matrix_pop();
     gs_set_render_target(nullptr, nullptr);
 
     m_slots[m_head].timestamp = timestamp;
