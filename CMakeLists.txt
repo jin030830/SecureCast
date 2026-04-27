@@ -4,16 +4,13 @@ include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/common/bootstrap.cmake" NO_POLICY_SCO
 
 project(securecast VERSION 1.0.0)
 
-# ---------------------------------------------------------------
-# C++ 표준 설정 (Role C: std::atomic, std::thread 등 필수)
-# ---------------------------------------------------------------
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
-# ---------------------------------------------------------------
-# 빌드 옵션
-# ---------------------------------------------------------------
 option(ENABLE_FRONTEND_API "Use obs-frontend-api for UI functionality" ON)
+option(ENABLE_QT "Use Qt functionality" OFF)
+
+include(compilerconfig)
+include(defaults)
+include(helpers)
+
 
 # ---------------------------------------------------------------
 # OBS SDK 탐색
