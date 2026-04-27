@@ -17,7 +17,7 @@ on:
   workflow_dispatch:
 
 env:
-  OBS_VERSION: '31.0.2'
+  OBS_VERSION: '31.1.1'
   PLUGIN_NAME: 'securecast'
 
 jobs:
