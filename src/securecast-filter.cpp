@@ -65,7 +65,7 @@ void FrameRingBuffer::pushFrame(obs_source_t* source, uint64_t timestamp)
     // HEAD 슬롯의 텍스처를 렌더 타겟(RT)으로 설정
     gs_texture_t* rt = m_slots[m_head].texture;
     gs_set_render_target(rt, nullptr);
-    gs_viewport(0, 0, m_width, m_height);
+    gs_set_viewport(0, 0, m_width, m_height);
     
     // [Fix] 투영 행렬을 텍스처 좌표계(0,0 ~ w,h)에 맞게 설정
     gs_matrix_push();
