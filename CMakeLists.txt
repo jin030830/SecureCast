@@ -39,4 +39,6 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
   src/securecast-filter.cpp
 )
 
-set_target_properties(${CMAKE_PROJECT_NAME} PROPERTIES PREFIX "")
+set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME securecast)
+
+setup_plugin_target(${CMAKE_PROJECT_NAME})
