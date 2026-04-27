@@ -1,11 +1,10 @@
 # =============================================================================
-# SecureCast OBS Plugin — Windows 빌드 워크플로우
+# SecureCast OBS Plugin — Windows 빌드 워크플로우 (Official Template 기반)
 #
-# 목적: Mac 개발자가 VMware 없이 클라우드에서 Windows용 DLL을 빌드
-# 트리거: 모든 브랜치 push, main PR, 수동 실행
-# 결과물: securecast.dll (GitHub Artifacts에서 다운로드 가능)
+# 목적: Mac 개발자가 클라우드에서 Windows용 DLL을 빌드
+# 해결: OBS 공식 템플릿의 워크플로우를 직접 호출하여 완벽한 SDK 환경 구축
 # =============================================================================
-name: Windows Build
+name: Build
 
 on:
   push:
@@ -16,151 +15,7 @@ on:
       - 'main'
   workflow_dispatch:
 
-env:
-  OBS_VERSION: '31.1.1'
-  PLUGIN_NAME: 'securecast'
-
 jobs:
-  build-windows:
-    name: 🔨 Windows x64 Build
-    runs-on: windows-latest
-
-    steps:
-      # ---------------------------------------------------------------
-      # Step 1: 소스 코드 체크아웃
-      # ---------------------------------------------------------------
-      - name: ✅ Checkout source code
-        uses: actions/checkout@v4
-
-      # ---------------------------------------------------------------
-      # Step 2: OBS Studio SDK 다운로드 (pre-built)
-      #
-      # external/obs-studio/는 .gitignore에 포함되어 GitHub에 올라가지 않음.
-      # 따라서 OBS 공식 릴리즈에서 pre-built 바이너리를 다운로드하고,
-      # 별도로 소스 헤더도 가져와서 CMake가 find_package(libobs)를 
-      # 성공할 수 있도록 CMAKE_PREFIX_PATH를 설정한다.
-      # ---------------------------------------------------------------
-      - name: 📦 Download OBS Studio SDK
-        shell: pwsh
-        run: |
-          $obsVersion = "${{ env.OBS_VERSION }}"
-          
-          # --- OBS 릴리즈 바이너리 (lib 파일 포함) 다운로드 ---
-          $obsUrl = "https://github.com/obsproject/obs-studio/releases/download/${obsVersion}/OBS-Studio-${obsVersion}-Windows-x64.zip"
-          Write-Host "Downloading OBS binaries from: $obsUrl"
-          Invoke-WebRequest -Uri $obsUrl -OutFile "obs-studio-bin.zip" -MaximumRetryCount 3
-          Expand-Archive -Path "obs-studio-bin.zip" -DestinationPath "${{ github.workspace }}/obs-sdk-bin"
-          
-          # --- OBS 소스 코드 (헤더 파일) 다운로드 ---
-          $srcUrl = "https://github.com/obsproject/obs-studio/archive/refs/tags/${obsVersion}.zip"
-          Write-Host "Downloading OBS source headers from: $srcUrl"
-          Invoke-WebRequest -Uri $srcUrl -OutFile "obs-studio-src.zip" -MaximumRetryCount 3
-          Expand-Archive -Path "obs-studio-src.zip" -DestinationPath "${{ github.workspace }}/obs-sdk-src"
-          
-          # --- 다운로드 확인 ---
-          Write-Host "=== OBS SDK Binaries ==="
-          Get-ChildItem "${{ github.workspace }}/obs-sdk-bin" -Recurse -Depth 2 | Select-Object FullName
-          Write-Host "=== OBS SDK Source ==="
-          Get-ChildItem "${{ github.workspace }}/obs-sdk-src" -Recurse -Depth 2 | Select-Object FullName
-
-      # ---------------------------------------------------------------
-      # Step 3: OBS SDK 구조 파악 및 CMAKE_PREFIX_PATH 설정
-      #
-      # OBS 릴리즈 ZIP의 구조에 맞추어 CMake가 libobs와 
-      # obs-frontend-api를 찾을 수 있도록 경로를 구성한다.
-      # ---------------------------------------------------------------
-      - name: 🔧 Setup OBS SDK paths
-        id: obs-paths
-        shell: pwsh
-        run: |
-          # OBS 릴리즈 바이너리에서 cmake 모듈 위치 찾기
-          $cmakeDir = Get-ChildItem "${{ github.workspace }}/obs-sdk-bin" -Recurse -Filter "LibObsConfig.cmake" -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($cmakeDir) {
-            $obsLibPath = $cmakeDir.DirectoryName
-            Write-Host "Found LibObsConfig.cmake at: $obsLibPath"
-            echo "OBS_CMAKE_PATH=$obsLibPath" >> $env:GITHUB_OUTPUT
-          } else {
-            Write-Host "WARNING: LibObsConfig.cmake not found in binaries. Will use source headers directly."
-          }
-          
-          # OBS 소스에서 헤더 디렉토리 찾기
-          $obsSrcDir = Get-ChildItem "${{ github.workspace }}/obs-sdk-src" -Directory | Select-Object -First 1
-          Write-Host "OBS source directory: $($obsSrcDir.FullName)"
-          echo "OBS_SRC_PATH=$($obsSrcDir.FullName)" >> $env:GITHUB_OUTPUT
-
-      # ---------------------------------------------------------------
-      # Step 4: CMake Configure
-      # ---------------------------------------------------------------
-      - name: 🛠️ CMake Configure
-        shell: pwsh
-        run: |
-          $prefixPaths = @()
-          
-          # OBS CMake 모듈 경로 추가
-          if ("${{ steps.obs-paths.outputs.OBS_CMAKE_PATH }}" -ne "") {
-            $prefixPaths += "${{ steps.obs-paths.outputs.OBS_CMAKE_PATH }}"
-            # 상위 경로도 추가 (cmake 구조에 따라 필요할 수 있음)
-            $parent = Split-Path "${{ steps.obs-paths.outputs.OBS_CMAKE_PATH }}" -Parent
-            $prefixPaths += $parent
-            $grandParent = Split-Path $parent -Parent
-            $prefixPaths += $grandParent
-          }
-          
-          # OBS SDK 바이너리 루트 추가
-          $prefixPaths += "${{ github.workspace }}/obs-sdk-bin"
-          
-          # OBS 소스 헤더 경로 추가
-          $obsSrc = "${{ steps.obs-paths.outputs.OBS_SRC_PATH }}"
-          if ($obsSrc -ne "") {
-            $prefixPaths += $obsSrc
-          }
-          
-          $prefixPathStr = $prefixPaths -join ";"
-          Write-Host "CMAKE_PREFIX_PATH: $prefixPathStr"
-          
-          cmake -B build `
-            -G "Visual Studio 17 2022" `
-            -A x64 `
-            -DCMAKE_PREFIX_PATH="$prefixPathStr" `
-            -DCMAKE_BUILD_TYPE=RelWithDebInfo `
-            -DENABLE_FRONTEND_API=ON `
-            -DCMAKE_SYSTEM_VERSION="10.0.19041.0"
-
-      # ---------------------------------------------------------------
-      # Step 5: CMake Build
-      # ---------------------------------------------------------------
-      - name: 🔨 CMake Build
-        run: cmake --build build --config RelWithDebInfo --parallel
-
-      # ---------------------------------------------------------------
-      # Step 6: 빌드 결과물 확인
-      # ---------------------------------------------------------------
-      - name: 🔍 Verify build output
-        shell: pwsh
-        run: |
-          Write-Host "=== Searching for built DLL ==="
-          $dll = Get-ChildItem "build" -Recurse -Filter "securecast.dll" -ErrorAction SilentlyContinue
-          if ($dll) {
-            Write-Host "✅ Found: $($dll.FullName)"
-            Write-Host "   Size: $([math]::Round($dll.Length / 1KB, 2)) KB"
-          } else {
-            Write-Host "⚠️ DLL not found. Listing all build outputs:"
-            Get-ChildItem "build" -Recurse -Include "*.dll","*.lib","*.pdb" | Select-Object FullName, Length
-          }
-
-      # ---------------------------------------------------------------
-      # Step 7: 결과물 업로드 (GitHub Artifacts)
-      #
-      # Actions 탭에서 다운로드 가능. 보존 기간: 30일
-      # ---------------------------------------------------------------
-      - name: 📤 Upload build artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: securecast-windows-x64
-          path: |
-            build/**/*.dll
-            build/**/*.pdb
-            src/**/*.effect
-            src/**/*.hlsl
-          retention-days: 30
-          if-no-files-found: warn
+  build-project:
+    name: Build Project 🧱
+    uses: obsproject/obs-plugintemplate/.github/workflows/build-project.yaml@master
