@@ -2,8 +2,23 @@ cmake_minimum_required(VERSION 3.28...3.30)
 
 project(securecast VERSION 1.0.0)
 
+# ---------------------------------------------------------------
+# C++ 표준 설정 (Role C: std::atomic, std::thread 등 필수)
+# ---------------------------------------------------------------
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# ---------------------------------------------------------------
+# 빌드 옵션
+# ---------------------------------------------------------------
 option(ENABLE_FRONTEND_API "Use obs-frontend-api for UI functionality" ON)
 
+# ---------------------------------------------------------------
+# OBS SDK 탐색
+#
+# 로컬 빌드: external/obs-studio/ 또는 시스템에 설치된 OBS에서 자동 탐색
+# CI 빌드(GitHub Actions): -DCMAKE_PREFIX_PATH 로 SDK 경로를 전달하면 됨
+# ---------------------------------------------------------------
 find_package(libobs REQUIRED)
 
 add_library(${CMAKE_PROJECT_NAME} MODULE)
