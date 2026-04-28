@@ -1,3 +1,16 @@
+// =============================================================================
+// securecast-filter.h — 필터 인스턴스의 공유 타입 정의
+//
+// 역할:
+//   하나의 OBS 소스에 부착된 SecureCast 필터 인스턴스가 들고 다니는 상태를
+//   정의. 이 헤더는 Role A/B/C 코드 모두가 include해서 같은 구조체를 본다.
+//
+// 어디서 사용:
+//   - securecast-filter.cpp: 인스턴스 생성/소멸/tick/render 콜백에서 직접 사용.
+//   - window_tracker.cpp: trackerAccumulator를 받아 throttle 처리 (Role A).
+//   - 향후 Role B (AI/OCR) / Role C (N-Frame Delay)도 이 구조체에 필드 추가 예정.
+// =============================================================================
+
 #pragma once
 
 // ----------------------------------------------------
@@ -20,27 +33,29 @@
 // ----------------------------------------------------
 // Helpers & Macros
 // ----------------------------------------------------
-#ifndef obs_log
-#define obs_log(level, format, ...) blog(level, "[SecureCast] " format, ##__VA_ARGS__)
-#endif
 
 // ----------------------------------------------------
 // Global Configurations (Config)
 // ----------------------------------------------------
-constexpr int SC_MAX_BLUR_RECTS   = 32; // 최대 동시 마스킹 가능 영역 수
-constexpr int SC_RING_BUFFER_SLOTS = 5; // Bounded Exposure N-Frame 지연 슬롯 수 (고정 3~5)
+// 컴파일 타임 상수. 런타임에 바꿀 일이 없으므로 constexpr로 둔다.
+constexpr int SC_MAX_BLUR_RECTS = 32;       // 한 프레임에 동시에 마스킹 가능한 최대 영역 수
+constexpr int SC_RING_BUFFER_SLOTS = 5;     // Bounded Exposure: AI 검증을 위해 N프레임만큼 송출 지연 슬롯 수 (고정 3~5)
 
 // ----------------------------------------------------
 // Shared Types (Types)
 // ----------------------------------------------------
 
+// UI 인디케이터 상태(초록/노랑/빨강).
+// video_render에서 오버레이 표시할 때, video_tick의 위험 판단 결과를 반영.
 enum class SecurityState {
     SAFE,       // 노출 위험 없음 (초록)
     PARTIAL,    // 위험 감지 후 마스킹 동작 중 (노랑)
     RISK        // 심각한 유출 위험 또는 프레임 오버플로우 (빨강)
 };
 
-// 화면 내 개별적인 블러/블랙아웃 처리 영역 구조체
+// 화면 내 개별적인 블러/블랙아웃 처리 영역.
+// Role A의 window_tracker / Role B의 OCR 결과가 이 구조체로 모이고,
+// Role A의 HLSL 셰이더가 이 좌표를 받아 픽셀 처리한다.
 struct BlurRect {
     int x;
     int y;
@@ -49,7 +64,8 @@ struct BlurRect {
     int type; // 0: Blur, 1: Blackout
 };
 
-// AI Thread → Render Thread 락프리 전달 페이로드
+// AI Thread에서 만든 마스킹 결과 → Render Thread로 넘기는 락프리 버퍼 팩(전달 페이로드)
+
 struct MaskPayload {
     BlurRect rects[SC_MAX_BLUR_RECTS];
     int rectCount;
@@ -184,7 +200,8 @@ struct SecureCastFilter {
     AtomicMaskChannel maskChannel; // AI → Render 락프리 채널
     MaskPayload      lastMask{};   // 마지막으로 적용된 마스킹 결과 (없으면 rectCount==0)
 
-    // ----- TODO: Role A 담당 필드 -----
+    // ----- [Role A] 담당 필드 -----
+    float         trackerAccumulator = 0.0f; // window_tracker tick throttle 누산기
     // gs_effect_t* blurEffect = nullptr;  // 컴파일된 HLSL 셰이더
 
     // ----- TODO: Role B 담당 필드 -----
