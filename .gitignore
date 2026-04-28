@@ -33,9 +33,10 @@ Thumbs.db
 *.pdb
 
 # Build output
-build_x64/
+build*/
 out/
 bin/
+external/
 
 # IDEs
 .idea/
