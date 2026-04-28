@@ -1,45 +1,44 @@
-# CMake
-CMakeCache.txt
-CMakeFiles
-CMakeScripts
-Testing
-Makefile
-cmake_install.cmake
-install_manifest.txt
-compile_commands.json
-CTestTestfile.cmake
-_deps
+# =============================================================================
+# .gitignore — "기본 차단 + 명시적 허용" 패턴
+#
+# 의도:
+#   .deps/, build_x64/, .vs/ 같은 빌드 산출물이 워낙 많아 일일이 무시하느니
+#   루트의 모든 항목을 차단(/*)한 뒤 필요한 폴더/파일만 ! 로 화이트리스트.
+#   새 빌드 도구가 새 디렉터리를 만들어도 자동으로 무시되어 안전.
+# =============================================================================
 
-# OS generated files
+# Exclude everything
+/*
+
+# Except for default project files
+# (표준 OBS 플러그인 템플릿이 가정하는 폴더 + 우리 소스 폴더)
+!/.github
+!/build-aux
+!/cmake
+!/data
+!/src
+!.clang-format
+!.gersemirc
+!.gitignore
+!buildspec.json
+!CMakeLists.txt
+!CMakePresets.json
+!LICENSE
+!README.md
+
+# SecureCast-specific keep list
+# (프로젝트 문서 — 빌드와 무관하지만 git에 포함시키고 싶음)
+!/SecureCast_통합_구현가이드.md
+!/중간보고서_final.md
+
+# Exclude lock files
+# (의존성 잠금 파일은 자동 생성, 머지 컨플릭트만 유발)
+*.lock.json
+
+# Exclude macOS legacy resource forks
 .DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
-Thumbs.db
 
-# Visual Studio
-.vs/
-*.suo
-*.user
-*.userosscache
-*.sln.docstates
-*.obj
-*.exe
-*.dll
-*.lib
-*.ilk
-*.pdb
-
-# Build output
-build_x64/
-out/
-bin/
-
-# IDEs
-.idea/
-.vscode/
-
-# VS Code / Cursor AI
-.gemini/
+# Exclude CMake build number cache
+# (cmake 호출마다 증가하는 카운터. 루트 /* 차단으로 자동 제외되지만,
+#  /cmake 가 화이트리스트에 있어 명시적으로 한 번 더 막아줌)
+/cmake/.CMakeBuildNumber
