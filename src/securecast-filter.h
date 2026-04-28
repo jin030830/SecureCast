@@ -33,9 +33,6 @@
 // ----------------------------------------------------
 // Helpers & Macros
 // ----------------------------------------------------
-#ifndef obs_log
-#define obs_log(level, format, ...) blog(level, "[SecureCast] " format, ##__VA_ARGS__)
-#endif
 
 // ----------------------------------------------------
 // Global Configurations (Config)
@@ -203,7 +200,8 @@ struct SecureCastFilter {
     AtomicMaskChannel maskChannel; // AI → Render 락프리 채널
     MaskPayload      lastMask{};   // 마지막으로 적용된 마스킹 결과 (없으면 rectCount==0)
 
-    // ----- TODO: Role A 담당 필드 -----
+    // ----- [Role A] 담당 필드 -----
+    float         trackerAccumulator = 0.0f; // window_tracker tick throttle 누산기
     // gs_effect_t* blurEffect = nullptr;  // 컴파일된 HLSL 셰이더
 
     // ----- TODO: Role B 담당 필드 -----

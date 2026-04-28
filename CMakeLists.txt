@@ -91,10 +91,17 @@ target_sources(
     src/plugin-main.cpp           # OBS 진입점 / 모듈 등록
     src/securecast-filter.cpp     # 필터 lifecycle 콜백 + dispatch table
     src/securecast-filter.h       # 공유 타입 (SecureCastFilter, BlurRect 등)
-    src/window_tracker.cpp        # Role A: 블랙리스트 앱 좌표 스캐너
-    src/window_tracker.h
     src/plugin-support.h          # PLUGIN_NAME / obs_log 선언 (정의는 .c.in)
 )
+
+if(WIN32)
+  target_sources(
+    ${CMAKE_PROJECT_NAME}
+    PRIVATE
+      src/window_tracker.cpp      # Role A: 블랙리스트 앱 좌표 스캐너
+      src/window_tracker.h
+  )
+endif()
 
 # OBS 표준 매크로: 출력 파일명을 "${_name}.dll" 로 강제, install 타겟 자동 생성.
 # (CMake 기본은 lib 접두사가 붙는데 OBS는 그걸 안 좋아함)
