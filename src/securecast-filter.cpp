@@ -62,14 +62,15 @@ void FrameRingBuffer::pushFrame(obs_source_t* source, uint64_t timestamp)
     if (!m_initialized)
         return;
 
+    // --- OBS의 현재 그래픽 상태를 백업 ---
+    struct gs_rect prevViewport;
+    gs_get_viewport(&prevViewport);
+    gs_projection_push();
+
     // HEAD 슬롯의 텍스처를 렌더 타겟(RT)으로 설정
     gs_texture_t* rt = m_slots[m_head].texture;
     gs_set_render_target(rt, nullptr);
     gs_set_viewport(0, 0, m_width, m_height);
-    
-    // [Fix] 투영 행렬을 텍스처 좌표계(0,0 ~ w,h)에 맞게 설정
-    gs_matrix_push();
-    gs_matrix_identity();
     gs_ortho(0.0f, (float)m_width, 0.0f, (float)m_height, -100.0f, 100.0f);
 
     struct vec4 clearColor;
@@ -79,8 +80,11 @@ void FrameRingBuffer::pushFrame(obs_source_t* source, uint64_t timestamp)
     // 상위(Parent) 소스의 현재 프레임을 RT에 복사
     obs_source_video_render(source);
 
-    gs_matrix_pop();
+    // --- OBS의 그래픽 상태를 원래대로 복원 ---
     gs_set_render_target(nullptr, nullptr);
+    gs_projection_pop();
+    gs_set_viewport(prevViewport.x, prevViewport.y,
+                    prevViewport.cx, prevViewport.cy);
 
     m_slots[m_head].timestamp = timestamp;
 
