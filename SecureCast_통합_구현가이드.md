@@ -351,11 +351,14 @@ void PanicButtonCallback(void *data, obs_hotkey_id id, obs_hotkey_t *key, bool p
     if (pressed) {
         SecureCastFilter *filter = (SecureCastFilter *)data;
         filter->panic_mode = !filter->panic_mode; // 토글
-        // panic_mode == true면 video_render에서 전체 화면에 블러 적용
-    }
-}
-```
-
+        // panic_mode == true면 video_render에서 전체 화면에 | KPI | 목표 수치 | 달성 방법 |
+|---|---|---|
+| **CPU 점유율 (정적 화면)** | **2.0% 미만** | 적응형 Dirty Rect Skip + 64x64 다운샘플 해싱 검증 |
+| **CPU 점유율 (동적 화면)** | **최대 8.0%** | 하드웨어 가속 OCR 활용 및 불필요한 영역 연산 배제 |
+| **탐지 재현율 (Recall)** | **95% 이상** | Windows.Media.Ocr + RE2 한국어 특화 패턴 (보수적 탐지 우선) |
+| **오탐률 (False Positive)** | **15% 이내** | 휴리스틱 필터 및 BBox 문맥 2차 검증 |
+| **방송 송출 지연 (Delay)** | **80ms 고정** | N-Frame Delay Queue (5프레임 @ 60fps) |
+| **Data Privacy** | **100% On-device** | 로컬 처리 및 분석 후 즉시 메모리 해제 |
 ### 6.2 ⚠️ 주의사항
 - 핫키가 게임의 키바인딩과 겹치지 않도록 기본값을 `Ctrl+Shift+F12` 같은 조합으로 설정
 - 패닉 모드 진입/해제 시 시각적 피드백(화면 가장자리 빨간 테두리 등)을 줘야 스트리머가 현재 상태를 인지 가능
@@ -432,8 +435,8 @@ for (auto const& line : result.Lines()) {
 |---|---|---|
 | **언어팩 미설치** | 한국어 OCR이 안 되면 아무것도 탐지 못함 | `IsLanguageSupported` 사전 체크 + UI 가이드 |
 | **비동기 실행** | `RecognizeAsync`는 코루틴(비동기)으로 동작 | AI Thread에서만 호출, Fast-Path(렌더 스레드)에서 절대 호출 금지 |
-| **SoftwareBitmap 변환** | GPU 텍스처 → CPU 비트맵 변환 시 복사 비용 발생 | ROI(관심 영역)만 잘라서(Crop) 변환하여 데이터량 최소화 |
-| **특수 폰트** | 게임 UI나 디자인 폰트는 OCR 인식률이 급격히 떨어짐 | V1에서는 정기적 UI 텍스트 위주로, V2에서 ONNX 모델로 보완 |
+| **Data Isolation** | 개인정보가 담긴 `SoftwareBitmap`이 메모리에 남을 위험 | 분석 완료 직후 링 버퍼 내 비트맵 데이터 `ZeroMemory` 처리 후 해제 |
+| **인식률 향상** | "0"을 "O"로 잘못 인식하여 정규식 우회 시도 | 정규식 적용 전 `CommonOcrFixer`를 통해 유사 문자 정규화 처리 (Recall 향상) |
 | **한영 혼합** | "배달주소: 서울특별시 Seoul" 같은 혼합 텍스트 | 한국어 엔진 + 영어 엔진 2개를 번갈아 실행하거나, 영어 우선 엔진 사용 |
 | **인식 지연** | 고해상도(4K)에서 전체 화면 OCR은 200ms+ 소요 | 전체 프레임 대신 변화 영역(ROI)만 잘라서 분석 — Dirty Rect Skip |
 
@@ -564,31 +567,22 @@ bool HeuristicFilter(const PiiMatch& match, HWND sourceWindow) {
 ### 4.2 구현 로직
 
 ```cpp
-// === 이전 프레임과 현재 프레임 비교 (SSIM 기반) ===
-// 1) 전체 프레임을 64x64로 축소
-cv::Mat prev_small, curr_small;
-cv::resize(prev_frame, prev_small, cv::Size(64, 64));
-cv::resize(curr_frame, curr_small, cv::Size(64, 64));
+// === 이전 프레임과 현재 프레임 비교 (FNV-1a Hash 기반) ===
+// 1) 64x64로 다운샘플링된 프레임 데이터의 64-bit 해시 계산
+uint64_t curr_hash = ComputeFNV1aHash(curr_64x64_data, 4096);
 
-// 2) SSIM(구조적 유사도) 계산
-double ssim = ComputeSSIM(prev_small, curr_small);
-// ssim이 1.0에 가까우면 변화 없음, 0에 가까우면 크게 변함
-
-if (ssim > 0.98) {
-    // 거의 안 바뀜 → OCR 스킵 (CPU 절약!)
+// 2) 해시 비교
+if (curr_hash == prev_hash) {
+    // 완전히 동일함 (변화 없음) → OCR 스킵 및 이전 마스킹 캐시 재사용 (CPU 절약)
     return;
-}
-
-if (ssim < 0.4) {
-    // 화면이 크게 바뀜 (탭 전환, 앱 전환 등)
-    // → Full-scan 모드: 전체 화면 OCR 실행
-    RunFullFrameOCR();
 } else {
-    // 일부만 바뀜 → 변화 영역(ROI)만 잘라서 OCR
-    auto changedRects = DetectChangedRegions(prev_frame, curr_frame);
+    // 화면에 변화가 감지됨 (스크롤, 앱 전환 등)
+    // 픽셀 차분을 통해 구체적인 변화 영역(Dirty Rect)을 추출
+    auto changedRects = DetectChangedRegions(prev_64x64_data, curr_64x64_data);
     for (auto& rect : changedRects) {
-        RunROI_OCR(rect); // 해당 영역만 OCR
+        RunROI_OCR(rect); // 해당 영역만 OCR 수행
     }
+    prev_hash = curr_hash;
 }
 ```
 
@@ -596,7 +590,7 @@ if (ssim < 0.4) {
 
 | 리스크 | 설명 | 대응법 |
 |---|---|---|
-| **스크롤** | 채팅창 등이 천천히 스크롤되면 SSIM이 높게 나오지만 새 텍스트 등장 | BBox별 개별 SSIM 체크로 보완 (전체 프레임 SSIM + 개별 BBox SSIM 2중 체크) |
+| **스크롤/동영상** | 미세하게 화면이 움직이거나 영상이 재생되면 매 프레임 해시가 달라져 캐시 효율 하락 | 전체 화면 해싱과 더불어, 고정된 UI 영역(채팅창, 결제창) BBox별 개별 해싱 2중 체크 |
 | **깜빡이는 UI** | 커서 깜빡임, 광고 배너 등이 지속적으로 변화를 유발 | 변화량 임계치를 설정하여 "의미 있는 변화"만 반응하도록 조절 |
 
 ---
@@ -706,50 +700,38 @@ if (SUCCEEDED(hr)) {
     // mapped.pData에 64x64 그레이스케일 데이터 (4096 bytes)
     uint8_t* pixels = (uint8_t*)mapped.pData;
     
-    // SSIM 또는 해시 계산
-    uint64_t hash = ComputeHash(pixels, 64 * 64);
+    // 픽셀 데이터 기반 해시 계산
+    uint64_t hash = ComputeFNV1aHash(pixels, 64 * 64);
     
     context->Unmap(stagingTexture, 0);
 }
 ```
 
-### 2.3 SSIM 계산 (해시 충돌 방지용)
+### 2.3 초고속 픽셀 해싱 (FNV-1a Hash)
 
 ```cpp
-// === 간소화된 SSIM 계산 ===
-// 완벽한 SSIM은 복잡하지만, 우리는 "변했는지 안 변했는지"만 알면 됨
-// → 평균 밝기 + 표준편차 비교만으로도 충분
-double SimpleSSIM(uint8_t* prev, uint8_t* curr, int size) {
-    double mean_prev = 0, mean_curr = 0;
-    for (int i = 0; i < size; i++) {
-        mean_prev += prev[i];
-        mean_curr += curr[i];
+// === FNV-1a 64-bit 해시 함수 ===
+// O(N)의 시간 복잡도로 4096 바이트 배열을 한 번만 순회하며, 
+// 곱셈과 XOR 연산만 사용하므로 CPU 부하가 극히 낮습니다. (SSIM 대비 압도적 속도)
+uint64_t ComputeFNV1aHash(const uint8_t* data, size_t size) {
+    uint64_t hash = 14695981039346656037ULL; // FNV_offset_basis
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= data[i];
+        hash *= 1099511628211ULL;        // FNV_prime
     }
-    mean_prev /= size;
-    mean_curr /= size;
-    
-    // 평균 밝기 차이가 크면 변한 것
-    double diff = abs(mean_prev - mean_curr);
-    
-    // 표준편차 비교 (텍스트가 있으면 편차가 큼)
-    double var_prev = 0, var_curr = 0;
-    for (int i = 0; i < size; i++) {
-        var_prev += (prev[i] - mean_prev) * (prev[i] - mean_prev);
-        var_curr += (curr[i] - mean_curr) * (curr[i] - mean_curr);
-    }
-    var_prev /= size;
-    var_curr /= size;
-    
-    // 종합 판단: 평균과 분산 모두 비슷하면 "변화 없음"
-    double score = 1.0 - (diff / 255.0) - abs(var_prev - var_curr) / (255.0 * 255.0);
-    return score; // 1.0 = 동일, 0.0 = 완전히 다름
+    return hash;
 }
 
 // 사용 예시
-if (SimpleSSIM(prev_bbox_data, curr_bbox_data, 4096) > 0.95) {
-    // 변화 없음 → OCR 재실행 안 함 (캐시 사용)
+uint64_t current_hash = ComputeFNV1aHash(pixels, 4096);
+
+if (current_hash == previous_hash) {
+    // 변화 없음! 무거운 OCR 과정을 완전히 건너뜁니다 (Cache Hit)
+    UsePreviousMaskCache();
 } else {
-    // 변화 감지 → OCR 재실행 필요!
+    // 변화 감지! 새롭게 AI 분석을 수행합니다 (Cache Miss)
+    RunNewAnalysis();
+    previous_hash = current_hash;
 }
 ```
 
@@ -1049,15 +1031,17 @@ struct NotificationGuard {
 
 // 알림 감지 로직: 해당 영역의 픽셀 변화를 모니터링
 void CheckNotificationArea(SecureCastFilter *f) {
-    // 이전 프레임 vs 현재 프레임에서 우측 하단 영역의 SSIM 계산
-    double ssim = ComputeAreaSSIM(f->prev_frame, f->curr_frame,
+    // 우측 하단(알림 영역)의 픽셀 해시(FNV-1a) 계산
+    // 팝업 알림이 뜨면 픽셀 색상이 완전히 바뀌므로 해시가 즉시 달라집니다.
+    uint64_t curr_notif_hash = ComputeAreaHash(f->curr_frame, 
                                   f->notif.relX, f->notif.relY,
                                   f->notif.relW, f->notif.relH);
     
-    if (ssim < 0.85) {
-        // 알림이 새로 떴을 가능성 높음
+    if (curr_notif_hash != f->prev_notif_hash) {
+        // 알림 영역의 픽셀 변화 감지 (팝업 발생)
         f->notif.isActive = true;
         f->notif.cooldown = 180; // 3초(60fps × 3) 동안 블러 유지
+        f->prev_notif_hash = curr_notif_hash;
     }
     
     if (f->notif.cooldown > 0) {
