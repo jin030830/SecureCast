@@ -38,13 +38,25 @@ OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("securecast", "en-US")
 
 // 플러그인 로드 시 OBS가 한 번 호출. 등록 작업은 여기서.
+/*
+ * [개발 프로세스 안내]
+ * 1. Role A (렌더링): obs_video_render() 과정에서 마스킹 셰이더를 적용합니다.
+ * 2. Role B (AI): 분석 엔진을 통해 화면의 개인정보 영역을 탐지하고 MaskPayload를 생성합니다.
+ * 3. Role C (파이프라인): FrameRingBuffer를 통해 프레임 지연을 관리하고, AtomicMaskChannel로 데이터를 중계합니다.
+ * 4. Role D (설정/UI): 사용자 설정값을 관리하며 전체 모듈의 상태(SecurityState)를 제어합니다.
+ */
+
+// Module entry point
 bool obs_module_load(void)
 {
-    obs_log(LOG_INFO, "[SecureCast] Initializing SecureCast v5.7 plugin (Single-Process Native C++)");
+    // [로그 정책] 모든 플러그인 메시지는 [SecureCast] 접두사를 사용하여 Role별 식별을 돕습니다.
+    blog(LOG_INFO, "[SecureCast] Initializing SecureCast v5.7 plugin (Single-Process Native C++)");
 
     // SecureCast 필터 타입을 OBS의 filter_types 배열에 등록.
     // 이후 사용자가 어떤 비디오 소스에 필터 추가하면 OBS가 securecast_filter_info
     // 의 create 콜백 (securecast_create) 을 호출해 필터 인스턴스를 만든다.
+    // Register our main filter
+    // [Role C/A 협업] 여기서 등록된 소스가 필터링 파이프라인의 시작점이 됩니다.
     obs_register_source(&securecast_filter_info);
 
     return true;  // false 반환 시 OBS가 모듈을 unload함
@@ -54,7 +66,8 @@ bool obs_module_load(void)
 // (필터 인스턴스별 정리는 securecast_destroy에서 처리)
 void obs_module_unload(void)
 {
-    obs_log(LOG_INFO, "[SecureCast] Unloading plugin");
+    // [자원 정리] Role C가 할당한 버퍼 및 Role B의 스레드를 여기서 안전하게 종료해야 합니다.
+    blog(LOG_INFO, "[SecureCast] Unloading plugin");
 }
 
 } // extern "C"
