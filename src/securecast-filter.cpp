@@ -211,14 +211,7 @@ static void* securecast_create(obs_data_t* settings, obs_source_t* context)
     filter->currentState = SecurityState::SAFE;
 
     // FrameRingBuffer는 첫 video_render 호출 시 지연 초기화 (OBS gs context 필요)
-
-    // MockAIWorker 시작 (해상도는 video_render 첫 호출 때 rimingBuffer 초기화 후 갱신)
-    // 기본 해상도(1920x1080)로 먼저 시작, 렌더러 초기화 후 재시작하지 않아도 됨
-    filter->mockWorker.start(1920, 1080,
-        [filter](const MaskPayload& payload) {
-            // AI 스레드에서 결과 도착 → 락프리 채널에 발행
-            filter->maskChannel.publish(payload);
-        });
+    // MockAIWorker도 렌더러가 실제 해상도를 알게 되는 시점(video_render)에 맞춰 시작하도록 연기합니다.
 
     blog(LOG_INFO, "Filter created (Role C: Mock Pipeline Active).");
     return filter;
@@ -286,15 +279,34 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
             obs_source_skip_video_filter(filter->context);
             return;
         }
+        // 첫 초기화 시 AI 워커도 실제 해상도로 시작
+        filter->mockWorker.start(w, h, [filter](const MaskPayload& payload) {
+            filter->maskChannel.publish(payload);
+        });
     } else if (filter->ringBuffer.getWidth() != w || filter->ringBuffer.getHeight() != h) {
-        // [P1 수정] 소스 해상도가 바뀌면 텍스처를 재생성해야 화면 깨짐 방지
+        // [P1 수정] 소스 해상도가 바뀌면 텍스처를 재생성해야 화면 깨짐 및 크래시 방지
         blog(LOG_INFO, "Resolution changed (%dx%d -> %dx%d). Reinitializing ring buffer.",
                 filter->ringBuffer.getWidth(), filter->ringBuffer.getHeight(), w, h);
+        
+        // 1. AI 워커 중지 (진행 중인 텍스처 읽기/분석 취소)
+        filter->mockWorker.stop();
+
+        // 2. 링 버퍼 파괴 및 재할당
         filter->ringBuffer.destroy();
         if (!filter->ringBuffer.initialize(w, h)) {
             obs_source_skip_video_filter(filter->context);
             return;
         }
+
+        // 3. 이전 해상도에서 만들어진 쓸모없는 마스킹 큐 비우기
+        MaskPayload dummy;
+        while (filter->maskChannel.consume(dummy)) {}
+        filter->lastMask = MaskPayload{};
+
+        // 4. 새 해상도로 AI 워커 재시작
+        filter->mockWorker.start(w, h, [filter](const MaskPayload& payload) {
+            filter->maskChannel.publish(payload);
+        });
     }
 
     // --- Step 2: 현재 프레임을 Ring Buffer HEAD에 Push ---
