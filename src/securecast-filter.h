@@ -70,27 +70,27 @@ struct MaskPayload {
 // ----------------------------------------------------
 class FrameRingBuffer {
 public:
-    // 각 슬롯이 보유하는 데이터: OBS 텍스처 핸들 + 타임스탬프
+    // 각 슬롯이 보유하는 데이터: gs_texrender + 타임스탬프
     struct Slot {
-        gs_texture_t* texture = nullptr; // GPU 텍스처 핸들 (OBS Graphics subsystem)
-        uint64_t      timestamp = 0;     // obs_get_video_frame_time() 값
+        gs_texrender_t* texrender = nullptr; // OBS 안전 렌더 타겟 관리자
+        uint64_t        timestamp = 0;
 
-        bool isReady() const { return texture != nullptr; }
+        // gs_texrender에서 결과 텍스처를 꺼내는 헬퍼
+        gs_texture_t* getTexture() const {
+            return texrender ? gs_texrender_get_texture(texrender) : nullptr;
+        }
+        bool isReady() const { return getTexture() != nullptr; }
     };
 
     FrameRingBuffer()  = default;
     ~FrameRingBuffer() = default;
 
-    // OBS gs_context가 잡힌 상태에서만 호출해야 함 (video_render 내부)
-    // width, height: 현재 소스의 해상도
     bool initialize(uint32_t width, uint32_t height);
     void destroy();
 
-    // 현재 프레임(currentVideoFrame)을 링 버퍼 HEAD에 복사해 넣는다.
-    // obs_source_t* source: 상위 원본 소스 (텍스처 가져오기 대상)
+    // gs_texrender_begin/end를 사용하여 안전하게 프레임을 캡처
     void pushFrame(obs_source_t* source, uint64_t timestamp);
 
-    // N 슬롯 전의 "지연된" 프레임을 읽어온다. (nullptr 반환 시 아직 버퍼 미충족)
     const Slot* peekDelayedSlot() const;
 
     bool isInitialized() const { return m_initialized; }
@@ -99,8 +99,8 @@ public:
 
 private:
     std::array<Slot, SC_RING_BUFFER_SLOTS> m_slots{};
-    int      m_head        = 0;     // 다음에 쓸 인덱스
-    int      m_frameCount  = 0;     // 누적 push 횟수 (충분한 지연이 쌓였는지 판단)
+    int      m_head        = 0;
+    int      m_frameCount  = 0;
     uint32_t m_width       = 0;
     uint32_t m_height      = 0;
     bool     m_initialized = false;

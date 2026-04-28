@@ -15,21 +15,18 @@ bool FrameRingBuffer::initialize(uint32_t width, uint32_t height)
     m_width  = width;
     m_height = height;
 
-    // OBS Graphics Context가 잡혀있는 상태(video_render 내부)에서만 호출됨
-    // 각 슬롯에 GPU 텍스처를 미리 할당한다.
     for (auto& slot : m_slots) {
-        // GS_BGRA: OBS 내부 표준 포맷 (DX11 기준 DXGI_FORMAT_B8G8R8A8_UNORM)
-        slot.texture = gs_texture_create(width, height, GS_BGRA, 1, nullptr, GS_RENDER_TARGET);
-        if (!slot.texture) {
-            blog(LOG_ERROR, "Failed to allocate ring buffer texture slot.");
-            destroy(); // 부분 할당된 것 정리
+        slot.texrender = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
+        if (!slot.texrender) {
+            blog(LOG_ERROR, "Failed to allocate gs_texrender slot.");
+            destroy();
             return false;
         }
         slot.timestamp = 0;
     }
 
     m_initialized = true;
-    blog(LOG_INFO, "FrameRingBuffer initialized: %dx%d, %d slots.",
+    blog(LOG_INFO, "FrameRingBuffer initialized: %dx%d, %d slots (gs_texrender).",
             width, height, SC_RING_BUFFER_SLOTS);
     return true;
 }
@@ -39,13 +36,11 @@ void FrameRingBuffer::destroy()
     if (!m_initialized)
         return;
 
-    // [P1 수정] OBS가 이미 Graphics Context를 잡은 상태에서 호출될 수 있으므로
-    // 안전하게 enter/leave를 감싸되, 이미 잡혀있는 경우를 대비해 상태 체크
     obs_enter_graphics();
     for (auto& slot : m_slots) {
-        if (slot.texture) {
-            gs_texture_destroy(slot.texture);
-            slot.texture = nullptr;
+        if (slot.texrender) {
+            gs_texrender_destroy(slot.texrender);
+            slot.texrender = nullptr;
         }
         slot.timestamp = 0;
     }
@@ -62,29 +57,21 @@ void FrameRingBuffer::pushFrame(obs_source_t* source, uint64_t timestamp)
     if (!m_initialized)
         return;
 
-    // --- OBS의 현재 그래픽 상태를 백업 ---
-    struct gs_rect prevViewport;
-    gs_get_viewport(&prevViewport);
-    gs_projection_push();
+    gs_texrender_t* tr = m_slots[m_head].texrender;
+    gs_texrender_reset(tr);
 
-    // HEAD 슬롯의 텍스처를 렌더 타겟(RT)으로 설정
-    gs_texture_t* rt = m_slots[m_head].texture;
-    gs_set_render_target(rt, nullptr);
-    gs_set_viewport(0, 0, m_width, m_height);
-    gs_ortho(0.0f, (float)m_width, 0.0f, (float)m_height, -100.0f, 100.0f);
+    // gs_texrender_begin/end가 내부적으로 렌더 타겟, 뷰포트, 투영 행렬을
+    // 안전하게 저장/복원해 주므로 OBS 렌더 상태가 오염되지 않는다.
+    if (gs_texrender_begin(tr, m_width, m_height)) {
+        struct vec4 clearColor;
+        vec4_zero(&clearColor);
+        gs_clear(GS_CLEAR_COLOR, &clearColor, 1.0f, 0);
 
-    struct vec4 clearColor;
-    vec4_zero(&clearColor);
-    gs_clear(GS_CLEAR_COLOR, &clearColor, 1.0f, 0);
+        gs_ortho(0.0f, (float)m_width, 0.0f, (float)m_height, -100.0f, 100.0f);
+        obs_source_video_render(source);
 
-    // 상위(Parent) 소스의 현재 프레임을 RT에 복사
-    obs_source_video_render(source);
-
-    // --- OBS의 그래픽 상태를 원래대로 복원 ---
-    gs_set_render_target(nullptr, nullptr);
-    gs_projection_pop();
-    gs_set_viewport(prevViewport.x, prevViewport.y,
-                    prevViewport.cx, prevViewport.cy);
+        gs_texrender_end(tr);
+    }
 
     m_slots[m_head].timestamp = timestamp;
 
@@ -96,11 +83,9 @@ void FrameRingBuffer::pushFrame(obs_source_t* source, uint64_t timestamp)
 
 const FrameRingBuffer::Slot* FrameRingBuffer::peekDelayedSlot() const
 {
-    // N 프레임이 아직 쌓이지 않은 초기 상태 → 대기
     if (m_frameCount < SC_RING_BUFFER_SLOTS)
         return nullptr;
 
-    // TAIL = HEAD - N (순환 인덱스)
     int tail = (m_head - SC_RING_BUFFER_SLOTS + SC_RING_BUFFER_SLOTS) % SC_RING_BUFFER_SLOTS;
     return &m_slots[tail];
 }
@@ -325,7 +310,7 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
     // --- Step 4~5: N프레임 지연된 슬롯 꺼내기 ---
     const FrameRingBuffer::Slot* delayedSlot = filter->ringBuffer.peekDelayedSlot();
 
-    if (!delayedSlot) {
+    if (!delayedSlot || !delayedSlot->getTexture()) {
         // 버퍼가 아직 충분히 안 쌓임 → 검정 홀드 프레임 (Bounded Exposure: 노출 0)
         gs_effect_t* solid = obs_get_base_effect(OBS_EFFECT_SOLID);
         gs_effect_set_color(gs_effect_get_param_by_name(solid, "color"), 0xFF000000);
@@ -335,10 +320,11 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
     }
 
     // --- Step 5b: 지연 프레임 그리기 ---
+    gs_texture_t* delayedTex = delayedSlot->getTexture();
     gs_effect_t* draw = obs_get_base_effect(OBS_EFFECT_DEFAULT);
-    gs_effect_set_texture(gs_effect_get_param_by_name(draw, "image"), delayedSlot->texture);
+    gs_effect_set_texture(gs_effect_get_param_by_name(draw, "image"), delayedTex);
     while (gs_effect_loop(draw, "Draw"))
-        gs_draw_sprite(delayedSlot->texture, 0, w, h);
+        gs_draw_sprite(delayedTex, 0, w, h);
 
     // --- 마스킹 오버레이: BlurRect 영역에 검정 박스 덮어쓰기 (Mock 시각화) ---
     // TODO (Role A): 이 부분을 HLSL Pixel Blur Shader 호출로 교체
