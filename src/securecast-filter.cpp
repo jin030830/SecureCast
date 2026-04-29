@@ -383,11 +383,11 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
     // currentState에 따라 화면 가장자리에 색상 테두리를 그린다.
     // SAFE: 초록 / PARTIAL: 노랑 / RISK: 빨강
     {
-        uint32_t borderColor = 0xFF00FF00; // 기본: SAFE (초록, ABGR)
+        uint32_t borderColor = 0xFF00FF00; // 기본: SAFE (초록, 0xAARRGGBB)
         if (filter->currentState == SecurityState::PARTIAL)
-            borderColor = 0xFF00FFFF; // 노랑 (ABGR)
+            borderColor = 0xFFFFFF00; // 노랑 (0xAARRGGBB)
         else if (filter->currentState == SecurityState::RISK)
-            borderColor = 0xFF0000FF; // 빨강 (ABGR)
+            borderColor = 0xFFFF0000; // 빨강 (0xAARRGGBB)
 
         const int BORDER = 6; // 테두리 두께 (픽셀)
 
