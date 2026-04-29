@@ -22,7 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "securecast-filter.h"
-
+#include "ocr-engine.h"   // [Role B] OCR engine
 // ================================================================
 // [Role C] FrameRingBuffer 구현부
 // ================================================================
@@ -230,7 +230,9 @@ static void* securecast_create(obs_data_t* settings, obs_source_t* context)
     obs_log(LOG_INFO, "[SecureCast] Filter created.");
 
     // TODO: Role C - Initialize N-Frame Delay Queue here
-    // TODO: Role B - Initialize AI/OCR Engine here
+    // [Role B] OCR Engine 초기화
+    filter->ocrEngine.init();
+    
     // TODO: Role A - Initialize Window Tracking Subsystem here (HLSL effect 컴파일 등)
     // FrameRingBuffer는 첫 video_render 호출 시 지연 초기화 (OBS gs context 필요)
     // MockAIWorker도 렌더러가 실제 해상도를 알게 되는 시점(video_render)에 맞춰 시작하도록 연기합니다.
@@ -335,7 +337,27 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
     // --- Step 2: 현재 프레임을 Ring Buffer HEAD에 Push ---
     uint64_t ts = obs_get_video_frame_time();
     filter->ringBuffer.pushFrame(parent, ts);
+// =====================================================
+// [Role B] OCR 분석 호출 (현재는 stub)
+// =====================================================
+    if (filter->ocrEngine.available()) {
+    // TODO(Role B/C):
+    // GPU readback 결과를 통해 실제 BGRA 픽셀을 전달받아야 함
+    // 현재 단계에서는 OCR 파이프라인 연결만 수행
 
+    const uint8_t* pixels = nullptr;
+    int stride = 0;
+
+    auto ocrBoxes = filter->ocrEngine.analyze_bgra_frame(
+        pixels,
+        (int)w,
+        (int)h,
+        stride
+    );
+
+    // TODO:
+    // ocrBoxes → BlurRect 변환 → maskChannel 또는 렌더 파이프라인에 전달
+}
     // --- Step 3: AI 결과 채널에서 최신 마스킹 페이로드 Consume ---
     MaskPayload newMask{};
     if (filter->maskChannel.consume(newMask))
