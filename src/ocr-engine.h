@@ -2,7 +2,7 @@
 #include <vector>
 #include <string>
 #include <cstdint>
-#include "securecast-types.h"
+
 
 struct SecureCastOcrWord {
     std::string text;
