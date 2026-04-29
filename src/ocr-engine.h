@@ -4,17 +4,14 @@
 #include <string>
 #include <vector>
 
-
-// OCR 결과에서 최종적으로 전달할 PII 영역
 struct SecureCastOcrBox {
-    const char *type; // PHONE, EMAIL, RRN, CARD, IP, ACCOUNT
+    const char *type;
     float x;
     float y;
     float w;
     float h;
 };
 
-// OCR 한 줄 단위 결과 (stub용)
 struct SecureCastOcrLine {
     std::string text;
     float x;
@@ -38,7 +35,7 @@ public:
 private:
     bool available_ = false;
 
-    std::vector<SecureCastOcrLine> recognize_text_stub(
+    std::vector<SecureCastOcrLine> recognize_text(
         const uint8_t *pixels,
         int width,
         int height,
@@ -49,5 +46,5 @@ private:
         const std::vector<SecureCastOcrLine>& lines
     );
 
-    std::string normalize_ocr_text(const std::string& text);
+    std::string normalize_numeric_candidate(const std::string& text);
 };
