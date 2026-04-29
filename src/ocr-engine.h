@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 
+
 // OCR 결과에서 최종적으로 전달할 PII 영역
 struct SecureCastOcrBox {
     const char *type; // PHONE, EMAIL, RRN, CARD, IP, ACCOUNT
