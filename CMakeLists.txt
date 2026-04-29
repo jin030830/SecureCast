@@ -37,6 +37,8 @@ endif()
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE 
   src/plugin-main.cpp
   src/securecast-filter.cpp
+  src/ocr-engine.cpp
+  src/ocr-engine.h
 )
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME securecast)
