@@ -206,5 +206,5 @@ struct SecureCastFilter {
 
         // ----- [Role B] 담당 필드 -----
     SecureCastOcrEngine ocrEngine;  // OCR + PII detection engine
-};
+
 };
