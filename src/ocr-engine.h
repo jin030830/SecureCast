@@ -1,11 +1,11 @@
 #pragma once
-#include <vector>
-#include <string>
+
 #include <cstdint>
+#include <string>
+#include <vector>
 
-
-struct SecureCastOcrWord {
-    std::string text;
+struct SecureCastOcrBox {
+    const char *type;
     float x;
     float y;
     float w;
