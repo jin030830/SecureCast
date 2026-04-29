@@ -23,6 +23,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <functional>
+#include <string>
 
 // ----------------------------------------------------
 // OBS Headers
@@ -203,6 +204,11 @@ struct SecureCastFilter {
     // ----- [Role A] 담당 필드 -----
     float         trackerAccumulator = 0.0f; // window_tracker tick throttle 누산기
     // gs_effect_t* blurEffect = nullptr;  // 컴파일된 HLSL 셰이더
+
+    // ----- [Role D] 담당 필드 -----
+    std::string  blacklistApps  = "";    // 블랙리스트 앱 목록 (줄바꿈 구분)
+    float        blurIntensity  = 5.0f; // 블러 강도 (1.0 ~ 10.0)
+    float        sensitivity    = 0.5f; // 감지 민감도 (0.0 ~ 1.0)
 
     // ----- TODO: Role B 담당 필드 -----
     // void* ocrEngine = nullptr;           // Windows.Media.Ocr 엔진 포인터

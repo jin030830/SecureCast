@@ -378,6 +378,44 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
         }
         gs_matrix_pop();
     }
+
+    // --- [Role D] 보안 상태 테두리 오버레이 ---
+    // currentState에 따라 화면 가장자리에 색상 테두리를 그린다.
+    // SAFE: 초록 / PARTIAL: 노랑 / RISK: 빨강
+    {
+        uint32_t borderColor = 0xFF00FF00; // 기본: SAFE (초록, ABGR)
+        if (filter->currentState == SecurityState::PARTIAL)
+            borderColor = 0xFF00FFFF; // 노랑 (ABGR)
+        else if (filter->currentState == SecurityState::RISK)
+            borderColor = 0xFF0000FF; // 빨강 (ABGR)
+
+        const int BORDER = 6; // 테두리 두께 (픽셀)
+
+        gs_effect_t* solid = obs_get_base_effect(OBS_EFFECT_SOLID);
+        gs_eparam_t* colorParam = gs_effect_get_param_by_name(solid, "color");
+        gs_effect_set_color(colorParam, borderColor);
+
+        gs_matrix_push();
+        while (gs_effect_loop(solid, "Solid")) {
+            // 위
+            gs_matrix_identity();
+            gs_matrix_translate3f(0.0f, 0.0f, 0.0f);
+            gs_draw_sprite(nullptr, 0, w, (uint32_t)BORDER);
+            // 아래
+            gs_matrix_identity();
+            gs_matrix_translate3f(0.0f, (float)(h - BORDER), 0.0f);
+            gs_draw_sprite(nullptr, 0, w, (uint32_t)BORDER);
+            // 왼쪽
+            gs_matrix_identity();
+            gs_matrix_translate3f(0.0f, 0.0f, 0.0f);
+            gs_draw_sprite(nullptr, 0, (uint32_t)BORDER, h);
+            // 오른쪽
+            gs_matrix_identity();
+            gs_matrix_translate3f((float)(w - BORDER), 0.0f, 0.0f);
+            gs_draw_sprite(nullptr, 0, (uint32_t)BORDER, h);
+        }
+        gs_matrix_pop();
+    }
 }
 // ---------------------------------------------------------
 // Tick (Slow-Path) — 매 프레임 호출되지만 윈도우 추적은 0.15초마다
@@ -398,6 +436,59 @@ static void securecast_video_tick(void* data, float seconds)
     sc_tracker_tick(seconds, &filter->trackerAccumulator);
 }
   
+// ================================================================
+// [Role D] Properties UI
+// ================================================================
+
+#define SC_SETTING_BLACKLIST      "sc_blacklist"
+#define SC_SETTING_BLUR_INTENSITY "sc_blur_intensity"
+#define SC_SETTING_GAME_MODE      "sc_game_mode"
+#define SC_SETTING_SENSITIVITY    "sc_sensitivity"
+
+// OBS 필터 패널에 표시할 기본값 설정
+static void securecast_get_defaults(obs_data_t* settings)
+{
+    obs_data_set_default_string(settings, SC_SETTING_BLACKLIST,      "");
+    obs_data_set_default_double(settings, SC_SETTING_BLUR_INTENSITY, 5.0);
+    obs_data_set_default_bool  (settings, SC_SETTING_GAME_MODE,      false);
+    obs_data_set_default_double(settings, SC_SETTING_SENSITIVITY,    0.5);
+}
+
+// OBS 필터 패널 UI 컨트롤 구성
+static obs_properties_t* securecast_get_properties(void* data)
+{
+    (void)data;
+    obs_properties_t* props = obs_properties_create();
+
+    obs_properties_add_text(props, SC_SETTING_BLACKLIST,
+        "Blacklist Apps (one per line)", OBS_TEXT_MULTILINE);
+
+    obs_properties_add_float_slider(props, SC_SETTING_BLUR_INTENSITY,
+        "Blur Intensity", 1.0, 10.0, 0.5);
+
+    obs_properties_add_bool(props, SC_SETTING_GAME_MODE,
+        "Game Mode");
+
+    obs_properties_add_float_slider(props, SC_SETTING_SENSITIVITY,
+        "Detection Sensitivity", 0.0, 1.0, 0.05);
+
+    return props;
+}
+
+// 사용자가 패널에서 값을 변경할 때마다 호출 — 필터 인스턴스에 반영
+static void securecast_update(void* data, obs_data_t* settings)
+{
+    SecureCastFilter* filter = static_cast<SecureCastFilter*>(data);
+
+    filter->blacklistApps = obs_data_get_string(settings, SC_SETTING_BLACKLIST);
+    filter->blurIntensity = (float)obs_data_get_double(settings, SC_SETTING_BLUR_INTENSITY);
+    filter->isGameMode    = obs_data_get_bool(settings, SC_SETTING_GAME_MODE);
+    filter->sensitivity   = (float)obs_data_get_double(settings, SC_SETTING_SENSITIVITY);
+
+    blog(LOG_INFO, "[SecureCast][D] Settings updated — blur=%.1f game=%d sensitivity=%.2f",
+         filter->blurIntensity, (int)filter->isGameMode, filter->sensitivity);
+}
+
 // ================================================================
 // Source Info Dispatch Table
 // ---------------------------------------------------------
@@ -421,5 +512,8 @@ struct obs_source_info securecast_filter_info = []() {
     info.destroy = securecast_destroy;
     info.video_tick = securecast_video_tick;
     info.video_render = securecast_video_render;
+    info.get_properties = securecast_get_properties;
+    info.get_defaults   = securecast_get_defaults;
+    info.update         = securecast_update;
     return info;
 }();
