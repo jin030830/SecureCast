@@ -4,6 +4,8 @@
 #include <vector>
 #include <string>
 
+
+
 bool SecureCastOcrEngine::init()
 {
     // TODO: Windows.Media.Ocr 초기화
