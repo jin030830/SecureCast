@@ -23,7 +23,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <functional>
-
+#include "ocr-engine.h"
 // ----------------------------------------------------
 // OBS Headers
 // ----------------------------------------------------
@@ -204,6 +204,7 @@ struct SecureCastFilter {
     float         trackerAccumulator = 0.0f; // window_tracker tick throttle 누산기
     // gs_effect_t* blurEffect = nullptr;  // 컴파일된 HLSL 셰이더
 
-    // ----- TODO: Role B 담당 필드 -----
-    // void* ocrEngine = nullptr;           // Windows.Media.Ocr 엔진 포인터
+        // ----- [Role B] 담당 필드 -----
+    SecureCastOcrEngine ocrEngine;  // OCR + PII detection engine
+};
 };
