@@ -1,5 +1,5 @@
 #include "ocr-engine.h"
-
+#include <winrt/Windows.Foundation.Collections.h>
 #include <algorithm>
 #include <cstring>
 #include <regex>
@@ -171,41 +171,53 @@ std::vector<SecureCastOcrLine> SecureCastOcrEngine::recognize_text(
 
         auto result = impl_->engine.RecognizeAsync(bitmap).get();
 
-        for (const auto& line : result.Lines()) {
-            SecureCastOcrLine outLine{};
-            outLine.text = winrt::to_string(line.Text());
+auto ocrLines = result.Lines();
 
-            bool hasBounds = false;
-            float minX = 0.0f;
-            float minY = 0.0f;
-            float maxX = 0.0f;
-            float maxY = 0.0f;
+for (uint32_t i = 0; i < ocrLines.Size(); ++i) {
+    auto line = ocrLines.GetAt(i);
 
-            for (const auto& word : line.Words()) {
-                auto bounds = word.BoundingRect();
+    SecureCastOcrLine outLine{};
+    outLine.text = winrt::to_string(line.Text());
 
-                if (!hasBounds) {
-                    minX = static_cast<float>(bounds.X);
-                    minY = static_cast<float>(bounds.Y);
-                    maxX = static_cast<float>(bounds.X + bounds.Width);
-                    maxY = static_cast<float>(bounds.Y + bounds.Height);
-                    hasBounds = true;
-                } else {
-                    minX = std::min(minX, static_cast<float>(bounds.X));
-                    minY = std::min(minY, static_cast<float>(bounds.Y));
-                    maxX = std::max(maxX, static_cast<float>(bounds.X + bounds.Width));
-                    maxY = std::max(maxY, static_cast<float>(bounds.Y + bounds.Height));
-                }
-            }
+    bool hasBounds = false;
+    float minX = 0.0f;
+    float minY = 0.0f;
+    float maxX = 0.0f;
+    float maxY = 0.0f;
 
-            if (hasBounds && !outLine.text.empty()) {
-                outLine.x = minX;
-                outLine.y = minY;
-                outLine.w = maxX - minX;
-                outLine.h = maxY - minY;
-                lines.push_back(outLine);
-            }
+    auto words = line.Words();
+
+    for (uint32_t j = 0; j < words.Size(); ++j) {
+        auto word = words.GetAt(j);
+        auto bounds = word.BoundingRect();
+
+        const float x = static_cast<float>(bounds.X);
+        const float y = static_cast<float>(bounds.Y);
+        const float right = static_cast<float>(bounds.X + bounds.Width);
+        const float bottom = static_cast<float>(bounds.Y + bounds.Height);
+
+        if (!hasBounds) {
+            minX = x;
+            minY = y;
+            maxX = right;
+            maxY = bottom;
+            hasBounds = true;
+        } else {
+            minX = std::min(minX, x);
+            minY = std::min(minY, y);
+            maxX = std::max(maxX, right);
+            maxY = std::max(maxY, bottom);
         }
+    }
+
+    if (hasBounds && !outLine.text.empty()) {
+        outLine.x = minX;
+        outLine.y = minY;
+        outLine.w = maxX - minX;
+        outLine.h = maxY - minY;
+        lines.push_back(outLine);
+    }
+}
     } catch (...) {
         return {};
     }
