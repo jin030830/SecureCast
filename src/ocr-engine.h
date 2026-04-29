@@ -5,7 +5,7 @@
 #include <vector>
 
 struct SecureCastOcrBox {
-    const char *type;
+    const char *type; // PHONE, EMAIL, RRN, CARD, IP, ACCOUNT
     float x;
     float y;
     float w;
