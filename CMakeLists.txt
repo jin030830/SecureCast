@@ -92,6 +92,7 @@ target_sources(
     src/securecast-filter.cpp     # 필터 lifecycle 콜백 + dispatch table
     src/securecast-filter.h       # 공유 타입 (SecureCastFilter, BlurRect 등)
     src/plugin-support.h          # PLUGIN_NAME / obs_log 선언 (정의는 .c.in)
+    src/ocr-engine.cpp  #    추가 OCR
 )
 
 if(WIN32)
