@@ -65,10 +65,7 @@
         "dev": true,
         "deprecated": true
       },
-      "cacheVariables": {
-        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_INSTALLATION_ROOT}/scripts/buildsystems/vcpkg.cmake",
-        "VCPKG_TARGET_TRIPLET": "x64-windows"
-      }
+
     },
     {
       "name": "windows-ci-x64",
