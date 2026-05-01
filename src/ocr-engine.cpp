@@ -1,5 +1,5 @@
 #include "ocr-engine.h"
-
+#include <initializer_list>
 #include <winrt/Windows.Foundation.Collections.h>
 #include <algorithm>
 #include <cstring>
@@ -293,8 +293,332 @@ std::vector<SecureCastOcrLine> SecureCastOcrEngine::recognize_text(
 }
 
 // ============================================================
+// ============================================================
 // 2. Google RE2 — 정규표현식 패턴 매칭
 // ============================================================
+
+namespace {
+
+static bool contains_any(
+    const std::string& text,
+    std::initializer_list<const char*> tokens
+) {
+    for (const char* token : tokens) {
+        if (text.find(token) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ends_with(const std::string& text, const std::string& suffix)
+{
+    if (text.size() < suffix.size()) {
+        return false;
+    }
+
+    return text.compare(text.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+static bool decode_utf8_next(
+    const std::string& text,
+    size_t& index,
+    uint32_t& codepoint,
+    size_t& charStart,
+    size_t& charLength
+) {
+    if (index >= text.size()) {
+        return false;
+    }
+
+    charStart = index;
+
+    const unsigned char c0 = static_cast<unsigned char>(text[index]);
+
+    if (c0 < 0x80) {
+        codepoint = c0;
+        charLength = 1;
+        index += 1;
+        return true;
+    }
+
+    if ((c0 & 0xE0) == 0xC0 && index + 1 < text.size()) {
+        const unsigned char c1 = static_cast<unsigned char>(text[index + 1]);
+        codepoint = ((c0 & 0x1F) << 6) | (c1 & 0x3F);
+        charLength = 2;
+        index += 2;
+        return true;
+    }
+
+    if ((c0 & 0xF0) == 0xE0 && index + 2 < text.size()) {
+        const unsigned char c1 = static_cast<unsigned char>(text[index + 1]);
+        const unsigned char c2 = static_cast<unsigned char>(text[index + 2]);
+        codepoint = ((c0 & 0x0F) << 12) |
+                    ((c1 & 0x3F) << 6) |
+                    (c2 & 0x3F);
+        charLength = 3;
+        index += 3;
+        return true;
+    }
+
+    if ((c0 & 0xF8) == 0xF0 && index + 3 < text.size()) {
+        const unsigned char c1 = static_cast<unsigned char>(text[index + 1]);
+        const unsigned char c2 = static_cast<unsigned char>(text[index + 2]);
+        const unsigned char c3 = static_cast<unsigned char>(text[index + 3]);
+        codepoint = ((c0 & 0x07) << 18) |
+                    ((c1 & 0x3F) << 12) |
+                    ((c2 & 0x3F) << 6) |
+                    (c3 & 0x3F);
+        charLength = 4;
+        index += 4;
+        return true;
+    }
+
+    codepoint = c0;
+    charLength = 1;
+    index += 1;
+    return false;
+}
+
+static bool is_hangul_syllable(uint32_t codepoint)
+{
+    return codepoint >= 0xAC00 && codepoint <= 0xD7A3;
+}
+
+static std::string extract_hangul_syllables_utf8(const std::string& text)
+{
+    std::string out;
+
+    size_t index = 0;
+    while (index < text.size()) {
+        uint32_t codepoint = 0;
+        size_t charStart = 0;
+        size_t charLength = 0;
+
+        if (!decode_utf8_next(text, index, codepoint, charStart, charLength)) {
+            continue;
+        }
+
+        if (is_hangul_syllable(codepoint)) {
+            out.append(text.data() + charStart, charLength);
+        }
+    }
+
+    return out;
+}
+
+static int count_hangul_syllables(const std::string& text)
+{
+    int count = 0;
+
+    size_t index = 0;
+    while (index < text.size()) {
+        uint32_t codepoint = 0;
+        size_t charStart = 0;
+        size_t charLength = 0;
+
+        if (!decode_utf8_next(text, index, codepoint, charStart, charLength)) {
+            continue;
+        }
+
+        if (is_hangul_syllable(codepoint)) {
+            count++;
+        }
+    }
+
+    return count;
+}
+
+static int count_ascii_digits(const std::string& text)
+{
+    int count = 0;
+    for (char c : text) {
+        if (c >= '0' && c <= '9') {
+            count++;
+        }
+    }
+    return count;
+}
+
+static bool has_name_label(const std::string& text)
+{
+    return contains_any(text, {
+        "이름",
+        "성명",
+        "성함",
+        "고객명",
+        "사용자명",
+        "name",
+        "Name",
+        "NAME"
+    });
+}
+
+static bool looks_like_korean_address_text(const std::string& text)
+{
+    if (contains_any(text, {
+        "주소",
+        "주소지",
+        "거주지",
+        "소재지",
+        "사는곳",
+        "배송지"
+    })) {
+        return true;
+    }
+
+    if (contains_any(text, {
+        "서울",
+        "부산",
+        "대구",
+        "인천",
+        "광주",
+        "대전",
+        "울산",
+        "세종",
+        "경기",
+        "강원",
+        "충북",
+        "충남",
+        "충청",
+        "전북",
+        "전남",
+        "전라",
+        "경북",
+        "경남",
+        "경상",
+        "제주"
+    })) {
+        return true;
+    }
+
+    const std::string hangulOnly = extract_hangul_syllables_utf8(text);
+    const int hangulCount = count_hangul_syllables(hangulOnly);
+
+    if (hangulCount < 2) {
+        return false;
+    }
+
+    // 地址常见行政区/道路后缀：서울시, 강남구, 역삼동, 테헤란로, 세종대로, 12길 等
+    if (ends_with(hangulOnly, "시") ||
+        ends_with(hangulOnly, "군") ||
+        ends_with(hangulOnly, "구") ||
+        ends_with(hangulOnly, "동") ||
+        ends_with(hangulOnly, "읍") ||
+        ends_with(hangulOnly, "면") ||
+        ends_with(hangulOnly, "로") ||
+        ends_with(hangulOnly, "길")) {
+        return true;
+    }
+
+    return false;
+}
+
+static bool starts_with_common_korean_surname(const std::string& hangulOnly)
+{
+    static const std::vector<std::string> surnames = {
+        "김", "이", "박", "최", "정", "강", "조", "윤", "장", "임",
+        "한", "오", "서", "신", "권", "황", "안", "송", "류", "홍",
+        "전", "고", "문", "양", "손", "배", "백", "허", "유", "남",
+        "심", "노", "하", "곽", "성", "차", "주", "우", "구", "민",
+        "진", "지", "엄", "채", "원", "천", "방", "공", "현", "함",
+        "변", "염", "여", "추", "도", "소", "석", "선", "설", "마",
+        "길", "연", "위", "표", "명", "기", "반", "왕", "금", "옥",
+        "육", "인", "맹", "제", "모", "남궁", "황보", "제갈", "선우"
+    };
+
+    for (const auto& surname : surnames) {
+        if (hangulOnly.rfind(surname, 0) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool looks_like_korean_name_candidate(const std::string& text)
+{
+    if (looks_like_korean_address_text(text)) {
+        return false;
+    }
+
+    if (contains_any(text, {
+        "주소",
+        "전화",
+        "휴대폰",
+        "핸드폰",
+        "이메일",
+        "메일",
+        "계좌",
+        "카드",
+        "결제",
+        "주민",
+        "번호",
+        "서울",
+        "부산"
+    })) {
+        return false;
+    }
+
+    const std::string hangulOnly = extract_hangul_syllables_utf8(text);
+    const int hangulCount = count_hangul_syllables(hangulOnly);
+
+    // 韩国姓名通常 2~4 个韩文字，复姓时也覆盖。
+    if (hangulCount < 2 || hangulCount > 4) {
+        return false;
+    }
+
+    if (!starts_with_common_korean_surname(hangulOnly)) {
+        return false;
+    }
+
+    return true;
+}
+
+static bool has_nearby_pii_context(
+    const std::vector<SecureCastOcrLine>& lines,
+    int index
+) {
+    const int start = std::max(0, index - 2);
+    const int end = std::min(static_cast<int>(lines.size()) - 1, index + 2);
+
+    for (int i = start; i <= end; ++i) {
+        const std::string& text = lines[i].text;
+
+        if (text.find("@") != std::string::npos) {
+            return true;
+        }
+
+        if (looks_like_korean_address_text(text)) {
+            return true;
+        }
+
+        if (contains_any(text, {
+            "주소",
+            "전화",
+            "휴대폰",
+            "핸드폰",
+            "이메일",
+            "메일",
+            "계좌",
+            "카드",
+            "주민",
+            "010",
+            "+82"
+        })) {
+            return true;
+        }
+
+        // 7자리 이상 숫자가 근처에 있으면 전화/계좌/주민번호/카드 가능성이 높음.
+        if (count_ascii_digits(text) >= 7) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+} // namespace
 
 // === STEP 2-0: OCR 오류 보정 ===
 // OCR이 숫자 0을 O/o로, 숫자 1을 I/l로 잘못 읽는 경우를 보정한다.
@@ -356,17 +680,27 @@ std::vector<SecureCastOcrBox> SecureCastOcrEngine::detect_pii(
 
     std::vector<SecureCastOcrBox> boxes;
 
-    for (const auto& line : lines) {
+    for (int i = 0; i < static_cast<int>(lines.size()); ++i) {
+        const auto& line = lines[i];
         const std::string& rawText = line.text;
+
         const char *type = nullptr;
 
         // === STEP 2-2: 이메일은 문자 기반이므로 먼저 검사 ===
         if (re2::RE2::PartialMatch(rawText, PATTERN_EMAIL)) {
             type = "EMAIL";
-        } else {
+        }
+
+        // === STEP 2-2-A: 주소 탐지 ===
+        // 예: 주소:서울시, 서울시 강남구, 역삼동, 테헤란로 등
+        if (type == nullptr && looks_like_korean_address_text(rawText)) {
+            type = "ADDRESS";
+        }
+
+        // === STEP 2-3: 숫자형 개인정보 탐지 ===
+        if (type == nullptr) {
             std::string numericText = rawText;
 
-            // === STEP 2-3: 숫자형 후보는 OCR 오류 보정 후 검사 ===
             if (re2::RE2::PartialMatch(rawText, PATTERN_NUMERIC_LIKE_CANDIDATE)) {
                 numericText = normalize_numeric_candidate(rawText);
             }
@@ -381,6 +715,23 @@ std::vector<SecureCastOcrBox> SecureCastOcrEngine::detect_pii(
                 type = "IP";
             } else if (re2::RE2::PartialMatch(numericText, PATTERN_ACCOUNT)) {
                 type = "ACCOUNT";
+            }
+        }
+
+        // === STEP 2-3-A: 이름 탐지 ===
+        // 1) "이름/성명/성함" 标签明确出现时，保守遮罩
+        // 2) 没有标签时，要求：韩文姓名候选 + 附近有邮箱/电话/地址/账号等上下文
+        if (type == nullptr) {
+            const bool explicitNameLabel = has_name_label(rawText);
+            const bool nameCandidate = looks_like_korean_name_candidate(rawText);
+
+            if (explicitNameLabel) {
+                const std::string hangulOnly = extract_hangul_syllables_utf8(rawText);
+                if (count_hangul_syllables(hangulOnly) >= 3) {
+                    type = "NAME";
+                }
+            } else if (nameCandidate && has_nearby_pii_context(lines, i)) {
+                type = "NAME";
             }
         }
 
@@ -412,7 +763,11 @@ bool SecureCastOcrEngine::heuristic_filter(
     const SecureCastOcrBox& box,
     const std::string& rawText
 ) {
-    (void)box;
+    // NAME / ADDRESS 是新增的隐私类型，直接保留。
+    if (std::strcmp(box.type, "NAME") == 0 ||
+        std::strcmp(box.type, "ADDRESS") == 0) {
+        return true;
+    }
 
     // === RE2 옵션: 대소문자 무시 ===
     static const re2::RE2::Options CASE_INSENSITIVE_OPTIONS = [] {
@@ -422,9 +777,8 @@ bool SecureCastOcrEngine::heuristic_filter(
     }();
 
     // === 규칙 1: 고위험 문맥 키워드가 있으면 유지 ===
-    // 주소, 전화, 계좌, 카드, 결제, 주민번호, 이메일 관련 단어가 있으면 블러한다.
     static const re2::RE2 PATTERN_HIGH_RISK_CONTEXT(
-        R"((주소|전화|휴대폰|계좌|카드|결제|주민|이메일|email|mail|tel|phone|account|card))",
+        R"((주소|주소지|거주지|전화|휴대폰|핸드폰|계좌|카드|결제|주민|이메일|성명|이름|email|mail|tel|phone|account|card|name))",
         CASE_INSENSITIVE_OPTIONS
     );
 
