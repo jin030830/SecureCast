@@ -3,10 +3,13 @@
 #include <winrt/Windows.Foundation.Collections.h>
 #include <algorithm>
 #include <cstring>
-#include <regex>
+#include <cstdint>
 #include <string>
 #include <vector>
-#include <cstdint>
+
+// === Google RE2 사용 ===
+// std::regex 대신 RE2를 강제로 사용한다.
+#include <re2/re2.h>
 
 #ifdef _WIN32
 #include <winrt/base.h>
@@ -20,7 +23,7 @@
 // ============================================================
 // Role B — 온디바이스 AI 엔진
 // 담당 기능: ② 위험 키워드 블러
-// 구성: OCR + 정규식 + 휴리스틱 필터 + Dirty Rect Skip
+// 구성: OCR + Google RE2 정규식 + 휴리스틱 필터 + Dirty Rect Skip
 // ============================================================
 
 #ifdef _WIN32
@@ -39,8 +42,6 @@ struct SecureCastOcrEngine::Impl {};
 namespace {
 
 // === STEP 0: 언어팩 사전 검증 (플러그인 초기화 시 1회) ===
-// PDF 샘플에는 CheckOcrLanguage()가 따로 있었지만,
-// 현재 클래스 헤더를 바꾸지 않기 위해 cpp 내부 helper 함수로 구현한다.
 bool check_ocr_language()
 {
     using winrt::Windows::Globalization::Language;
@@ -51,12 +52,10 @@ bool check_ocr_language()
 }
 
 // === STEP 0-1: 언어팩 미설치 안내 ===
-// 실제 UI가 있으면 여기서 사용자에게
-// "Windows 설정 > 언어 > 한국어 언어 팩 설치" 안내를 띄우면 된다.
 void show_language_pack_guide()
 {
-    // TODO: 프로젝트 UI/로그 시스템에 맞게 연결
-    // 예: log_warning("한국어 OCR 언어팩이 설치되어 있지 않습니다.");
+    // TODO: 실제 UI 또는 로그 시스템과 연결
+    // 예: "Windows 설정 > 언어 > 한국어 언어 팩 설치" 안내
 }
 
 } // namespace
@@ -85,11 +84,9 @@ bool SecureCastOcrEngine::init()
 
         Language ko(L"ko");
 
-        // === STEP 0 결과 반영: 한국어 언어팩 확인 ===
         if (check_ocr_language()) {
             impl_->engine = OcrEngine::TryCreateFromLanguage(ko);
         } else {
-            // 한국어 언어팩이 없으면 사용자 프로필 언어 기반 OCR로 fallback
             show_language_pack_guide();
             impl_->engine = OcrEngine::TryCreateFromUserProfileLanguages();
         }
@@ -113,8 +110,7 @@ bool SecureCastOcrEngine::available() const
 
 // ============================================================
 // 4. 적응형 Dirty Rect Skip — 성능 최적화
-// PDF에서는 SSIM 기반으로 설명하지만,
-// 현재 구현에서는 FNV-1a 샘플링 해시 기반 Dirty Skip을 사용한다.
+// 현재 구현: FNV-1a 샘플링 해시 기반 Dirty Skip
 // ============================================================
 
 std::vector<SecureCastOcrBox> SecureCastOcrEngine::analyze_bgra_frame(
@@ -130,12 +126,12 @@ std::vector<SecureCastOcrBox> SecureCastOcrEngine::analyze_bgra_frame(
     // === STEP 4-1: 현재 프레임 해시 계산 ===
     uint64_t currentHash = compute_frame_hash(pixels, width, height, stride);
 
-    // === STEP 4-2: 이전 프레임과 동일하면 OCR 생략 ===
+    // === STEP 4-2: 이전 프레임과 같으면 OCR 생략 ===
     if (hasLastFrameHash_ && currentHash == lastFrameHash_) {
         return lastBoxes_;
     }
 
-    // === STEP 4-3: 프레임이 바뀐 경우 OCR + PII 탐지 실행 ===
+    // === STEP 4-3: 변경된 프레임에 대해서만 OCR + PII 탐지 ===
     auto lines = recognize_text(pixels, width, height, stride);
     auto boxes = detect_pii(lines);
 
@@ -147,8 +143,7 @@ std::vector<SecureCastOcrBox> SecureCastOcrEngine::analyze_bgra_frame(
     return boxes;
 }
 
-// === STEP 4-5: FNV-1a 기반 간단 Dirty Skip 해시 ===
-// 전체 프레임을 모두 읽지 않고 16px 간격으로 샘플링해서 비용을 낮춘다.
+// === STEP 4-5: FNV-1a 기반 Dirty Skip 해시 ===
 uint64_t SecureCastOcrEngine::compute_frame_hash(
     const uint8_t *pixels,
     int width,
@@ -167,7 +162,6 @@ uint64_t SecureCastOcrEngine::compute_frame_hash(
         for (int x = 0; x < width; x += sampleStep) {
             const uint8_t *px = row + static_cast<size_t>(x) * 4;
 
-            // BGRA 중 B, G, R만 사용
             hash ^= px[0];
             hash *= prime;
 
@@ -233,11 +227,9 @@ std::vector<SecureCastOcrLine> SecureCastOcrEngine::recognize_text(
         );
 
         // === STEP 2-1: OCR 실행 ===
-        // PDF에서는 co_await 형태지만,
-        // 현재 코드는 동기 호출 구조이므로 .get()으로 결과를 기다린다.
         auto result = impl_->engine.RecognizeAsync(bitmap).get();
 
-        // === STEP 3: OCR 결과에서 텍스트와 좌표 추출 ===
+        // === STEP 3: 결과에서 텍스트와 좌표 추출 ===
         auto ocrLines = result.Lines();
 
         for (uint32_t i = 0; i < ocrLines.Size(); ++i) {
@@ -301,7 +293,7 @@ std::vector<SecureCastOcrLine> SecureCastOcrEngine::recognize_text(
 }
 
 // ============================================================
-// 2. 정규표현식 패턴 매칭
+// 2. Google RE2 — 정규표현식 패턴 매칭
 // ============================================================
 
 // === STEP 2-0: OCR 오류 보정 ===
@@ -321,45 +313,44 @@ std::string SecureCastOcrEngine::normalize_numeric_candidate(const std::string& 
     return out;
 }
 
-// === STEP 2-1: OCR 결과에 대해 개인정보 패턴 매칭 실행 ===
-// PDF에서는 Google RE2를 권장하지만,
-// 현재 프로젝트 코드는 std::regex 기반이므로 기존 구조를 유지한다.
-// RE2를 설치했다면 std::regex_search 부분을 RE2::PartialMatch로 바꾸면 된다.
+// === STEP 2-1: OCR 결과에 대해 RE2 패턴 매칭 실행 ===
 std::vector<SecureCastOcrBox> SecureCastOcrEngine::detect_pii(
     const std::vector<SecureCastOcrLine>& lines
 ) {
+    // === 정규식 패턴 정의: 초기화 시 1회 컴파일 ===
+
     // 1) 주민등록번호: 6자리-7자리, 뒷자리 첫 글자 1~4
-    static const std::regex rrn(
+    static const re2::RE2 PATTERN_RRN(
         R"(\d{6}[-–]\s?[1-4]\d{6})"
     );
 
     // 2) 전화번호: 010-XXXX-XXXX, 02-XXX-XXXX, +82 형식 포함
-    static const std::regex phone(
+    static const re2::RE2 PATTERN_PHONE(
         R"((?:\+82[-\s]?)?(?:010|011|016|017|018|019|02|0\d{2})[-.\s]?\d{3,4}[-.\s]?\d{4})"
     );
 
     // 3) 이메일
-    static const std::regex email(
+    static const re2::RE2 PATTERN_EMAIL(
         R"([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})"
     );
 
     // 4) 신용카드 번호
-    static const std::regex card(
+    static const re2::RE2 PATTERN_CARD(
         R"(\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4})"
     );
 
     // 5) IP 주소
-    static const std::regex ip(
+    static const re2::RE2 PATTERN_IP(
         R"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})"
     );
 
     // 6) 계좌번호
-    static const std::regex account(
+    static const re2::RE2 PATTERN_ACCOUNT(
         R"(\d{3,4}[-\s]?\d{2,4}[-\s]?\d{4,6}[-\s]?\d{0,3})"
     );
 
     // 7) OCR 보정이 필요한 숫자 후보
-    static const std::regex numericLikeCandidate(
+    static const re2::RE2 PATTERN_NUMERIC_LIKE_CANDIDATE(
         R"([0-9OoIl\-\s\.–+]{6,})"
     );
 
@@ -370,25 +361,25 @@ std::vector<SecureCastOcrBox> SecureCastOcrEngine::detect_pii(
         const char *type = nullptr;
 
         // === STEP 2-2: 이메일은 문자 기반이므로 먼저 검사 ===
-        if (std::regex_search(rawText, email)) {
+        if (re2::RE2::PartialMatch(rawText, PATTERN_EMAIL)) {
             type = "EMAIL";
         } else {
             std::string numericText = rawText;
 
             // === STEP 2-3: 숫자형 후보는 OCR 오류 보정 후 검사 ===
-            if (std::regex_search(rawText, numericLikeCandidate)) {
+            if (re2::RE2::PartialMatch(rawText, PATTERN_NUMERIC_LIKE_CANDIDATE)) {
                 numericText = normalize_numeric_candidate(rawText);
             }
 
-            if (std::regex_search(numericText, rrn)) {
+            if (re2::RE2::PartialMatch(numericText, PATTERN_RRN)) {
                 type = "RRN";
-            } else if (std::regex_search(numericText, phone)) {
+            } else if (re2::RE2::PartialMatch(numericText, PATTERN_PHONE)) {
                 type = "PHONE";
-            } else if (std::regex_search(numericText, card)) {
+            } else if (re2::RE2::PartialMatch(numericText, PATTERN_CARD)) {
                 type = "CARD";
-            } else if (std::regex_search(numericText, ip)) {
+            } else if (re2::RE2::PartialMatch(numericText, PATTERN_IP)) {
                 type = "IP";
-            } else if (std::regex_search(numericText, account)) {
+            } else if (re2::RE2::PartialMatch(numericText, PATTERN_ACCOUNT)) {
                 type = "ACCOUNT";
             }
         }
@@ -421,25 +412,27 @@ bool SecureCastOcrEngine::heuristic_filter(
     const SecureCastOcrBox& box,
     const std::string& rawText
 ) {
-    // 현재 함수에는 sourceWindow(HWND)가 없기 때문에,
-    // PDF의 프로세스 이름 / 윈도우 타이틀 기반 필터는 아직 직접 적용하지 못한다.
-    // 대신 OCR 텍스트 주변 문맥 기반 필터를 먼저 구현한다.
-
     (void)box;
+
+    // === RE2 옵션: 대소문자 무시 ===
+    static const re2::RE2::Options CASE_INSENSITIVE_OPTIONS = [] {
+        re2::RE2::Options options;
+        options.set_case_sensitive(false);
+        return options;
+    }();
 
     // === 규칙 1: 고위험 문맥 키워드가 있으면 유지 ===
     // 주소, 전화, 계좌, 카드, 결제, 주민번호, 이메일 관련 단어가 있으면 블러한다.
-    static const std::regex highRiskContext(
+    static const re2::RE2 PATTERN_HIGH_RISK_CONTEXT(
         R"((주소|전화|휴대폰|계좌|카드|결제|주민|이메일|email|mail|tel|phone|account|card))",
-        std::regex_constants::icase
+        CASE_INSENSITIVE_OPTIONS
     );
 
-    if (std::regex_search(rawText, highRiskContext)) {
+    if (re2::RE2::PartialMatch(rawText, PATTERN_HIGH_RISK_CONTEXT)) {
         return true;
     }
 
     // === 규칙 2: 기본 정책 ===
     // 개인정보로 의심되면 보수적으로 마스킹한다.
-    // 즉, 애매하면 블러한다.
     return true;
 }
