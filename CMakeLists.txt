@@ -43,7 +43,12 @@ add_library(${CMAKE_PROJECT_NAME} MODULE)
 # OBS 코어 라이브러리 (libobs) 찾아서 우리 dll에 link.
 # OBS::libobs 타겟은 .deps/cmake/libobsConfig.cmake에서 정의됨.
 find_package(libobs REQUIRED)
-target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs)
+find_package(re2 CONFIG REQUIRED)
+
+target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE
+  OBS::libobs
+  re2::re2
+)
 
 # helpers_common.cmake가 만든 plugin-support 정적 라이브러리는 obs.h를 #include
 # (blogva 등) 하므로 자기 자신도 libobs에 link해야 컴파일된다.
