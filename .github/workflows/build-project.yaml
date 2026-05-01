@@ -105,15 +105,7 @@ jobs:
 
       - name: Install RE2
         run: |
-          $vcpkgRoot = $env:VCPKG_INSTALLATION_ROOT
-          if (-not $vcpkgRoot) {
-            $vcpkgRoot = "C:\vcpkg"
-          }
-
           vcpkg install re2:x64-windows
-
-          "CMAKE_TOOLCHAIN_FILE=$vcpkgRoot/scripts/buildsystems/vcpkg.cmake" >> $env:GITHUB_ENV
-          "VCPKG_TARGET_TRIPLET=x64-windows" >> $env:GITHUB_ENV
 
       - name: Build Plugin 🧱
         uses: ./.github/actions/build-plugin
