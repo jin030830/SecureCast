@@ -43,6 +43,15 @@ add_library(${CMAKE_PROJECT_NAME} MODULE)
 # OBS 코어 라이브러리 (libobs) 찾아서 우리 dll에 link.
 # OBS::libobs 타겟은 .deps/cmake/libobsConfig.cmake에서 정의됨.
 find_package(libobs REQUIRED)
+
+if(WIN32)
+  if(DEFINED ENV{VCPKG_INSTALLATION_ROOT})
+    list(APPEND CMAKE_PREFIX_PATH "$ENV{VCPKG_INSTALLATION_ROOT}/installed/x64-windows")
+  elseif(EXISTS "C:/vcpkg/installed/x64-windows")
+    list(APPEND CMAKE_PREFIX_PATH "C:/vcpkg/installed/x64-windows")
+  endif()
+endif()
+
 find_package(re2 CONFIG REQUIRED)
 
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE
