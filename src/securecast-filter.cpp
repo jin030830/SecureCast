@@ -393,20 +393,38 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
 
                 const int maxRects = (int)(sizeof(payload.rects) / sizeof(payload.rects[0]));
 
-                for (const auto& box : ocrBoxes) {
-                    if (payload.rectCount >= maxRects)
-                        break;
+for (const auto& box : ocrBoxes) {
+    if (payload.rectCount >= maxRects)
+        break;
 
-                    BlurRect& r = payload.rects[payload.rectCount++];
+    int x      = static_cast<int>(box.x);
+    int y      = static_cast<int>(box.y);
+    int width  = static_cast<int>(box.w);
+    int height = static_cast<int>(box.h);
 
-                    // 假设 ocr-engine.h 里的 box 字段是 x/y/width/height。
-                    // 如果你的字段名不同，编译时这里会报错，需要按 ocr-engine.h 改。
-                    r.x      = box.x;
-                    r.y      = box.y;
-                    r.width  = box.width;
-                    r.height = box.height;
-                    r.type   = 1; // Blackout
-                }
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+
+    if (x >= static_cast<int>(w) || y >= static_cast<int>(h))
+        continue;
+
+    if (x + width > static_cast<int>(w))
+        width = static_cast<int>(w) - x;
+
+    if (y + height > static_cast<int>(h))
+        height = static_cast<int>(h) - y;
+
+    if (width <= 0 || height <= 0)
+        continue;
+
+    BlurRect& r = payload.rects[payload.rectCount++];
+
+    r.x      = x;
+    r.y      = y;
+    r.width  = width;
+    r.height = height;
+    r.type   = 1; // Blackout
+}
 
                 // 即使识别结果为 0，也发布空 payload，用来清掉旧遮罩。
                 filter->maskChannel.publish(payload);
