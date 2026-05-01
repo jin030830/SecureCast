@@ -18,11 +18,15 @@
 #include "securecast-filter.h"
 #include "plugin-support.h"   // obs_log
 #include "window_tracker.h"   // sc_tracker_tick (Role A: 블랙리스트 앱 좌표 수집)
+#include "ocr-engine.h"       // [Role B] OCR engine
+
 #include <chrono>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include "securecast-filter.h"
-#include "ocr-engine.h"   // [Role B] OCR engine
+#include <utility>
+#include <vector>
+
 // ================================================================
 // [Role C] FrameRingBuffer 구현부
 // ================================================================
@@ -80,8 +84,6 @@ void FrameRingBuffer::pushFrame(obs_source_t* source, uint64_t timestamp)
     gs_texrender_t* tr = m_slots[m_head].texrender;
     gs_texrender_reset(tr);
 
-    // gs_texrender_begin/end가 내부적으로 렌더 타겟, 뷰포트, 투영 행렬을
-    // 안전하게 저장/복원해 주므로 OBS 렌더 상태가 오염되지 않는다.
     if (gs_texrender_begin(tr, m_width, m_height)) {
         struct vec4 clearColor;
         vec4_zero(&clearColor);
@@ -95,7 +97,6 @@ void FrameRingBuffer::pushFrame(obs_source_t* source, uint64_t timestamp)
 
     m_slots[m_head].timestamp = timestamp;
 
-    // 다음 HEAD로 순환
     m_head = (m_head + 1) % SC_RING_BUFFER_SLOTS;
     if (m_frameCount < SC_RING_BUFFER_SLOTS)
         m_frameCount++;
@@ -111,7 +112,59 @@ const FrameRingBuffer::Slot* FrameRingBuffer::peekDelayedSlot() const
 }
 
 // ================================================================
+// [Role B/C] GPU texture -> CPU BGRA pixels
+// ================================================================
+
+static bool read_texture_bgra_to_cpu(
+    gs_texture_t* texture,
+    uint32_t width,
+    uint32_t height,
+    std::vector<uint8_t>& outPixels,
+    int& outStride)
+{
+    if (!texture || width == 0 || height == 0)
+        return false;
+
+    gs_stagesurf_t* stage = gs_stagesurface_create(width, height, GS_BGRA);
+    if (!stage) {
+        blog(LOG_ERROR, "[securecast][ocr] Failed to create staging surface.");
+        return false;
+    }
+
+    gs_stage_texture(stage, texture);
+
+    uint8_t* mappedData = nullptr;
+    uint32_t mappedStride = 0;
+
+    if (!gs_stagesurface_map(stage, &mappedData, &mappedStride)) {
+        blog(LOG_WARNING, "[securecast][ocr] Failed to map staging surface.");
+        gs_stagesurface_destroy(stage);
+        return false;
+    }
+
+    const uint32_t tightStride = width * 4;
+    outPixels.resize((size_t)tightStride * height);
+
+    for (uint32_t y = 0; y < height; y++) {
+        memcpy(
+            outPixels.data() + (size_t)y * tightStride,
+            mappedData + (size_t)y * mappedStride,
+            tightStride
+        );
+    }
+
+    gs_stagesurface_unmap(stage);
+    gs_stagesurface_destroy(stage);
+
+    outStride = (int)tightStride;
+    return true;
+}
+
+// ================================================================
 // [Role C] MockAIWorker 구현부
+//
+// 注意：这个类现在保留，但 securecast_video_render() 里不再 start 它。
+// 这样可以先切到真实 OCR pipeline。
 // ================================================================
 
 void MockAIWorker::start(uint32_t frameWidth, uint32_t frameHeight, ResultCallback callback)
@@ -149,7 +202,6 @@ void MockAIWorker::stop()
 void MockAIWorker::workerLoop()
 {
     while (m_running.load()) {
-        // AI 처리 시간 시뮬레이션 (실제 OCR 처리 예상 지연: ~40~60ms)
         {
             std::unique_lock<std::mutex> lock(m_mutex);
             m_cv.wait_for(lock, std::chrono::milliseconds(50),
@@ -159,11 +211,11 @@ void MockAIWorker::workerLoop()
         if (!m_running.load())
             break;
 
-        // 가짜 마스킹 결과 생성: 화면 정중앙에 200x100 픽셀의 블랙아웃 박스 하나
+        // Mock 逻辑保留备用，但当前真实 OCR pipeline 不会启动这个 worker。
         MaskPayload payload{};
         payload.rectCount = 1;
-        payload.rects[0].x     = static_cast<int>(m_frameWidth  / 2) - 100;
-        payload.rects[0].y     = static_cast<int>(m_frameHeight / 2) - 50;
+        payload.rects[0].x      = static_cast<int>(m_frameWidth  / 2) - 100;
+        payload.rects[0].y      = static_cast<int>(m_frameHeight / 2) - 50;
         payload.rects[0].width  = 200;
         payload.rects[0].height = 100;
         payload.rects[0].type   = 1; // Blackout
@@ -175,10 +227,6 @@ void MockAIWorker::workerLoop()
 
 // ================================================================
 // [Role C] AtomicMaskChannel 구현부
-//
-// [P0 수정] m_pending은 비원자적 구조체이므로 뮤텍스로 보호한다.
-// 이전 코드는 memory_order만으로 data race를 방지하려 했으나,
-// m_pending 쓰기 중에 Render Thread가 읽으면 torn read가 발생한다.
 // ================================================================
 
 void AtomicMaskChannel::publish(const MaskPayload& payload)
@@ -192,9 +240,11 @@ bool AtomicMaskChannel::consume(MaskPayload& out)
 {
     if (!m_ready.load(std::memory_order_acquire))
         return false;
+
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_ready.exchange(false, std::memory_order_acq_rel))
-        return false; // 다른 consumer가 먼저 가져간 경우 (현재는 단일이지만 방어적 처리)
+        return false;
+
     out = m_pending;
     return true;
 }
@@ -203,19 +253,12 @@ bool AtomicMaskChannel::consume(MaskPayload& out)
 // Filter Lifecycle Callbacks
 // ================================================================
 
-// OBS가 필터 메뉴/관리 UI에 표시할 이름.
-// 인자 type_data는 obs_source_info::type_data 필드 — 우리는 안 씀.
 static const char* securecast_get_name(void* type_data)
 {
     (void)type_data;
     return "SecureCast Privacy Masking";
 }
 
-// 사용자가 어떤 비디오 소스에 SecureCast 필터를 추가할 때 호출.
-// settings는 OBS Properties UI에서 사용자가 입력한 값 (현재 미사용),
-// context는 OBS가 만든 이 필터의 source 핸들.
-//
-// 반환값은 OBS가 보관하다가 이후 모든 콜백의 data 인자로 다시 넘겨준다.
 static void* securecast_create(obs_data_t* settings, obs_source_t* context)
 {
     (void)settings;
@@ -225,33 +268,26 @@ static void* securecast_create(obs_data_t* settings, obs_source_t* context)
     filter->isActive     = true;
     filter->isGameMode   = false;
     filter->currentState = SecurityState::SAFE;
-    filter->trackerAccumulator = 0.0f;  // window_tracker tick throttle 누산기
+    filter->trackerAccumulator = 0.0f;
 
     obs_log(LOG_INFO, "[SecureCast] Filter created.");
 
-    // TODO: Role C - Initialize N-Frame Delay Queue here
     // [Role B] OCR Engine 초기화
     filter->ocrEngine.init();
-    
-    // TODO: Role A - Initialize Window Tracking Subsystem here (HLSL effect 컴파일 등)
-    // FrameRingBuffer는 첫 video_render 호출 시 지연 초기화 (OBS gs context 필요)
-    // MockAIWorker도 렌더러가 실제 해상도를 알게 되는 시점(video_render)에 맞춰 시작하도록 연기합니다.
 
-    blog(LOG_INFO, "Filter created (Role C: Mock Pipeline Active).");
+    blog(LOG_INFO, "Filter created (Role B/C: OCR Pipeline Active).");
     return filter;
 }
 
-// 필터 인스턴스 정리. OBS는 이 시점 이후 동일 data 포인터를 다시 안 넘긴다.
 static void securecast_destroy(void* data)
 {
     SecureCastFilter* filter = static_cast<SecureCastFilter*>(data);
 
     blog(LOG_INFO, "Destroying filter...");
 
-    // AI 워커 먼저 중지 (콜백이 ring buffer에 접근하지 않도록)
+    // 当前不再启动 MockAIWorker，但 stop() 保留是安全的。
     filter->mockWorker.stop();
 
-    // GPU 텍스처 해제 (내부에서 obs_enter/leave_graphics 처리)
     filter->ringBuffer.destroy();
 
     delete filter;
@@ -259,21 +295,9 @@ static void securecast_destroy(void* data)
 }
 
 // ================================================================
-// [Role C] 핵심 렌더 루프 (60 FPS)
-//
-// 흐름도:
-//
-//   ┌─────────────────────────────────────────────────┐
-//   │ video_render() [Render Thread, ~16ms 주기]       │
-//   │                                                   │
-//   │  1. 링 버퍼 지연 초기화 (첫 프레임 한 번만)        │
-//   │  2. 현재 프레임 → Ring Buffer HEAD 에 Push        │
-//   │  3. AtomicMaskChannel에서 최신 AI 결과 Consume    │
-//   │  4. Ring Buffer TAIL(N프레임 전) 꺼내기           │
-//   │  5a. 버퍼 미충족 → 블랙 홀드 프레임 출력           │
-//   │  5b. 버퍼 충족  → 지연 프레임 + 마스킹 박스 출력   │
-//   └─────────────────────────────────────────────────┘
+// [Role C] 핵심 렌더 루프
 // ================================================================
+
 static void securecast_video_render(void* data, gs_effect_t* effect)
 {
     (void)effect;
@@ -284,7 +308,6 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
         return;
     }
 
-    // 상위 소스의 실제 해상도 가져오기
     obs_source_t* parent = obs_filter_get_parent(filter->context);
     if (!parent) {
         obs_source_skip_video_filter(filter->context);
@@ -298,76 +321,42 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
         return;
     }
 
-    // --- Step 1: 링 버퍼 지연 초기화 또는 해상도 변경 대응 ---
+    // --- Step 1: Ring buffer init / resize ---
     if (!filter->ringBuffer.isInitialized()) {
         if (!filter->ringBuffer.initialize(w, h)) {
             obs_source_skip_video_filter(filter->context);
             return;
         }
-        // 첫 초기화 시 AI 워커도 실제 해상도로 시작
-        filter->mockWorker.start(w, h, [filter](const MaskPayload& payload) {
-            filter->maskChannel.publish(payload);
-        });
+
+        // 不再启动 MockAIWorker。
+        blog(LOG_INFO, "[securecast][ocr] Real OCR pipeline waiting for delayed frames.");
     } else if (filter->ringBuffer.getWidth() != w || filter->ringBuffer.getHeight() != h) {
-        // [P1 수정] 소스 해상도가 바뀌면 텍스처를 재생성해야 화면 깨짐 및 크래시 방지
         blog(LOG_INFO, "Resolution changed (%dx%d -> %dx%d). Reinitializing ring buffer.",
                 filter->ringBuffer.getWidth(), filter->ringBuffer.getHeight(), w, h);
-        
-        // 1. AI 워커 중지 (진행 중인 텍스처 읽기/분석 취소)
+
         filter->mockWorker.stop();
 
-        // 2. 링 버퍼 파괴 및 재할당
         filter->ringBuffer.destroy();
         if (!filter->ringBuffer.initialize(w, h)) {
             obs_source_skip_video_filter(filter->context);
             return;
         }
 
-        // 3. 이전 해상도에서 만들어진 쓸모없는 마스킹 큐 비우기
         MaskPayload dummy;
         while (filter->maskChannel.consume(dummy)) {}
         filter->lastMask = MaskPayload{};
 
-        // 4. 새 해상도로 AI 워커 재시작
-        filter->mockWorker.start(w, h, [filter](const MaskPayload& payload) {
-            filter->maskChannel.publish(payload);
-        });
+        blog(LOG_INFO, "[securecast][ocr] Real OCR pipeline restarted after resize.");
     }
 
-    // --- Step 2: 현재 프레임을 Ring Buffer HEAD에 Push ---
+    // --- Step 2: Push current frame to Ring Buffer ---
     uint64_t ts = obs_get_video_frame_time();
     filter->ringBuffer.pushFrame(parent, ts);
-// =====================================================
-// [Role B] OCR 분석 호출 (현재는 stub)
-// =====================================================
-    if (filter->ocrEngine.available()) {
-    // TODO(Role B/C):
-    // GPU readback 결과를 통해 실제 BGRA 픽셀을 전달받아야 함
-    // 현재 단계에서는 OCR 파이프라인 연결만 수행
 
-    const uint8_t* pixels = nullptr;
-    int stride = 0;
-
-    auto ocrBoxes = filter->ocrEngine.analyze_bgra_frame(
-        pixels,
-        (int)w,
-        (int)h,
-        stride
-    );
-
-    // TODO:
-    // ocrBoxes → BlurRect 변환 → maskChannel 또는 렌더 파이프라인에 전달
-}
-    // --- Step 3: AI 결과 채널에서 최신 마스킹 페이로드 Consume ---
-    MaskPayload newMask{};
-    if (filter->maskChannel.consume(newMask))
-        filter->lastMask = newMask;
-
-    // --- Step 4~5: N프레임 지연된 슬롯 꺼내기 ---
+    // --- Step 3: Get delayed frame ---
     const FrameRingBuffer::Slot* delayedSlot = filter->ringBuffer.peekDelayedSlot();
 
     if (!delayedSlot || !delayedSlot->getTexture()) {
-        // 버퍼가 아직 충분히 안 쌓임 → 검정 홀드 프레임 (Bounded Exposure: 노출 0)
         gs_effect_t* solid = obs_get_base_effect(OBS_EFFECT_SOLID);
         gs_effect_set_color(gs_effect_get_param_by_name(solid, "color"), 0xFF000000);
         while (gs_effect_loop(solid, "Solid"))
@@ -375,19 +364,75 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
         return;
     }
 
-    // --- Step 5b: 지연 프레임 그리기 ---
+    // =====================================================
+    // [Role B] Real OCR analysis from delayed frame
+    // =====================================================
+    if (filter->ocrEngine.available()) {
+        static int ocrFrameCounter = 0;
+        ocrFrameCounter++;
+
+        // 不要每帧 OCR。30fps 下约 0.5 秒识别一次。
+        if (ocrFrameCounter >= 15) {
+            ocrFrameCounter = 0;
+
+            std::vector<uint8_t> bgraPixels;
+            int stride = 0;
+
+            gs_texture_t* ocrTex = delayedSlot->getTexture();
+
+            if (read_texture_bgra_to_cpu(ocrTex, w, h, bgraPixels, stride)) {
+                auto ocrBoxes = filter->ocrEngine.analyze_bgra_frame(
+                    bgraPixels.data(),
+                    (int)w,
+                    (int)h,
+                    stride
+                );
+
+                MaskPayload payload{};
+                payload.rectCount = 0;
+
+                const int maxRects = (int)(sizeof(payload.rects) / sizeof(payload.rects[0]));
+
+                for (const auto& box : ocrBoxes) {
+                    if (payload.rectCount >= maxRects)
+                        break;
+
+                    BlurRect& r = payload.rects[payload.rectCount++];
+
+                    // 假设 ocr-engine.h 里的 box 字段是 x/y/width/height。
+                    // 如果你的字段名不同，编译时这里会报错，需要按 ocr-engine.h 改。
+                    r.x      = box.x;
+                    r.y      = box.y;
+                    r.width  = box.width;
+                    r.height = box.height;
+                    r.type   = 1; // Blackout
+                }
+
+                // 即使识别结果为 0，也发布空 payload，用来清掉旧遮罩。
+                filter->maskChannel.publish(payload);
+
+                blog(LOG_INFO, "[securecast][ocr] OCR boxes: %d", payload.rectCount);
+            }
+        }
+    }
+
+    // --- Step 4: Consume latest OCR mask result ---
+    MaskPayload newMask{};
+    if (filter->maskChannel.consume(newMask))
+        filter->lastMask = newMask;
+
+    // --- Step 5: Draw delayed frame ---
     gs_texture_t* delayedTex = delayedSlot->getTexture();
     gs_effect_t* draw = obs_get_base_effect(OBS_EFFECT_DEFAULT);
     gs_effect_set_texture(gs_effect_get_param_by_name(draw, "image"), delayedTex);
     while (gs_effect_loop(draw, "Draw"))
         gs_draw_sprite(delayedTex, 0, w, h);
 
-    // --- 마스킹 오버레이: BlurRect 영역에 검정 박스 덮어쓰기 (Mock 시각화) ---
-    // TODO (Role A): 이 부분을 HLSL Pixel Blur Shader 호출로 교체
+    // --- Step 6: Draw masking overlay ---
     if (filter->lastMask.rectCount > 0) {
         gs_effect_t* solid = obs_get_base_effect(OBS_EFFECT_SOLID);
         gs_eparam_t* colorParam = gs_effect_get_param_by_name(solid, "color");
-        gs_effect_set_color(colorParam, 0xFF000000); // 불투명 검정
+        gs_effect_set_color(colorParam, 0xFF000000);
 
         gs_matrix_push();
         while (gs_effect_loop(solid, "Solid")) {
@@ -401,16 +446,11 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
         gs_matrix_pop();
     }
 }
+
 // ---------------------------------------------------------
-// Tick (Slow-Path) — 매 프레임 호출되지만 윈도우 추적은 0.15초마다
+// Tick (Slow-Path)
 // ---------------------------------------------------------
-//
-// OBS 렌더링 파이프라인은 60fps라 video_tick도 60Hz로 들어온다.
-// 그러나 EnumWindows는 무거운 호출이라 매 tick 돌리면 CPU 낭비가 크다.
-// → window_tracker.cpp의 sc_tracker_tick이 trackerAccumulator를 누산해
-//   임계 (0.15초) 를 넘을 때만 실제 스캔을 수행한다.
-//
-// seconds: 직전 tick과의 경과 시간(초). 60fps면 약 0.0167.
+
 static void securecast_video_tick(void* data, float seconds)
 {
     SecureCastFilter* filter = (SecureCastFilter*)data;
@@ -419,29 +459,20 @@ static void securecast_video_tick(void* data, float seconds)
 
     sc_tracker_tick(seconds, &filter->trackerAccumulator);
 }
-  
+
 // ================================================================
 // Source Info Dispatch Table
-// ---------------------------------------------------------
-//
-// 위 콜백들을 묶어 OBS에 등록할 obs_source_info 구조체.
-// lambda-IIFE 패턴 ([]{...}()) 으로 정적 초기화하면서 필드를 채운다.
-// plugin-main.cpp의 obs_register_source(&securecast_filter_info) 가 이걸 등록.
-//
-// 핵심 필드:
-//   id           : 내부 식별자 (씬/scene-collection 저장 시 키로 사용됨)
-//   type         : OBS_SOURCE_TYPE_FILTER → 입력/트랜지션이 아닌 "필터"
-//   output_flags : OBS_SOURCE_VIDEO → 비디오 필터 (오디오 아님)
-//                  → 이 플래그 덕에 OBS가 "효과 필터" 메뉴에 노출시킴
+// ================================================================
+
 struct obs_source_info securecast_filter_info = []() {
     struct obs_source_info info = {};
     info.id           = "securecast_filter";
     info.type         = OBS_SOURCE_TYPE_FILTER;
     info.output_flags = OBS_SOURCE_VIDEO;
-    info.get_name = securecast_get_name;
-    info.create = securecast_create;
-    info.destroy = securecast_destroy;
-    info.video_tick = securecast_video_tick;
+    info.get_name     = securecast_get_name;
+    info.create       = securecast_create;
+    info.destroy      = securecast_destroy;
+    info.video_tick   = securecast_video_tick;
     info.video_render = securecast_video_render;
     return info;
 }();
