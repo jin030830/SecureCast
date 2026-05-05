@@ -22,11 +22,23 @@
 
 #include <algorithm>
 #include <chrono>
+#include <memory>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <utility>
 #include <vector>
+
+// ================================================================
+// SecureCastFilter 구현부
+// ================================================================
+
+SecureCastFilter::SecureCastFilter()
+    : ocrEngine(std::make_unique<SecureCastOcrEngine>())
+{
+}
+
+SecureCastFilter::~SecureCastFilter() = default;
 
 // ================================================================
 // [Role C] FrameRingBuffer 구현부
@@ -294,7 +306,7 @@ static void ocr_worker_loop(SecureCastFilter* filter)
     if (!filter)
         return;
 
-    const bool ocrReady = filter->ocrEngine.init();
+    const bool ocrReady = filter->ocrEngine ? filter->ocrEngine->init() : false;
     if (ocrReady) {
         blog(LOG_INFO, "[securecast][ocr] OCR worker initialized.");
     } else {
@@ -333,7 +345,7 @@ static void ocr_worker_loop(SecureCastFilter* filter)
         if (!ocrReady || pixels.empty() || width <= 0 || height <= 0 || stride <= 0)
             continue;
 
-        auto ocrBoxes = filter->ocrEngine.analyze_bgra_frame(
+        auto ocrBoxes = filter->ocrEngine->analyze_bgra_frame(
             pixels.data(),
             width,
             height,
