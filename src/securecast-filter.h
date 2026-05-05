@@ -22,11 +22,15 @@
 #include <array>
 #include <condition_variable>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
 
-#include "ocr-engine.h"
+// ocr-engine.h는 이 헤더에서 직접 include하지 않는다.
+// WinRT/OCR 관련 의존성이 다른 translation unit으로 전파되는 것을 막기 위해
+// SecureCastOcrEngine은 forward declaration + unique_ptr로 보관한다.
+class SecureCastOcrEngine;
 
 // ----------------------------------------------------
 // OBS Headers
@@ -185,6 +189,12 @@ private:
 // 모든 Role이 참조하는 필터 인스턴스
 // ----------------------------------------------------
 struct SecureCastFilter {
+    SecureCastFilter();
+    ~SecureCastFilter();
+
+    SecureCastFilter(const SecureCastFilter&) = delete;
+    SecureCastFilter& operator=(const SecureCastFilter&) = delete;
+
     obs_source_t* context = nullptr;
 
     // UI 및 운영 토글 상태
@@ -204,7 +214,8 @@ struct SecureCastFilter {
 
     // ----- [Role B] OCR 엔진 -----
     // OCR 엔진은 render thread가 아니라 OCR worker thread 내부에서 init()한다.
-    SecureCastOcrEngine ocrEngine;
+    // forward declaration을 위해 unique_ptr로 보관하여 ocr-engine.h 의존성을 분리한다.
+    std::unique_ptr<SecureCastOcrEngine> ocrEngine;
 
     // ----- [Role B/C] OCR용 GPU readback 재사용 리소스 -----
     // 매 OCR마다 gs_stagesurface_create/destroy를 반복하지 않기 위해 보관한다.
