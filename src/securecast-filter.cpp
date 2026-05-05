@@ -277,9 +277,14 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
     (void)effect;
 
     SecureCastFilter* filter = static_cast<SecureCastFilter*>(data);
-    if (!filter->isActive) {
-        obs_source_skip_video_filter(filter->context);
-        return;
+
+    // isActive는 GUI 스레드(update)에서도 쓸 수 있으므로 settingsMutex로 보호
+    {
+        std::lock_guard<std::mutex> lock(filter->settingsMutex);
+        if (!filter->isActive) {
+            obs_source_skip_video_filter(filter->context);
+            return;
+        }
     }
 
     // 상위 소스의 실제 해상도 가져오기
@@ -390,11 +395,15 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
             state = filter->currentState;
         }
 
-        uint32_t borderColor = 0xFF00FF00; // 기본: SAFE (초록, 0xAARRGGBB)
+        // gs_effect_set_color()는 OBS ARGB 포맷: 상위 바이트부터 A·R·G·B 순서
+        //   SAFE    0xFF00FF00 : A=FF R=00 G=FF B=00 → 초록
+        //   PARTIAL 0xFFFFFF00 : A=FF R=FF G=FF B=00 → 노랑
+        //   RISK    0xFFFF0000 : A=FF R=FF G=00 B=00 → 빨강
+        uint32_t borderColor = 0xFF00FF00; // SAFE: 초록
         if (state == SecurityState::PARTIAL)
-            borderColor = 0xFFFFFF00; // 노랑 (0xAARRGGBB)
+            borderColor = 0xFFFFFF00; // PARTIAL: 노랑
         else if (state == SecurityState::RISK)
-            borderColor = 0xFFFF0000; // 빨강 (0xAARRGGBB)
+            borderColor = 0xFFFF0000; // RISK: 빨강
 
         const int BORDER = 6; // 테두리 두께 (픽셀)
 
