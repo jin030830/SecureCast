@@ -1,6 +1,5 @@
 #include "ocr-engine.h"
 #include <initializer_list>
-#include <winrt/Windows.Foundation.Collections.h>
 #include <algorithm>
 #include <cstring>
 #include <cstdint>
@@ -13,6 +12,7 @@
 
 #ifdef _WIN32
 #include <winrt/base.h>
+#include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Globalization.h>
 #include <winrt/Windows.Graphics.Imaging.h>
@@ -23,15 +23,20 @@
 // ============================================================
 // Role B — 온디바이스 AI 엔진
 // 담당 기능: ② 위험 키워드 블러
-// 구성: OCR + Google RE2 정규식 + 휴리스틱 필터 + Dirty Rect Skip
+// 구성: OCR + Google RE2 정규식 + Dirty Rect Skip
 // ============================================================
 
 #ifdef _WIN32
 struct SecureCastOcrEngine::Impl {
     winrt::Windows::Media::Ocr::OcrEngine engine{nullptr};
+    int lastFrameWidth{-1};
+    int lastFrameHeight{-1};
 };
 #else
-struct SecureCastOcrEngine::Impl {};
+struct SecureCastOcrEngine::Impl {
+    int lastFrameWidth{-1};
+    int lastFrameHeight{-1};
+};
 #endif
 
 // ============================================================
@@ -73,6 +78,11 @@ bool SecureCastOcrEngine::init()
 {
 #ifdef _WIN32
     try {
+        hasLastFrameHash_ = false;
+        lastBoxes_.clear();
+        impl_->lastFrameWidth = -1;
+        impl_->lastFrameHeight = -1;
+
         try {
             winrt::init_apartment(winrt::apartment_type::multi_threaded);
         } catch (const winrt::hresult_error&) {
@@ -110,7 +120,7 @@ bool SecureCastOcrEngine::available() const
 
 // ============================================================
 // 4. 적응형 Dirty Rect Skip — 성능 최적화
-// 현재 구현: FNV-1a 샘플링 해시 기반 Dirty Skip
+// 현재 구현: FNV-1a 전체 픽셀 해시 기반 Dirty Skip
 // ============================================================
 
 std::vector<SecureCastOcrBox> SecureCastOcrEngine::analyze_bgra_frame(
@@ -123,11 +133,20 @@ std::vector<SecureCastOcrBox> SecureCastOcrEngine::analyze_bgra_frame(
         return {};
     }
 
-    // === STEP 4-1: 현재 프레임 해시 계산 ===
-    uint64_t currentHash = compute_frame_hash(pixels, width, height, stride);
+    if (stride < width * 4) {
+        return {};
+    }
 
-    // === STEP 4-2: 이전 프레임과 같으면 OCR 생략 ===
-    if (hasLastFrameHash_ && currentHash == lastFrameHash_) {
+    // === STEP 4-1: 현재 프레임 해시 계산 ===
+    const uint64_t currentHash = compute_frame_hash(pixels, width, height, stride);
+
+    // === STEP 4-2: 같은 해상도 + 같은 해시인 경우에만 OCR 생략 ===
+    // 해상도가 바뀌었는데 이전 좌표를 재사용하면 마스크 위치가 어긋난다.
+    const bool sameResolution =
+        impl_->lastFrameWidth == width &&
+        impl_->lastFrameHeight == height;
+
+    if (hasLastFrameHash_ && sameResolution && currentHash == lastFrameHash_) {
         return lastBoxes_;
     }
 
@@ -138,6 +157,8 @@ std::vector<SecureCastOcrBox> SecureCastOcrEngine::analyze_bgra_frame(
     // === STEP 4-4: 결과 캐싱 ===
     lastFrameHash_ = currentHash;
     hasLastFrameHash_ = true;
+    impl_->lastFrameWidth = width;
+    impl_->lastFrameHeight = height;
     lastBoxes_ = boxes;
 
     return boxes;
@@ -150,26 +171,38 @@ uint64_t SecureCastOcrEngine::compute_frame_hash(
     int height,
     int stride
 ) {
-    uint64_t hash = 14695981039346656037ULL;
+    constexpr uint64_t kFnvOffset = 14695981039346656037ULL;
+    constexpr uint64_t kFnvPrime = 1099511628211ULL;
 
-    constexpr uint64_t prime = 1099511628211ULL;
-    constexpr int sampleStep = 16;
+    auto mixByte = [&](uint64_t& hash, uint8_t value) {
+        hash ^= static_cast<uint64_t>(value);
+        hash *= kFnvPrime;
+    };
 
-    for (int y = 0; y < height; y += sampleStep) {
+    auto mixUint32 = [&](uint64_t& hash, uint32_t value) {
+        mixByte(hash, static_cast<uint8_t>(value & 0xffU));
+        mixByte(hash, static_cast<uint8_t>((value >> 8U) & 0xffU));
+        mixByte(hash, static_cast<uint8_t>((value >> 16U) & 0xffU));
+        mixByte(hash, static_cast<uint8_t>((value >> 24U) & 0xffU));
+    };
+
+    uint64_t hash = kFnvOffset;
+
+    // 해상도와 stride까지 해시에 포함해 캐시 충돌 가능성을 낮춘다.
+    mixUint32(hash, static_cast<uint32_t>(width));
+    mixUint32(hash, static_cast<uint32_t>(height));
+    mixUint32(hash, static_cast<uint32_t>(stride));
+
+    const size_t rowBytes = static_cast<size_t>(width) * 4U;
+
+    // 기존 16픽셀 샘플링은 작은 텍스트 변경을 놓칠 수 있다.
+    // 보안 우선 정책이므로 실제 화면 영역의 BGRA 전체 바이트를 해시한다.
+    for (int y = 0; y < height; ++y) {
         const uint8_t *row =
             pixels + static_cast<size_t>(y) * static_cast<size_t>(stride);
 
-        for (int x = 0; x < width; x += sampleStep) {
-            const uint8_t *px = row + static_cast<size_t>(x) * 4;
-
-            hash ^= px[0];
-            hash *= prime;
-
-            hash ^= px[1];
-            hash *= prime;
-
-            hash ^= px[2];
-            hash *= prime;
+        for (size_t i = 0; i < rowBytes; ++i) {
+            mixByte(hash, row[i]);
         }
     }
 
@@ -190,6 +223,10 @@ std::vector<SecureCastOcrLine> SecureCastOcrEngine::recognize_text(
     std::vector<SecureCastOcrLine> lines;
 
     if (!impl_->engine || pixels == nullptr || width <= 0 || height <= 0 || stride <= 0) {
+        return lines;
+    }
+
+    if (stride < width * 4) {
         return lines;
     }
 
@@ -454,6 +491,26 @@ static bool has_name_label(const std::string& text)
     });
 }
 
+static bool has_adjacent_name_label(
+    const std::vector<SecureCastOcrLine>& lines,
+    int index
+) {
+    const int start = std::max(0, index - 1);
+    const int end = std::min(static_cast<int>(lines.size()) - 1, index + 1);
+
+    for (int i = start; i <= end; ++i) {
+        if (i == index) {
+            continue;
+        }
+
+        if (has_name_label(lines[i].text)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 static bool looks_like_korean_address_text(const std::string& text)
 {
     if (contains_any(text, {
@@ -499,7 +556,7 @@ static bool looks_like_korean_address_text(const std::string& text)
         return false;
     }
 
-    // 地址常见行政区/道路后缀：서울시, 강남구, 역삼동, 테헤란로, 세종대로, 12길 等
+    // 주소에서 자주 나오는 행정구역/도로명 접미사: 서울시, 강남구, 역삼동, 테헤란로, 세종대로, 12길 등
     if (ends_with(hangulOnly, "시") ||
         ends_with(hangulOnly, "군") ||
         ends_with(hangulOnly, "구") ||
@@ -563,7 +620,7 @@ static bool looks_like_korean_name_candidate(const std::string& text)
     const std::string hangulOnly = extract_hangul_syllables_utf8(text);
     const int hangulCount = count_hangul_syllables(hangulOnly);
 
-    // 韩国姓名通常 2~4 个韩文字，复姓时也覆盖。
+    // 한국 이름은 보통 2~4글자이며 복성도 포함한다.
     if (hangulCount < 2 || hangulCount > 4) {
         return false;
     }
@@ -719,36 +776,34 @@ std::vector<SecureCastOcrBox> SecureCastOcrEngine::detect_pii(
         }
 
         // === STEP 2-3-A: 이름 탐지 ===
-        // 1) "이름/성명/성함" 标签明确出现时，保守遮罩
-        // 2) 没有标签时，要求：韩文姓名候选 + 附近有邮箱/电话/地址/账号等上下文
+        // 1) "이름/성명/성함" 라벨이 명확하면 같은 줄 또는 인접 줄의 이름 후보까지 마스킹
+        // 2) 라벨이 없으면 한국 이름 후보 + 근처 이메일/전화/주소/계좌 문맥을 요구
         if (type == nullptr) {
             const bool explicitNameLabel = has_name_label(rawText);
             const bool nameCandidate = looks_like_korean_name_candidate(rawText);
+            const bool adjacentNameLabel = has_adjacent_name_label(lines, i);
 
             if (explicitNameLabel) {
+                // 같은 줄에 라벨과 실제 이름이 같이 나온 경우: "이름: 김철수"
                 const std::string hangulOnly = extract_hangul_syllables_utf8(rawText);
                 if (count_hangul_syllables(hangulOnly) >= 3) {
                     type = "NAME";
                 }
-            } else if (nameCandidate && has_nearby_pii_context(lines, i)) {
+            } else if (nameCandidate && (adjacentNameLabel || has_nearby_pii_context(lines, i))) {
+                // OCR이 "이름:"과 "김철수"를 서로 다른 라인으로 분리하는 경우를 처리한다.
                 type = "NAME";
             }
         }
 
         // === STEP 2-4: 패턴에 걸린 경우 Bounding Box 생성 ===
         if (type != nullptr) {
-            SecureCastOcrBox box{
+            boxes.push_back(SecureCastOcrBox{
                 type,
                 line.x,
                 line.y,
                 line.w,
                 line.h
-            };
-
-            // === STEP 3으로 전달: 휴리스틱 필터 적용 ===
-            if (heuristic_filter(box, rawText)) {
-                boxes.push_back(box);
-            }
+            });
         }
     }
 
@@ -763,30 +818,16 @@ bool SecureCastOcrEngine::heuristic_filter(
     const SecureCastOcrBox& box,
     const std::string& rawText
 ) {
-    // NAME / ADDRESS 是新增的隐私类型，直接保留。
-    if (std::strcmp(box.type, "NAME") == 0 ||
-        std::strcmp(box.type, "ADDRESS") == 0) {
-        return true;
-    }
+    (void)rawText;
 
-    // === RE2 옵션: 대소문자 무시 ===
-    static const re2::RE2::Options CASE_INSENSITIVE_OPTIONS = [] {
-        re2::RE2::Options options;
-        options.set_case_sensitive(false);
-        return options;
-    }();
-
-    // === 규칙 1: 고위험 문맥 키워드가 있으면 유지 ===
-    static const re2::RE2 PATTERN_HIGH_RISK_CONTEXT(
-        R"((주소|주소지|거주지|전화|휴대폰|핸드폰|계좌|카드|결제|주민|이메일|성명|이름|email|mail|tel|phone|account|card|name))",
-        CASE_INSENSITIVE_OPTIONS
-    );
-
-    if (re2::RE2::PartialMatch(rawText, PATTERN_HIGH_RISK_CONTEXT)) {
-        return true;
-    }
-
-    // === 규칙 2: 기본 정책 ===
-    // 개인정보로 의심되면 보수적으로 마스킹한다.
-    return true;
+    // detect_pii()에서 이미 타입별 판정을 끝냈다.
+    // 여기서 전부 true를 반환하면 필터 의미가 사라지므로, 알려진 타입만 통과시킨다.
+    return std::strcmp(box.type, "RRN") == 0 ||
+           std::strcmp(box.type, "PHONE") == 0 ||
+           std::strcmp(box.type, "EMAIL") == 0 ||
+           std::strcmp(box.type, "CARD") == 0 ||
+           std::strcmp(box.type, "IP") == 0 ||
+           std::strcmp(box.type, "ACCOUNT") == 0 ||
+           std::strcmp(box.type, "NAME") == 0 ||
+           std::strcmp(box.type, "ADDRESS") == 0;
 }
