@@ -192,7 +192,7 @@ struct SecureCastFilter {
 
     // UI 및 운영 토글 상태
     bool          isActive    = true;
-    bool          isGameMode  = false;
+    // bool          isGameMode  = false;  // [v2] 게임 모드 — 현재 스코프 외
     SecurityState currentState = SecurityState::SAFE;
 
     // ----- [Role C] 담당 필드 -----
@@ -206,6 +206,7 @@ struct SecureCastFilter {
     // gs_effect_t* blurEffect = nullptr;  // 컴파일된 HLSL 셰이더
 
     // ----- [Role D] 담당 필드 -----
+    mutable std::mutex settingsMutex;               // GUI 스레드(update) ↔ Render 스레드 간 설정값 보호
     std::string  blacklistApps  = "";    // 블랙리스트 앱 목록 (줄바꿈 구분)
     float        blurIntensity  = 5.0f; // 블러 강도 (1.0 ~ 10.0)
     float        sensitivity    = 0.5f; // 감지 민감도 (0.0 ~ 1.0)
