@@ -234,8 +234,10 @@ static MaskPayload build_mask_payload_from_ocr_boxes(
         int width  = static_cast<int>(box.w);
         int height = static_cast<int>(box.h);
 
-        x = std::max(0, x);
-        y = std::max(0, y);
+        if (x < 0)
+            x = 0;
+        if (y < 0)
+            y = 0;
 
         if (x >= frameWidth || y >= frameHeight)
             continue;
