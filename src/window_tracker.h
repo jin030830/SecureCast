@@ -8,8 +8,8 @@
 //   에 넘겨 해당 영역만 가려버리는 데 사용된다.
 //
 // 어디서 사용:
-//   - securecast-filter.cpp::securecast_video_tick → sc_tracker_tick 호출
-//   - sc_tracker_tick 내부에서 sc_scan_blacklisted_windows 호출 (150ms마다 1회)
+//   - securecast-filter.cpp::securecast_video_tick
+//     trackerAccumulator를 누산하여 0.15초마다 sc_scan_blacklisted_windows 직접 호출
 //
 // 왜 별도 파일:
 //   Win32 API (EnumWindows / DwmGetWindowAttribute / OpenProcess) 의존이
@@ -54,19 +54,7 @@ struct TrackedWindowList {
 // (DwmGetWindowAttribute는 caller 스레드 컨텍스트로 동작).
 void sc_scan_blacklisted_windows(TrackedWindowList *out);
 
-// video_tick의 throttle 헬퍼.
-// seconds : 직전 tick과의 경과 시간 (60fps면 약 0.0167)
-// accumulator : 누산값 보관 위치 (보통 SecureCastFilter::trackerAccumulator)
-//
-// 동작:
-//   1. *accumulator += seconds
-//   2. 0.15초 미만이면 즉시 리턴 (대부분의 호출은 여기서 끝)
-//   3. 임계 도달 시 sc_scan_blacklisted_windows 1회 + 결과를 obs_log로 출력
-//   4. *accumulator = 0
-//
-// 0.15초인 이유: 사람이 창 이동 후 마우스를 떼는 데 걸리는 시간보다 짧으면서,
-// 60fps tick 매번(0.0167) 호출하는 것보다는 ~9배 적게 EnumWindows 호출.
-void sc_tracker_tick(float seconds, float *accumulator);
+
 
 #ifdef __cplusplus
 }

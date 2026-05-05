@@ -93,7 +93,8 @@ public:
     void destroy();
 
     // gs_texrender_begin/end를 사용하여 안전하게 프레임을 캡처
-    void pushFrame(obs_source_t* source, uint64_t timestamp, obs_source_t* filter_context);
+    // [C-2 수정] 미사용 source 인자 제거 — obs_filter_get_target(filter_context)으로만 타겟을 구함
+    void pushFrame(uint64_t timestamp, obs_source_t* filter_context);
 
     const Slot* peekDelayedSlot() const;
 
@@ -192,12 +193,12 @@ struct SecureCastFilter {
 #ifdef _WIN32
     GpuReadback      readback;           // GPU 텍스처를 CPU 메모리로 지연 없이 복사하는 다중 슬롯 텍스처 풀
 #endif
-    PixelHashCache      fullScreenHash;  // FNV-1a 기반으로 화면 변화(Smart Grid)를 감지하여 AI 동작을 제어하는 객체
-    std::vector<uint8_t> fullScreenBuffer; // 64x64 다운샘플링된 픽셀 데이터 임시 보관용
-    
-    std::vector<uint8_t>        readbackBuffer;   // Readback을 통해 수확한 픽셀 데이터를 저장하는 CPU 버퍼 (Slot 0 + Slot 1)
-    uint64_t                    frameCounter = 0; // GPU와 CPU 간의 프레임 정합성을 맞추기 위한 카운터
-    PipelineHealth              health;           // GPU 스톨 또는 쿼리 실패 감지 시 자가 치유(Reset)를 담당하는 헬스 매니저
+    PixelHashCache       fullScreenHash;   // FNV-1a 기반으로 화면 변화(Smart Grid)를 감지하여 AI 동작을 제어하는 객체
+    // [C-3 수정] fullScreenBuffer 제거 — 실제 해시 입력은 readbackBuffer.data()(슬롯 0)에서 가져옴
+
+    std::vector<uint8_t> readbackBuffer;  // Readback을 통해 수확한 픽셀 데이터를 저장하는 CPU 버퍼 (Slot 0 + Slot 1)
+    uint64_t             frameCounter = 0; // GPU와 CPU 간의 프레임 정합성을 맞추기 위한 카운터
+    PipelineHealth       health;           // GPU 스톨 또는 쿼리 실패 감지 시 자가 치유(Reset)를 담당하는 헬스 매니저
 
     // ----- [Role A 담당: 윈도우 추적 및 블랙리스트] -----
     float         trackerAccumulator = 0.0f; // 윈도우 스캔 틱 조절(0.15초 단위)용 시간 누산기
