@@ -28,7 +28,50 @@
 #include <string.h>
 
 // window_tracker.cpp의 SCAN_INTERVAL_SEC(0.15f) 이상이면 즉시 스캔 트리거.
-static constexpr float SCAN_INTERVAL_FORCE = 1.0f;
+static constexpr float SCAN_INTERVAL_FORCE    = 1.0f;
+static constexpr float SCAN_INTERVAL_NORMAL   = 0.15f; // 일반 모드 스캔 주기
+static constexpr float SCAN_INTERVAL_GAME     = 0.5f;  // 게임 모드 스캔 주기
+
+// Game mode thresholds
+static constexpr float GM_CPU_ENTER     = 40.0f; // 진입 임계값 (%)
+static constexpr float GM_CPU_EXIT      = 30.0f; // 해제 임계값 (%)
+static constexpr float GM_ENTER_TIME    = 3.0f;  // 진입까지 ≥40% 유지 시간 (초)
+static constexpr float GM_EXIT_TIME     = 5.0f;  // 해제까지 ≤30%  유지 시간 (초)
+static constexpr float GM_SAMPLE_INTERVAL = 1.0f; // CPU 샘플링 주기 (초)
+
+// ================================================================
+// [Game Mode] GetSystemTimes 기반 시스템 전체 CPU 사용률 샘플링 (WIN32)
+//
+// GetSystemTimes: kernel 시간에 idle이 포함되므로
+//   CPU % = (kernel + user - idle) / (kernel + user) * 100
+// 멀티코어 기준 전체 평균값. 오버헤드 거의 0 (단순 syscall).
+// ================================================================
+#ifdef _WIN32
+static float sampleCpuUsage(FILETIME* prevIdle, FILETIME* prevKernel, FILETIME* prevUser)
+{
+    FILETIME idle, kernel, user;
+    if (!GetSystemTimes(&idle, &kernel, &user))
+        return 0.0f;
+
+    auto ft2u64 = [](FILETIME ft) -> uint64_t {
+        return (uint64_t(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+    };
+
+    uint64_t idleDiff   = ft2u64(idle)   - ft2u64(*prevIdle);
+    uint64_t kernelDiff = ft2u64(kernel) - ft2u64(*prevKernel);
+    uint64_t userDiff   = ft2u64(user)   - ft2u64(*prevUser);
+
+    *prevIdle   = idle;
+    *prevKernel = kernel;
+    *prevUser   = user;
+
+    uint64_t total = kernelDiff + userDiff;
+    if (total == 0)
+        return 0.0f;
+
+    return (float)(total - idleDiff) / (float)total * 100.0f;
+}
+#endif
 
 // ================================================================
 // [Role A] 윈도우 좌표 → OBS 소스 픽셀 좌표 변환 + 15% BBox 팽창
@@ -258,20 +301,42 @@ void MockAIWorker::stop()
     blog(LOG_INFO, "MockAIWorker stopped.");
 }
 
+void MockAIWorker::setPaused(bool paused)
+{
+    if (!m_running.load())
+        return;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_paused.store(paused, std::memory_order_relaxed);
+    }
+    m_cv.notify_all();
+    blog(LOG_INFO, "MockAIWorker %s.", paused ? "paused" : "resumed");
+}
+
 void MockAIWorker::workerLoop()
 {
     while (m_running.load()) {
-        // AI 처리 시간 시뮬레이션 (실제 OCR 처리 예상 지연: ~40~60ms)
         {
             std::unique_lock<std::mutex> lock(m_mutex);
-            m_cv.wait_for(lock, std::chrono::milliseconds(50),
-                          [this]() { return !m_running.load(); });
+            if (m_paused.load(std::memory_order_relaxed)) {
+                // 게임 모드 일시정지: stop() 또는 resume 신호까지 대기
+                m_cv.wait(lock, [this]() {
+                    return !m_running.load() ||
+                           !m_paused.load(std::memory_order_relaxed);
+                });
+            } else {
+                // AI 처리 시간 시뮬레이션 (실제 OCR 처리 예상 지연: ~40~60ms)
+                m_cv.wait_for(lock, std::chrono::milliseconds(50), [this]() {
+                    return !m_running.load() ||
+                            m_paused.load(std::memory_order_relaxed);
+                });
+            }
         }
 
-        if (!m_running.load())
-            break;
+        if (!m_running.load() || m_paused.load(std::memory_order_relaxed))
+            continue;
 
-        // Role B(실제 OCR/AI) 미구현 — 빈 페이로드 전달 (중앙 박스 제거)
+        // Role B(실제 OCR/AI) 미구현 — 빈 페이로드 전달
         MaskPayload payload{};
         payload.rectCount = 0;
 
@@ -355,6 +420,8 @@ static void* securecast_create(obs_data_t* settings, obs_source_t* context)
 
 #ifdef _WIN32
     filter->winListener.start();
+    // CPU 샘플링 기준점 초기화 (첫 샘플에서 diff가 0이 되지 않도록)
+    GetSystemTimes(&filter->prevIdleTime, &filter->prevKernelTime, &filter->prevUserTime);
 #endif
 
     // Panic 핫키 등록 (Ctrl+Shift+F12 기본 바인딩)
@@ -615,28 +682,43 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
                     all_count < (int)(sizeof(all_rects) / sizeof(all_rects[0])); i++)
         all_rects[all_count++] = filter->lastMask.rects[i];
 
-    if (all_count == 0)
-        return;
-
-    if (filter->blurEffect) {
-        // blur.effect 셰이더 사용 (Blur / Blackout technique)
-        for (int i = 0; i < all_count; i++)
-            render_blur_rect(filter->blurEffect, delayedTex, all_rects[i], w, h);
-    } else {
-        // 셰이더 로드 실패 시 fallback: 단색 검정 박스
-        gs_effect_t *solid = obs_get_base_effect(OBS_EFFECT_SOLID);
-        gs_effect_set_color(gs_effect_get_param_by_name(solid, "color"), 0xFF000000);
-        gs_matrix_push();
-        while (gs_effect_loop(solid, "Solid")) {
-            for (int i = 0; i < all_count; i++) {
-                gs_matrix_identity();
-                gs_matrix_translate3f((float)all_rects[i].x, (float)all_rects[i].y, 0.0f);
-                gs_draw_sprite(nullptr, 0, (uint32_t)all_rects[i].width,
-                               (uint32_t)all_rects[i].height);
+    if (all_count > 0) {
+        if (filter->blurEffect) {
+            // blur.effect 셰이더 사용 (Blur / Blackout technique)
+            for (int i = 0; i < all_count; i++)
+                render_blur_rect(filter->blurEffect, delayedTex, all_rects[i], w, h);
+        } else {
+            // 셰이더 로드 실패 시 fallback: 단색 검정 박스
+            gs_effect_t *solid = obs_get_base_effect(OBS_EFFECT_SOLID);
+            gs_effect_set_color(gs_effect_get_param_by_name(solid, "color"), 0xFF000000);
+            gs_matrix_push();
+            while (gs_effect_loop(solid, "Solid")) {
+                for (int i = 0; i < all_count; i++) {
+                    gs_matrix_identity();
+                    gs_matrix_translate3f((float)all_rects[i].x, (float)all_rects[i].y, 0.0f);
+                    gs_draw_sprite(nullptr, 0, (uint32_t)all_rects[i].width,
+                                   (uint32_t)all_rects[i].height);
+                }
             }
+            gs_matrix_pop();
         }
-        gs_matrix_pop();
     }
+
+#ifdef _WIN32
+    // 게임 모드 활성 시: 우상단에 빨간 네모 박스 표시 (임시 인디케이터)
+    if (filter->isGameMode) {
+        gs_effect_t* solid = obs_get_base_effect(OBS_EFFECT_SOLID);
+        constexpr uint32_t GM_SZ = 20, GM_PAD = 8;
+        gs_effect_set_color(gs_effect_get_param_by_name(solid, "color"), 0xFFFF0000);
+        while (gs_effect_loop(solid, "Solid")) {
+            gs_matrix_push();
+            gs_matrix_identity();
+            gs_matrix_translate3f((float)(w - GM_SZ - GM_PAD), (float)GM_PAD, 0.0f);
+            gs_draw_sprite(nullptr, 0, GM_SZ, GM_SZ);
+            gs_matrix_pop();
+        }
+    }
+#endif
 }
 // ---------------------------------------------------------
 // Tick (Slow-Path) — 매 프레임 호출되지만 윈도우 추적은 0.15초마다
@@ -655,6 +737,46 @@ static void securecast_video_tick(void* data, float seconds)
         return;
 
 #ifdef _WIN32
+    // ── CPU 샘플링 & 게임 모드 상태머신 (1초 주기) ──────────────────────
+    filter->cpuSampleAccumulator += seconds;
+    if (filter->cpuSampleAccumulator >= GM_SAMPLE_INTERVAL) {
+        filter->cpuSampleAccumulator = 0.0f;
+        filter->cpuUsage = sampleCpuUsage(&filter->prevIdleTime,
+                                           &filter->prevKernelTime,
+                                           &filter->prevUserTime);
+
+        if (!filter->isGameMode) {
+            if (filter->cpuUsage >= GM_CPU_ENTER) {
+                filter->gameModeEntryTimer += GM_SAMPLE_INTERVAL;
+                if (filter->gameModeEntryTimer >= GM_ENTER_TIME) {
+                    filter->isGameMode        = true;
+                    filter->gameModeEntryTimer = 0.0f;
+                    filter->gameModeExitTimer  = 0.0f;
+                    filter->mockWorker.setPaused(true);
+                    blog(LOG_INFO, "[SecureCast] Game mode ON  (CPU: %.0f%%)", filter->cpuUsage);
+                }
+            } else {
+                filter->gameModeEntryTimer = 0.0f;
+            }
+        } else {
+            if (filter->cpuUsage <= GM_CPU_EXIT) {
+                filter->gameModeExitTimer += GM_SAMPLE_INTERVAL;
+                if (filter->gameModeExitTimer >= GM_EXIT_TIME) {
+                    filter->isGameMode       = false;
+                    filter->gameModeExitTimer = 0.0f;
+                    filter->mockWorker.setPaused(false);
+                    blog(LOG_INFO, "[SecureCast] Game mode OFF (CPU: %.0f%%, 10s cooldown)", filter->cpuUsage);
+                }
+            } else {
+                filter->gameModeExitTimer = 0.0f;
+            }
+        }
+    }
+
+    // ── WinEvent: 포그라운드 전환 감지 → Quick Restore ─
+    // 게임 모드는 CPU 임계값(<30%, 10s)으로만 해제한다.
+    // WinEvent로 해제하면 게임 실행 중 발생하는 내부 창 이벤트(알림, 팝업 등)에
+    // 의해 게임 모드가 즉시 끊겼다가 3초 후 재진입하는 깜빡임이 발생한다.
     if (filter->winListener.checkAndClearRescan()) {
         filter->trackerAccumulator = SCAN_INTERVAL_FORCE;
 
@@ -676,7 +798,6 @@ static void securecast_video_tick(void* data, float seconds)
                 if (!alreadyTracked && filter->windowList.count < SC_MAX_TRACKED_WINDOWS) {
                     const TrackedWindow& tw = filter->recentlySeenList.items[ri];
                     filter->windowList.items[filter->windowList.count++] = tw;
-                    // captureWindowList에도 즉시 반영: 이번 render pushFrame 스냅샷에 포함
                     if (filter->captureWindowList.count < SC_MAX_TRACKED_WINDOWS)
                         filter->captureWindowList.items[filter->captureWindowList.count++] = tw;
                     // Quick restore 성공: 즉시 강제 스캔을 하지 않는다.
@@ -691,7 +812,9 @@ static void securecast_video_tick(void* data, float seconds)
             }
         }
     }
-    sc_tracker_tick(seconds, &filter->trackerAccumulator, &filter->windowList);
+
+    const float scanInterval = filter->isGameMode ? SCAN_INTERVAL_GAME : SCAN_INTERVAL_NORMAL;
+    sc_tracker_tick(seconds, &filter->trackerAccumulator, &filter->windowList, scanInterval);
 
     // recentlySeenList 유지: windowList 항목을 upsert, 완전히 닫힌 HWND 제거.
     // recentlySeenList는 앱이 다시 등장했을 때 quick restore의 소스가 된다.

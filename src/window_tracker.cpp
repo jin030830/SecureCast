@@ -104,26 +104,32 @@ bool is_task_switcher_window(HWND hwnd)
 	return false;
 }
 
-// 창 중앙점이 실제로 그 창의 표면에 있는지 확인 (다른 앱에 가려져 있으면 false).
-// 뒤로 보내기 상태 감지에 사용. GetAncestor(GA_ROOT)로 최상위 윈도우까지 올라가
-// 우리가 추적 중인 hwnd와 같은지 비교한다.
-// Task View / Alt+Tab이 앞에 있으면 true 반환 (전환 중에도 마스킹 유지).
+// 창이 다른 앱에 완전히 가려져 있는지 확인 (뒤로 보내기 감지).
+// 중앙 1점이 아니라 5점(중앙 + 4코너 25% 안쪽)을 샘플링해,
+// 하나라도 hwnd가 최상위이면 true 반환.
+// 완전히 다른 앱에 덮여야(5점 모두 다른 창) 추적 해제.
 bool is_window_top_at_center(HWND hwnd, const RECT &rect)
 {
-	POINT center = {
-		(rect.left + rect.right) / 2,
-		(rect.top + rect.bottom) / 2
+	const LONG w4 = (rect.right  - rect.left) / 4;
+	const LONG h4 = (rect.bottom - rect.top)  / 4;
+	const POINT samples[5] = {
+		{ (rect.left + rect.right) / 2,  (rect.top + rect.bottom) / 2 }, // center
+		{ rect.left  + w4,               rect.top  + h4               }, // top-left
+		{ rect.right - w4,               rect.top  + h4               }, // top-right
+		{ rect.left  + w4,               rect.bottom - h4             }, // bottom-left
+		{ rect.right - w4,               rect.bottom - h4             }, // bottom-right
 	};
-	HWND topAt = WindowFromPoint(center);
-	if (!topAt)
-		return true;
-	HWND topRoot = GetAncestor(topAt, GA_ROOT);
-	if (topRoot == hwnd)
-		return true;
-	// Task View/Alt+Tab이 앞에 있으면 추적 유지 (전환 UI → 마스킹 계속 필요)
-	if (is_task_switcher_window(topRoot))
-		return true;
-	return false; // 다른 일반 앱이 앞에 있음 → 뒤로 보내기로 간주
+	for (const POINT &pt : samples) {
+		HWND topAt = WindowFromPoint(pt);
+		if (!topAt)
+			return true;
+		HWND topRoot = GetAncestor(topAt, GA_ROOT);
+		if (topRoot == hwnd)
+			return true;
+		if (is_task_switcher_window(topRoot))
+			return true;
+	}
+	return false; // 5개 샘플점 모두 다른 앱에 가려짐 → 뒤로 보내기로 간주
 }
 
 // EnumWindows의 콜백. 시스템의 모든 최상위 윈도우에 대해 한 번씩 호출됨.
@@ -242,13 +248,13 @@ extern "C" void sc_scan_blacklisted_windows(TrackedWindowList *out)
 
 // 60fps tick에서 매번 호출되어도 실제 무거운 EnumWindows는 0.15초마다 1회만 실행.
 // 매칭된 창은 일단 obs_log로만 출력 — 후속 단계에서 BlurRect로 변환 후 셰이더에 전달.
-extern "C" void sc_tracker_tick(float seconds, float *accumulator, TrackedWindowList *out)
+extern "C" void sc_tracker_tick(float seconds, float *accumulator, TrackedWindowList *out, float interval)
 {
 	if (!accumulator)
 		return;
 
 	*accumulator += seconds;
-	if (*accumulator < SCAN_INTERVAL_SEC)
+	if (*accumulator < interval)
 		return;
 	*accumulator = 0.0f;
 

@@ -72,7 +72,8 @@ void sc_update_tracked_bounds(TrackedWindowList *list);
 //   2. 0.15초 미만이면 즉시 리턴 (대부분의 호출은 여기서 끝)
 //   3. 임계 도달 시 sc_scan_blacklisted_windows 1회 + *out 업데이트 + obs_log 출력
 //   4. *accumulator = 0
-void sc_tracker_tick(float seconds, float *accumulator, TrackedWindowList *out);
+// interval: 실제 스캔 주기(초). 기본 0.15초, 게임 모드 시 0.5초 전달.
+void sc_tracker_tick(float seconds, float *accumulator, TrackedWindowList *out, float interval);
 
 #ifdef __cplusplus
 }

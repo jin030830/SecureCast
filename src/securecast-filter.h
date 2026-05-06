@@ -171,14 +171,17 @@ public:
     // 워커 스레드 시작. frameWidth/Height로 가짜 중앙 좌표를 계산한다.
     void start(uint32_t frameWidth, uint32_t frameHeight, ResultCallback callback);
     void stop();
+    void setPaused(bool paused);
 
     bool isRunning() const { return m_running.load(); }
+    bool isPaused()  const { return m_paused.load();  }
 
 private:
     void workerLoop();
 
     std::thread             m_thread;
     std::atomic<bool>       m_running{false};
+    std::atomic<bool>       m_paused{false};
     std::mutex              m_mutex;
     std::condition_variable m_cv;
 
@@ -244,6 +247,15 @@ struct SecureCastFilter {
     TrackedWindowList recentlySeenList{};    // 과거에 추적했던 창 목록 (quick restore용, 닫힐 때까지 유지)
     LingeringWindow   lingeringWindows[SC_MAX_LINGERING]{};
     int               lingeringCount = 0;
+
+    // ----- [Game Mode] CPU 사용률 기반 자동 전환 -----
+    float    cpuSampleAccumulator = 0.0f; // 1초 샘플링 누산기
+    float    cpuUsage             = 0.0f; // 최근 측정 시스템 CPU 사용률 (0~100)
+    float    gameModeEntryTimer   = 0.0f; // ≥40% 지속 시간 누산 (3초 도달 시 진입)
+    float    gameModeExitTimer    = 0.0f; // <30% 지속 시간 누산 (10초 도달 시 해제)
+    FILETIME prevIdleTime         = {};   // GetSystemTimes 이전 샘플
+    FILETIME prevKernelTime       = {};
+    FILETIME prevUserTime         = {};
 #endif
 
     // ----- [Panic Button] Ctrl+Shift+F12 -----
