@@ -1,0 +1,90 @@
+// =============================================================================
+// securecast_blur.effect — SecureCast 마스킹 셰이더 (P2)
+//
+// 역할:
+//   영상 텍스처(image) 의 특정 박스 영역(box_offset + box_size) 을 주변
+//   픽셀과 평균낸 Gaussian Blur 로 덮어 그린다. 검정 솔리드 박스보다
+//   가장자리가 자연스러워, 박스가 카톡 본체를 1~2 px 못 cover 해도 시각적
+//   노출이 거의 인지되지 않음 (방송 표준 모자이크 효과).
+//
+// 사용:
+//   sprite 를 박스 위치 (gs_matrix_translate3f + box w/h) 로 그리면 sprite
+//   uv (0~1) 가 박스 내부 상대 좌표가 됨. fragment 에서 box_offset / box_size
+//   / image_size 로 원본 image 의 sample 좌표를 계산.
+//
+// Technique:
+//   Blur     : 5x5 box average (BlurRect.type == 0)
+//   Blackout : 단색 검정       (BlurRect.type == 1)
+// =============================================================================
+
+uniform float4x4 ViewProj;
+uniform texture2d image;
+uniform float2 box_offset;     // 박스 좌상단의 image 내부 픽셀 좌표
+uniform float2 box_size;       // 박스 크기 (픽셀)
+uniform float2 image_size;     // 영상 텍스처 크기 (픽셀)
+uniform float  blur_radius;    // blur kernel 반경 배수 (1.0 = 1 텍셀)
+
+sampler_state def_sampler {
+    Filter   = Linear;
+    AddressU = Clamp;
+    AddressV = Clamp;
+};
+
+struct VertInOut {
+    float4 pos : POSITION;
+    float2 uv  : TEXCOORD0;
+};
+
+VertInOut VSDefault(VertInOut vert_in)
+{
+    VertInOut vert_out;
+    vert_out.pos = mul(float4(vert_in.pos.xyz, 1.0), ViewProj);
+    vert_out.uv  = vert_in.uv;
+    return vert_out;
+}
+
+// 5x5 = 25-tap box average. radius 가 클수록 더 멀리서 sampling → 더 흐려짐.
+// linear sampler + clamp 라 가장자리에서 텍스처 밖을 읽어도 안전.
+float4 PSBlur(VertInOut vert_in) : TARGET
+{
+    float2 sample_pixel = box_offset + vert_in.uv * box_size;
+    float2 sample_uv    = sample_pixel / image_size;
+    float2 texel        = float2(1.0, 1.0) / image_size;
+
+    float4 color = float4(0.0, 0.0, 0.0, 0.0);
+
+    [unroll]
+    for (int dy = -2; dy <= 2; ++dy) {
+        [unroll]
+        for (int dx = -2; dx <= 2; ++dx) {
+            float2 offset = float2(dx, dy) * texel * blur_radius;
+            color += image.Sample(def_sampler, sample_uv + offset);
+        }
+    }
+    color /= 25.0;
+    color.a = 1.0;
+    return color;
+}
+
+float4 PSBlackout(VertInOut vert_in) : TARGET
+{
+    return float4(0.0, 0.0, 0.0, 1.0);
+}
+
+technique Blur
+{
+    pass
+    {
+        vertex_shader = VSDefault(vert_in);
+        pixel_shader  = PSBlur(vert_in);
+    }
+}
+
+technique Blackout
+{
+    pass
+    {
+        vertex_shader = VSDefault(vert_in);
+        pixel_shader  = PSBlackout(vert_in);
+    }
+}
