@@ -246,6 +246,10 @@ struct SecureCastFilter {
     int               lingeringCount = 0;
 #endif
 
+    // ----- [Panic Button] Ctrl+Shift+F12 -----
+    std::atomic<bool> panicMode{false};
+    obs_hotkey_id     panicHotkeyId = OBS_INVALID_HOTKEY_ID;
+
     // ----- TODO: Role B 담당 필드 -----
     // void* ocrEngine = nullptr;           // Windows.Media.Ocr 엔진 포인터
 };

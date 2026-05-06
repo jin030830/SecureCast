@@ -21,6 +21,7 @@
 #include "securecast-filter.h"
 #include "plugin-support.h"   // obs_log
 #include "window_tracker.h"   // sc_tracker_tick (Role A: 블랙리스트 앱 좌표 수집)
+#include <obs-frontend-api.h> // obs_hotkey_register_frontend
 #include <algorithm>
 #include <chrono>
 #include <stdlib.h>
@@ -309,6 +310,17 @@ bool AtomicMaskChannel::consume(MaskPayload& out)
 // Filter Lifecycle Callbacks
 // ================================================================
 
+// Panic 핫키 콜백 — 누를 때(pressed=true)만 토글. 해제 이벤트는 무시.
+static void panic_hotkey_cb(void* data, obs_hotkey_id, obs_hotkey_t*, bool pressed)
+{
+    if (!pressed)
+        return;
+    auto* filter = static_cast<SecureCastFilter*>(data);
+    bool next = !filter->panicMode.load(std::memory_order_relaxed);
+    filter->panicMode.store(next, std::memory_order_relaxed);
+    blog(LOG_INFO, "[SecureCast] Panic mode %s.", next ? "ON" : "OFF");
+}
+
 // OBS가 필터 메뉴/관리 UI에 표시할 이름.
 // 인자 type_data는 obs_source_info::type_data 필드 — 우리는 안 씀.
 static const char* securecast_get_name(void* type_data)
@@ -345,6 +357,25 @@ static void* securecast_create(obs_data_t* settings, obs_source_t* context)
     filter->winListener.start();
 #endif
 
+    // Panic 핫키 등록 (Ctrl+Shift+F12 기본 바인딩)
+    filter->panicHotkeyId = obs_hotkey_register_frontend(
+        "securecast_panic_toggle",
+        obs_module_text("PanicButton"),
+        panic_hotkey_cb, filter);
+    if (filter->panicHotkeyId != OBS_INVALID_HOTKEY_ID) {
+        obs_data_t*       combo = obs_data_create();
+        obs_data_array_t* arr   = obs_data_array_create();
+        obs_data_set_bool(combo,   "control", true);
+        obs_data_set_bool(combo,   "shift",   true);
+        obs_data_set_bool(combo,   "alt",     false);
+        obs_data_set_string(combo, "key",     "OBS_KEY_F12");
+        obs_data_array_push_back(arr, combo);
+        obs_hotkey_load(filter->panicHotkeyId, arr);
+        obs_data_array_release(arr);
+        obs_data_release(combo);
+        blog(LOG_INFO, "[SecureCast] Panic hotkey registered (Ctrl+Shift+F12).");
+    }
+
     // HLSL 셰이더 컴파일 (그래픽스 컨텍스트 필요)
     obs_enter_graphics();
     char *effect_path = obs_module_file("securecast_blur.effect");
@@ -368,6 +399,12 @@ static void securecast_destroy(void* data)
     SecureCastFilter* filter = static_cast<SecureCastFilter*>(data);
 
     blog(LOG_INFO, "Destroying filter...");
+
+    // 핫키 먼저 해제 — 콜백이 해제된 filter에 접근하지 못하도록
+    if (filter->panicHotkeyId != OBS_INVALID_HOTKEY_ID) {
+        obs_hotkey_unregister(filter->panicHotkeyId);
+        filter->panicHotkeyId = OBS_INVALID_HOTKEY_ID;
+    }
 
 #ifdef _WIN32
     filter->winListener.stop();
@@ -486,6 +523,39 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
     MaskPayload newMask{};
     if (filter->maskChannel.consume(newMask))
         filter->lastMask = newMask;
+
+    // --- Panic Mode (Ctrl+Shift+F12) ---
+    // ring buffer는 계속 채우되 인코더로는 전체 블랙 + 빨간 테두리만 출력.
+    // 스트리머는 빨간 테두리로 패닉 활성 여부를 확인할 수 있다.
+    if (filter->panicMode.load(std::memory_order_relaxed)) {
+        gs_effect_t* solid = obs_get_base_effect(OBS_EFFECT_SOLID);
+
+        // 전체 블랙아웃
+        gs_effect_set_color(gs_effect_get_param_by_name(solid, "color"), 0xFF000000);
+        while (gs_effect_loop(solid, "Solid"))
+            gs_draw_sprite(nullptr, 0, w, h);
+
+        // 빨간 테두리 6px
+        constexpr uint32_t BORDER = 6;
+        gs_effect_set_color(gs_effect_get_param_by_name(solid, "color"), 0xFFFF0000);
+        while (gs_effect_loop(solid, "Solid")) {
+            gs_matrix_push(); gs_matrix_identity();
+            gs_draw_sprite(nullptr, 0, w, BORDER);                          // top
+            gs_matrix_pop();
+            gs_matrix_push(); gs_matrix_identity();
+            gs_matrix_translate3f(0.0f, (float)(h - BORDER), 0.0f);
+            gs_draw_sprite(nullptr, 0, w, BORDER);                          // bottom
+            gs_matrix_pop();
+            gs_matrix_push(); gs_matrix_identity();
+            gs_draw_sprite(nullptr, 0, BORDER, h);                          // left
+            gs_matrix_pop();
+            gs_matrix_push(); gs_matrix_identity();
+            gs_matrix_translate3f((float)(w - BORDER), 0.0f, 0.0f);
+            gs_draw_sprite(nullptr, 0, BORDER, h);                          // right
+            gs_matrix_pop();
+        }
+        return;
+    }
 
     // --- Step 4~5: N프레임 지연된 슬롯 꺼내기 ---
     const FrameRingBuffer::Slot* delayedSlot = filter->ringBuffer.peekDelayedSlot();
