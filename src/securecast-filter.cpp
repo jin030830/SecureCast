@@ -27,7 +27,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-// window_tracker.cpp의 SCAN_INTERVAL_SEC(0.15f) 이상이면 즉시 스캔 트리거.
+// trackerAccumulator에 이 값을 대입하면 다음 sc_tracker_tick 호출 시 임계를 즉시 초과 → 강제 스캔 트리거.
 static constexpr float SCAN_INTERVAL_FORCE    = 1.0f;
 static constexpr float SCAN_INTERVAL_NORMAL   = 0.15f; // 일반 모드 스캔 주기
 static constexpr float SCAN_INTERVAL_GAME     = 0.5f;  // 게임 모드 스캔 주기
@@ -165,6 +165,7 @@ static void render_blur_rect(gs_effect_t *fx, gs_texture_t *img_tex,
 // [Role C] FrameRingBuffer 구현부
 // ================================================================
 
+// GPU에 gs_texrender 슬롯을 할당한다. video_render 첫 호출 또는 해상도 변경 시 호출.
 bool FrameRingBuffer::initialize(uint32_t width, uint32_t height)
 {
     if (m_initialized)
@@ -189,6 +190,7 @@ bool FrameRingBuffer::initialize(uint32_t width, uint32_t height)
     return true;
 }
 
+// 모든 슬롯의 GPU 텍스처를 해제하고 버퍼를 초기 상태로 되돌린다. 소멸자 또는 해상도 변경 시 호출.
 void FrameRingBuffer::destroy()
 {
     if (!m_initialized)
@@ -210,6 +212,8 @@ void FrameRingBuffer::destroy()
     blog(LOG_INFO, "FrameRingBuffer destroyed.");
 }
 
+// 현재 OBS 소스 프레임을 HEAD 슬롯에 캡처하고, 창 좌표 스냅샷을 함께 저장한다.
+// HEAD를 한 칸 전진시켜 다음 pushFrame이 다음 슬롯에 쓰도록 한다.
 #ifdef _WIN32
 void FrameRingBuffer::pushFrame(obs_source_t* source, uint64_t timestamp,
                                  const TrackedWindowList* wlist)
@@ -251,11 +255,13 @@ void FrameRingBuffer::pushFrame(obs_source_t* source, uint64_t timestamp)
         m_frameCount++;
 }
 
+// N프레임(SC_RING_BUFFER_SLOTS) 전 슬롯을 반환한다. 인코더로 출력하는 "안전한" 지연 프레임.
 const FrameRingBuffer::Slot* FrameRingBuffer::peekDelayedSlot() const
 {
     return peekSlotAtOffset(SC_RING_BUFFER_SLOTS);
 }
 
+// HEAD에서 framesBack만큼 이전 슬롯을 반환한다. N-1 슬롯과의 합집합 마스킹(빠른 이동 커버)에 사용.
 const FrameRingBuffer::Slot* FrameRingBuffer::peekSlotAtOffset(int framesBack) const
 {
     if (framesBack <= 0 || m_frameCount < framesBack)
@@ -269,6 +275,7 @@ const FrameRingBuffer::Slot* FrameRingBuffer::peekSlotAtOffset(int framesBack) c
 // [Role C] MockAIWorker 구현부
 // ================================================================
 
+// 워커 스레드를 시작한다. AI 분석이 완료될 때마다 callback으로 마스킹 결과를 전달.
 void MockAIWorker::start(uint32_t frameWidth, uint32_t frameHeight, ResultCallback callback)
 {
     if (m_running.load())
@@ -284,6 +291,7 @@ void MockAIWorker::start(uint32_t frameWidth, uint32_t frameHeight, ResultCallba
             m_frameWidth, m_frameHeight);
 }
 
+// 워커 스레드에 종료 신호를 보내고 join한다. securecast_destroy() 에서 ring buffer 해제 전에 반드시 호출.
 void MockAIWorker::stop()
 {
     if (!m_running.load())
@@ -301,6 +309,7 @@ void MockAIWorker::stop()
     blog(LOG_INFO, "MockAIWorker stopped.");
 }
 
+// 게임 모드 진입/해제 시 호출. paused=true면 스레드는 cv.wait에서 대기해 CPU를 점유하지 않는다.
 void MockAIWorker::setPaused(bool paused)
 {
     if (!m_running.load())
@@ -313,6 +322,8 @@ void MockAIWorker::setPaused(bool paused)
     blog(LOG_INFO, "MockAIWorker %s.", paused ? "paused" : "resumed");
 }
 
+// 워커 스레드 본체. 50ms 주기로 빈 페이로드를 publish한다.
+// Role B 구현 시 여기서 OCR 호출 후 실제 BlurRect를 채워 publish하도록 교체.
 void MockAIWorker::workerLoop()
 {
     while (m_running.load()) {
@@ -353,6 +364,7 @@ void MockAIWorker::workerLoop()
 // m_pending 쓰기 중에 Render Thread가 읽으면 torn read가 발생한다.
 // ================================================================
 
+// AI 스레드 → Render 스레드 결과 전달. 뮤텍스로 m_pending 기록 보호 후 ready 플래그를 set.
 void AtomicMaskChannel::publish(const MaskPayload& payload)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
@@ -360,6 +372,7 @@ void AtomicMaskChannel::publish(const MaskPayload& payload)
     m_ready.store(true, std::memory_order_release);
 }
 
+// Render 스레드가 새 마스킹 결과를 꺼낸다. 새 데이터가 없으면 false 반환 (lastMask 유지).
 bool AtomicMaskChannel::consume(MaskPayload& out)
 {
     if (!m_ready.load(std::memory_order_acquire))
@@ -765,7 +778,7 @@ static void securecast_video_tick(void* data, float seconds)
                     filter->isGameMode       = false;
                     filter->gameModeExitTimer = 0.0f;
                     filter->mockWorker.setPaused(false);
-                    blog(LOG_INFO, "[SecureCast] Game mode OFF (CPU: %.0f%%, 10s cooldown)", filter->cpuUsage);
+                    blog(LOG_INFO, "[SecureCast] Game mode OFF (CPU: %.0f%%, 5s cooldown)", filter->cpuUsage);
                 }
             } else {
                 filter->gameModeExitTimer = 0.0f;
@@ -774,7 +787,7 @@ static void securecast_video_tick(void* data, float seconds)
     }
 
     // ── WinEvent: 포그라운드 전환 감지 → Quick Restore ─
-    // 게임 모드는 CPU 임계값(<30%, 10s)으로만 해제한다.
+    // 게임 모드는 CPU 임계값(≤30%, 5s)으로만 해제한다.
     // WinEvent로 해제하면 게임 실행 중 발생하는 내부 창 이벤트(알림, 팝업 등)에
     // 의해 게임 모드가 즉시 끊겼다가 3초 후 재진입하는 깜빡임이 발생한다.
     if (filter->winListener.checkAndClearRescan()) {

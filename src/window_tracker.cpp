@@ -32,8 +32,8 @@ namespace {
 
 constexpr int MIN_WINDOW_DIMENSION = 100;
 
-// EnumWindows 1회의 비용을 60fps 매 tick 떠안기엔 부담. 사람의 창 이동 인지
-// 시간보다 짧으면 충분하므로 0.15초 (≈6.7Hz) 로 둔다.
+// 기본 스캔 주기 참조값 (일반 모드). 실제 스캔 주기는 sc_tracker_tick의 interval 인자로 전달된다.
+// 게임 모드에서는 호출자(securecast-filter.cpp)가 SCAN_INTERVAL_GAME(0.5초)을 전달한다.
 constexpr float SCAN_INTERVAL_SEC = 0.15f;
 
 // 보호 대상 앱 목록. 향후 OBS Properties UI에서 사용자가 편집할 수 있게 확장 예정.
