@@ -659,6 +659,33 @@ static void securecast_video_tick(void* data, float seconds)
                 };
         }
     }
+
+    // New window detection: 이번 스캔에서 새로 등장한 창을 즉시 lingering에 prime.
+    // 탐지 전에 ring buffer에 이미 쌓인 프레임(최대 SC_RING_BUFFER_SLOTS개)이
+    // 출력될 때도 마스킹되도록 SC_RING_BUFFER_SLOTS+1 틱을 부여한다.
+    // (+1: 탐지 틱의 render에서 captureWindowList가 업데이트되기 전에
+    //  pushFrame이 먼저 실행되어 생기는 1프레임 갭을 커버)
+    for (int ci = 0; ci < filter->windowList.count; ++ci) {
+        HWND ch = filter->windowList.items[ci].hwnd;
+        bool wasPrev = false;
+        for (int pi = 0; pi < filter->prevWindowList.count; ++pi) {
+            if (filter->prevWindowList.items[pi].hwnd == ch) { wasPrev = true; break; }
+        }
+        if (!wasPrev) {
+            bool already = false;
+            for (int li = 0; li < filter->lingeringCount; ++li) {
+                if (filter->lingeringWindows[li].window.hwnd == ch) {
+                    filter->lingeringWindows[li].ticksRemaining = SC_RING_BUFFER_SLOTS + 1;
+                    already = true; break;
+                }
+            }
+            if (!already && filter->lingeringCount < SC_MAX_LINGERING)
+                filter->lingeringWindows[filter->lingeringCount++] = {
+                    filter->windowList.items[ci], SC_RING_BUFFER_SLOTS + 1
+                };
+        }
+    }
+
     filter->prevWindowList = filter->windowList;
 
     // 매 tick 카운트다운 → 정확히 N프레임(ring buffer 지연) 후 자연 제거
