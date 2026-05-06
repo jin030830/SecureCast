@@ -609,6 +609,13 @@ static void securecast_video_tick(void* data, float seconds)
                     // captureWindowList에도 즉시 반영: 이번 render pushFrame 스냅샷에 포함
                     if (filter->captureWindowList.count < SC_MAX_TRACKED_WINDOWS)
                         filter->captureWindowList.items[filter->captureWindowList.count++] = tw;
+                    // Quick restore 성공: 즉시 강제 스캔을 하지 않는다.
+                    // EVENT 직후 EnumWindows의 z-order 체크(is_window_top_at_center)는
+                    // 창이 방금 포그라운드가 되어 z-order가 아직 안 정착한 상태라
+                    // 일시적으로 실패할 수 있다. 실패하면 scan 결과가 {}가 되어
+                    // windowList와 captureWindowList를 덮어쓰고 방금 복원한 항목이 사라진다.
+                    // 대신 다음 render의 sc_update_tracked_bounds가 안정적으로 확인하게 맡긴다.
+                    filter->trackerAccumulator = 0.0f;
                 }
                 break;
             }
