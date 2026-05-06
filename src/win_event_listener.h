@@ -57,7 +57,7 @@ private:
     std::atomic<bool> m_running{false};
     DWORD             m_threadId    = 0;
     HWINEVENTHOOK     m_hookGroup1  = nullptr; // SHOW / HIDE / DESTROY
-    HWINEVENTHOOK     m_hookGroup2  = nullptr; // LOCATIONCHANGE
+    HWINEVENTHOOK     m_hookGroup2  = nullptr; // SYSTEM_FOREGROUND (포그라운드 전환)
 
     std::atomic<bool> m_needRescan{false};
 

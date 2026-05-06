@@ -45,24 +45,23 @@ void WinEventListener::run()
     m_threadId = GetCurrentThreadId();
 
     // 그룹 1: 등장/사라짐/소멸 (드물게 발생, 모든 윈도우 대상)
-    // EVENT_OBJECT_SHOW, EVENT_OBJECT_HIDE, EVENT_OBJECT_DESTROY 가 이 범위에 들어감.
     m_hookGroup1 = SetWinEventHook(
         EVENT_OBJECT_SHOW, EVENT_OBJECT_DESTROY,
         nullptr, eventProc, 0, 0,
         WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
 
-    // [의도적으로 LOCATIONCHANGE 후킹하지 않음]
-    // EVENT_OBJECT_LOCATIONCHANGE 는 마우스 커서 / UI 갱신 / 모든 윈도우 이동에 발생해
-    // 1초당 수천 번 콜백. 모든 콜백이 needRescan flag 를 set 하면 매 video_tick 마다
-    // 풀 스캔 (EnumWindows + OpenProcess) 이 돌아 CPU 가 폭주한다 (관측: 일반 25%,
-    // 게임 중 70%). 위치 변경은 매 tick (60Hz) 의 sc_get_window_visible_bounds 폴링
-    // 으로 처리. 게임 중 빠른 이동 노출은 4주차 게임 모드 (적응형 마진 등) 로 별도 처리.
-    m_hookGroup2 = nullptr;
+    // 그룹 2: 포그라운드 변경 — 카톡이 앞으로 오거나 다른 앱이 앞으로 와서 카톡이
+    // 뒤로 가는 순간을 감지. EVENT_OBJECT_LOCATIONCHANGE(위치 이동)와 달리 포그라운드
+    // 전환은 드물게 발생하므로 CPU 부담 없이 추가 가능.
+    m_hookGroup2 = SetWinEventHook(
+        EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
+        nullptr, eventProc, 0, 0,
+        WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
 
     if (!m_hookGroup1) {
         blog(LOG_ERROR, "[SecureCast] SetWinEventHook failed; falling back to polling only.");
     } else {
-        blog(LOG_INFO, "[SecureCast] WinEventListener started (SHOW/HIDE/DESTROY only).");
+        blog(LOG_INFO, "[SecureCast] WinEventListener started (SHOW/HIDE/DESTROY + FOREGROUND).");
     }
 
     // 메시지 펌프 — WINEVENT_OUTOFCONTEXT 콜백은 이 펌프에서 dispatch 됨.

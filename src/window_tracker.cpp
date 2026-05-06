@@ -30,7 +30,6 @@
 
 namespace {
 
-// 너무 작은 창은 시각적으로 노출 가능성이 낮고, 트레이 아이콘 같은 노이즈가 많다.
 constexpr int MIN_WINDOW_DIMENSION = 100;
 
 // EnumWindows 1회의 비용을 60fps 매 tick 떠안기엔 부담. 사람의 창 이동 인지
@@ -88,6 +87,45 @@ bool is_blacklisted(const wchar_t *exe_name)
 	return false;
 }
 
+// Win+Tab(Task View)나 Alt+Tab(앱 전환기)인지 클래스명으로 판별.
+// 이 창이 앞에 있을 때는 뒤에 있는 민감 앱을 추적 해제하지 않는다.
+// 이유: Task View/Alt+Tab은 전환 UI이므로, 그 뒤의 민감 앱은 "선택 중인 상태"일 수 있고
+//       전환 애니메이션(~500ms) 동안도 마스킹을 유지해야 즉시 가려진다.
+bool is_task_switcher_window(HWND hwnd)
+{
+	wchar_t cls[128] = {};
+	GetClassNameW(hwnd, cls, 128);
+	// Win+Tab Task View (Windows 10 / 11)
+	if (wcsstr(cls, L"MultitaskingView") != nullptr)
+		return true;
+	// Alt+Tab 앱 전환기 (버전마다 클래스명 다름)
+	if (iequals(cls, L"TaskSwitcherWnd") || iequals(cls, L"XamlExplorerHostIslandWindow"))
+		return true;
+	return false;
+}
+
+// 창 중앙점이 실제로 그 창의 표면에 있는지 확인 (다른 앱에 가려져 있으면 false).
+// 뒤로 보내기 상태 감지에 사용. GetAncestor(GA_ROOT)로 최상위 윈도우까지 올라가
+// 우리가 추적 중인 hwnd와 같은지 비교한다.
+// Task View / Alt+Tab이 앞에 있으면 true 반환 (전환 중에도 마스킹 유지).
+bool is_window_top_at_center(HWND hwnd, const RECT &rect)
+{
+	POINT center = {
+		(rect.left + rect.right) / 2,
+		(rect.top + rect.bottom) / 2
+	};
+	HWND topAt = WindowFromPoint(center);
+	if (!topAt)
+		return true;
+	HWND topRoot = GetAncestor(topAt, GA_ROOT);
+	if (topRoot == hwnd)
+		return true;
+	// Task View/Alt+Tab이 앞에 있으면 추적 유지 (전환 UI → 마스킹 계속 필요)
+	if (is_task_switcher_window(topRoot))
+		return true;
+	return false; // 다른 일반 앱이 앞에 있음 → 뒤로 보내기로 간주
+}
+
 // EnumWindows의 콜백. 시스템의 모든 최상위 윈도우에 대해 한 번씩 호출됨.
 // 반환:
 //   TRUE  → 다음 윈도우로 계속 순회
@@ -143,6 +181,11 @@ BOOL CALLBACK enum_proc(HWND hwnd, LPARAM lparam)
 	if (!is_blacklisted(exe_name))
 		return TRUE;
 
+	// Z-order: 창 중앙이 다른 앱에 가려져 있으면 (뒤로 보내기 상태) 추적 대상 제외.
+	// 카톡이 OBS 뒤로 가도 IsWindowVisible=true라 이 체크 없이는 계속 추적된다.
+	if (!is_window_top_at_center(hwnd, rect))
+		return TRUE;
+
 	// 매칭 성공 → out 슬롯에 정보 복사.
 	auto &slot = out->items[out->count++];
 	slot.hwnd = hwnd;
@@ -177,6 +220,13 @@ extern "C" void sc_update_tracked_bounds(TrackedWindowList *list)
 		if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS,
 		                                    &rect, sizeof(rect))))
 			list->items[i].bounds = rect;
+
+		// 다른 앱 창이 앞으로 와서 이 창을 가리면 즉시 추적 해제.
+		// 뒤로 보내기는 IsWindowVisible=true를 유지하므로 위의 체크만으로는 감지 불가.
+		if (!is_window_top_at_center(hwnd, list->items[i].bounds)) {
+			list->items[i] = list->items[--list->count];
+			continue;
+		}
 	}
 }
 
