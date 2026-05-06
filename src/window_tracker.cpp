@@ -158,6 +158,28 @@ BOOL CALLBACK enum_proc(HWND hwnd, LPARAM lparam)
 
 } // namespace
 
+extern "C" void sc_update_tracked_bounds(TrackedWindowList *list)
+{
+	if (!list || list->count == 0)
+		return;
+
+	// 역순으로 순회해야 swap-and-pop 시 인덱스가 안 틀린다.
+	for (int i = list->count - 1; i >= 0; --i) {
+		HWND hwnd = list->items[i].hwnd;
+
+		// 창이 닫혔거나 최소화됐으면 슬롯 제거 (마지막 원소와 swap-and-pop).
+		if (!IsWindowVisible(hwnd)) {
+			list->items[i] = list->items[--list->count];
+			continue;
+		}
+
+		RECT rect{};
+		if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS,
+		                                    &rect, sizeof(rect))))
+			list->items[i].bounds = rect;
+	}
+}
+
 // 호출자는 OBS의 video_tick / video_render 같은 렌더 스레드 컨텍스트에서만 호출할 것.
 // (DWM/Win32 윈도우 핸들 조회는 caller 스레드의 메시지 큐에 의존)
 extern "C" void sc_scan_blacklisted_windows(TrackedWindowList *out)
@@ -170,7 +192,7 @@ extern "C" void sc_scan_blacklisted_windows(TrackedWindowList *out)
 
 // 60fps tick에서 매번 호출되어도 실제 무거운 EnumWindows는 0.15초마다 1회만 실행.
 // 매칭된 창은 일단 obs_log로만 출력 — 후속 단계에서 BlurRect로 변환 후 셰이더에 전달.
-extern "C" void sc_tracker_tick(float seconds, float *accumulator)
+extern "C" void sc_tracker_tick(float seconds, float *accumulator, TrackedWindowList *out)
 {
 	if (!accumulator)
 		return;
@@ -183,10 +205,13 @@ extern "C" void sc_tracker_tick(float seconds, float *accumulator)
 	TrackedWindowList list{};
 	sc_scan_blacklisted_windows(&list);
 
+	// 스캔 결과를 호출자에게 전달 (창이 0개여도 업데이트 — 닫힌 창 반영).
+	if (out)
+		*out = list;
+
 	if (list.count == 0)
 		return;
 
-	// 디버그 출력. 운영 단계에서는 빈도 줄이거나 LOG_DEBUG로 강등 예정.
 	for (int i = 0; i < list.count; ++i) {
 		const auto &w = list.items[i];
 		obs_log(LOG_INFO, "[tracker] %ls @ (%ld,%ld)-(%ld,%ld) %ldx%ld", w.exe_name,

@@ -54,19 +54,25 @@ struct TrackedWindowList {
 // (DwmGetWindowAttribute는 caller 스레드 컨텍스트로 동작).
 void sc_scan_blacklisted_windows(TrackedWindowList *out);
 
+// Fast-path 좌표 갱신: 이미 list에 들어있는 HWND들에 대해 DWM으로 bounds만 재조회.
+// EnumWindows / OpenProcess 없이 DWM query만 수행하므로 매 프레임 호출 가능.
+//
+// 창이 닫혀 IsWindowVisible이 false가 되면 해당 슬롯을 list에서 즉시 제거한다.
+// (slow scan은 새 창 발견용, fast-path는 이미 알고 있는 창의 위치 추적용)
+void sc_update_tracked_bounds(TrackedWindowList *list);
+
 // video_tick의 throttle 헬퍼.
-// seconds : 직전 tick과의 경과 시간 (60fps면 약 0.0167)
+// seconds     : 직전 tick과의 경과 시간 (60fps면 약 0.0167)
 // accumulator : 누산값 보관 위치 (보통 SecureCastFilter::trackerAccumulator)
+// out         : 스캔이 실행된 경우에만 결과로 채워짐; throttle로 스킵되면 불변.
+//               null 허용 (결과가 필요 없으면 null 전달).
 //
 // 동작:
 //   1. *accumulator += seconds
 //   2. 0.15초 미만이면 즉시 리턴 (대부분의 호출은 여기서 끝)
-//   3. 임계 도달 시 sc_scan_blacklisted_windows 1회 + 결과를 obs_log로 출력
+//   3. 임계 도달 시 sc_scan_blacklisted_windows 1회 + *out 업데이트 + obs_log 출력
 //   4. *accumulator = 0
-//
-// 0.15초인 이유: 사람이 창 이동 후 마우스를 떼는 데 걸리는 시간보다 짧으면서,
-// 60fps tick 매번(0.0167) 호출하는 것보다는 ~9배 적게 EnumWindows 호출.
-void sc_tracker_tick(float seconds, float *accumulator);
+void sc_tracker_tick(float seconds, float *accumulator, TrackedWindowList *out);
 
 #ifdef __cplusplus
 }

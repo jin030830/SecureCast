@@ -100,9 +100,32 @@ if(WIN32)
     PRIVATE
       src/window_tracker.cpp      # Role A: 블랙리스트 앱 좌표 스캐너
       src/window_tracker.h
+      src/win_event_listener.cpp  # Role A: SetWinEventHook push 감지
+      src/win_event_listener.h
   )
 endif()
 
 # OBS 표준 매크로: 출력 파일명을 "${_name}.dll" 로 강제, install 타겟 자동 생성.
 # (CMake 기본은 lib 접두사가 붙는데 OBS는 그걸 안 좋아함)
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
+
+# 빌드 후 OBS 플러그인 경로에 자동 배포.
+# CMAKE_INSTALL_PREFIX = C:/ProgramData/obs-studio/plugins (defaults.cmake에서 설정)
+if(WIN32)
+  add_custom_command(
+    TARGET ${CMAKE_PROJECT_NAME}
+    POST_BUILD
+    COMMAND "${CMAKE_COMMAND}" -E make_directory
+      "${CMAKE_INSTALL_PREFIX}/${CMAKE_PROJECT_NAME}/bin/64bit"
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+      "$<TARGET_FILE:${CMAKE_PROJECT_NAME}>"
+      "${CMAKE_INSTALL_PREFIX}/${CMAKE_PROJECT_NAME}/bin/64bit/"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory
+      "${CMAKE_INSTALL_PREFIX}/${CMAKE_PROJECT_NAME}/data"
+    COMMAND "${CMAKE_COMMAND}" -E copy_directory
+      "${CMAKE_CURRENT_SOURCE_DIR}/data"
+      "${CMAKE_INSTALL_PREFIX}/${CMAKE_PROJECT_NAME}/data"
+    COMMENT "Deploy ${CMAKE_PROJECT_NAME} to OBS plugins: ${CMAKE_INSTALL_PREFIX}"
+    VERBATIM
+  )
+endif()

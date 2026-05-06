@@ -15,13 +15,107 @@
 //   securecast_video_render  : 매 프레임 (60fps), 실제 픽셀 렌더링 단계
 // =============================================================================
 
+// NOMINMAX must be defined before any Windows header to prevent min/max macro conflicts
+// with std::max / std::min from <algorithm>.
+#define NOMINMAX
 #include "securecast-filter.h"
 #include "plugin-support.h"   // obs_log
 #include "window_tracker.h"   // sc_tracker_tick (Role A: 블랙리스트 앱 좌표 수집)
+#include <algorithm>
 #include <chrono>
 #include <stdlib.h>
 #include <string.h>
-#include "securecast-filter.h"
+
+// window_tracker.cpp의 SCAN_INTERVAL_SEC(0.15f) 이상이면 즉시 스캔 트리거.
+static constexpr float SCAN_INTERVAL_FORCE = 1.0f;
+
+// ================================================================
+// [Role A] 윈도우 좌표 → OBS 소스 픽셀 좌표 변환 + 15% BBox 팽창
+//
+// TrackedWindow.bounds : DWM 화면 절대좌표 (물리 픽셀)
+// src_w / src_h        : OBS 소스 해상도 (= 캡처 모니터 해상도와 같다고 가정)
+//
+// 변환 순서:
+//   1. MonitorFromWindow → 창이 속한 모니터의 원점(rcMonitor.left/top) 파악
+//   2. 창 좌표 - 모니터 원점 → 모니터 상대 좌표
+//   3. (모니터 상대 좌표 / 모니터 크기) * 소스 크기 → 소스 픽셀 좌표
+//   4. 15% BBox 팽창 후 소스 경계로 clamp
+// ================================================================
+#ifdef _WIN32
+static BlurRect tracked_window_to_blur_rect(const TrackedWindow &tw,
+                                             uint32_t src_w, uint32_t src_h)
+{
+    BlurRect r{};
+    // MonitorFromRect을 사용해야 lingering window(이미 닫힌 hwnd)에도 동작한다.
+    HMONITOR hmon = MonitorFromRect(&tw.bounds, MONITOR_DEFAULTTONEAREST);
+    if (!hmon)
+        return r;
+
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(MONITORINFO);
+    if (!GetMonitorInfo(hmon, &mi))
+        return r;
+
+    int mon_w = mi.rcMonitor.right  - mi.rcMonitor.left;
+    int mon_h = mi.rcMonitor.bottom - mi.rcMonitor.top;
+    if (mon_w <= 0 || mon_h <= 0)
+        return r;
+
+    float sx = (float)src_w / mon_w;
+    float sy = (float)src_h / mon_h;
+
+    int x  = (int)((tw.bounds.left - mi.rcMonitor.left) * sx);
+    int y  = (int)((tw.bounds.top  - mi.rcMonitor.top ) * sy);
+    int bw = (int)((tw.bounds.right  - tw.bounds.left) * sx);
+    int bh = (int)((tw.bounds.bottom - tw.bounds.top ) * sy);
+
+    // 비대칭 BBox 팽창 — 위쪽(타이틀바 위)은 최소, 좌/우/아래는 빠른 이동 여유 포함.
+    // 위: 1%  / 좌우: 5% (이동 시 trailing edge 커버) / 아래: 3%
+    int exp_top    = (int)(bh * 0.01f);
+    int exp_sides  = (int)(bw * 0.025f);
+    int exp_bottom = (int)(bh * 0.015f);
+    x  = std::max(0,          x  - exp_sides);
+    y  = std::max(0,          y  - exp_top);
+    bw = std::min((int)src_w - x, bw + exp_sides * 2);
+    bh = std::min((int)src_h - y, bh + exp_top + exp_bottom);
+
+    r = {x, y, bw, bh, 0}; // type 0 = Blur (Blackout과 시각적으로 구분 가능)
+    return r;
+}
+#endif
+
+// ================================================================
+// [Role A] blur.effect 셰이더로 BlurRect 1개를 렌더링
+//
+// type == 0 (Blur)    : image 텍스처를 box_offset/size 기준으로 5x5 평균
+// type == 1 (Blackout): 단색 검정
+// ================================================================
+static void render_blur_rect(gs_effect_t *fx, gs_texture_t *img_tex,
+                              const BlurRect &r, uint32_t src_w, uint32_t src_h)
+{
+    if (r.width <= 0 || r.height <= 0)
+        return;
+
+    const char *tech = (r.type == 0) ? "Blur" : "Blackout";
+
+    if (r.type == 0) {
+        struct vec2 box_off = {(float)r.x, (float)r.y};
+        struct vec2 box_sz  = {(float)r.width, (float)r.height};
+        struct vec2 img_sz  = {(float)src_w, (float)src_h};
+        gs_effect_set_texture(gs_effect_get_param_by_name(fx, "image"),      img_tex);
+        gs_effect_set_vec2(   gs_effect_get_param_by_name(fx, "box_offset"), &box_off);
+        gs_effect_set_vec2(   gs_effect_get_param_by_name(fx, "box_size"),   &box_sz);
+        gs_effect_set_vec2(   gs_effect_get_param_by_name(fx, "image_size"), &img_sz);
+        gs_effect_set_float(  gs_effect_get_param_by_name(fx, "blur_radius"), 8.0f);
+    }
+
+    gs_matrix_push();
+    gs_matrix_identity();
+    gs_matrix_translate3f((float)r.x, (float)r.y, 0.0f);
+    while (gs_effect_loop(fx, tech))
+        gs_draw_sprite(nullptr, 0, (uint32_t)r.width, (uint32_t)r.height);
+    gs_matrix_pop();
+}
 
 // ================================================================
 // [Role C] FrameRingBuffer 구현부
@@ -72,10 +166,22 @@ void FrameRingBuffer::destroy()
     blog(LOG_INFO, "FrameRingBuffer destroyed.");
 }
 
+#ifdef _WIN32
+void FrameRingBuffer::pushFrame(obs_source_t* source, uint64_t timestamp,
+                                 const TrackedWindowList* wlist)
+#else
 void FrameRingBuffer::pushFrame(obs_source_t* source, uint64_t timestamp)
+#endif
 {
     if (!m_initialized)
         return;
+
+#ifdef _WIN32
+    if (wlist)
+        m_slots[m_head].windowSnapshot = *wlist;
+    else
+        m_slots[m_head].windowSnapshot = TrackedWindowList{};
+#endif
 
     gs_texrender_t* tr = m_slots[m_head].texrender;
     gs_texrender_reset(tr);
@@ -103,11 +209,16 @@ void FrameRingBuffer::pushFrame(obs_source_t* source, uint64_t timestamp)
 
 const FrameRingBuffer::Slot* FrameRingBuffer::peekDelayedSlot() const
 {
-    if (m_frameCount < SC_RING_BUFFER_SLOTS)
-        return nullptr;
+    return peekSlotAtOffset(SC_RING_BUFFER_SLOTS);
+}
 
-    int tail = (m_head - SC_RING_BUFFER_SLOTS + SC_RING_BUFFER_SLOTS) % SC_RING_BUFFER_SLOTS;
-    return &m_slots[tail];
+const FrameRingBuffer::Slot* FrameRingBuffer::peekSlotAtOffset(int framesBack) const
+{
+    if (framesBack <= 0 || m_frameCount < framesBack)
+        return nullptr;
+    int idx = ((m_head - framesBack) % SC_RING_BUFFER_SLOTS + SC_RING_BUFFER_SLOTS)
+              % SC_RING_BUFFER_SLOTS;
+    return &m_slots[idx];
 }
 
 // ================================================================
@@ -159,14 +270,9 @@ void MockAIWorker::workerLoop()
         if (!m_running.load())
             break;
 
-        // 가짜 마스킹 결과 생성: 화면 정중앙에 200x100 픽셀의 블랙아웃 박스 하나
+        // Role B(실제 OCR/AI) 미구현 — 빈 페이로드 전달 (중앙 박스 제거)
         MaskPayload payload{};
-        payload.rectCount = 1;
-        payload.rects[0].x     = static_cast<int>(m_frameWidth  / 2) - 100;
-        payload.rects[0].y     = static_cast<int>(m_frameHeight / 2) - 50;
-        payload.rects[0].width  = 200;
-        payload.rects[0].height = 100;
-        payload.rects[0].type   = 1; // Blackout
+        payload.rectCount = 0;
 
         if (m_callback)
             m_callback(payload);
@@ -235,6 +341,23 @@ static void* securecast_create(obs_data_t* settings, obs_source_t* context)
     // FrameRingBuffer는 첫 video_render 호출 시 지연 초기화 (OBS gs context 필요)
     // MockAIWorker도 렌더러가 실제 해상도를 알게 되는 시점(video_render)에 맞춰 시작하도록 연기합니다.
 
+#ifdef _WIN32
+    filter->winListener.start();
+#endif
+
+    // HLSL 셰이더 컴파일 (그래픽스 컨텍스트 필요)
+    obs_enter_graphics();
+    char *effect_path = obs_module_file("securecast_blur.effect");
+    if (effect_path) {
+        filter->blurEffect = gs_effect_create_from_file(effect_path, nullptr);
+        bfree(effect_path);
+    }
+    obs_leave_graphics();
+    if (!filter->blurEffect)
+        blog(LOG_WARNING, "[SecureCast] blur effect load failed; falling back to solid blackout.");
+    else
+        blog(LOG_INFO, "[SecureCast] blur effect loaded.");
+
     blog(LOG_INFO, "Filter created (Role C: Mock Pipeline Active).");
     return filter;
 }
@@ -246,8 +369,20 @@ static void securecast_destroy(void* data)
 
     blog(LOG_INFO, "Destroying filter...");
 
+#ifdef _WIN32
+    filter->winListener.stop();
+#endif
+
     // AI 워커 먼저 중지 (콜백이 ring buffer에 접근하지 않도록)
     filter->mockWorker.stop();
+
+    // GPU 리소스 해제
+    obs_enter_graphics();
+    if (filter->blurEffect) {
+        gs_effect_destroy(filter->blurEffect);
+        filter->blurEffect = nullptr;
+    }
+    obs_leave_graphics();
 
     // GPU 텍스처 해제 (내부에서 obs_enter/leave_graphics 처리)
     filter->ringBuffer.destroy();
@@ -333,8 +468,19 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
     }
 
     // --- Step 2: 현재 프레임을 Ring Buffer HEAD에 Push ---
+    // OBS 소스 내부 버퍼링으로 obs_source_video_render()가 반환하는 픽셀은
+    // 실제 DWM 쿼리보다 ~1프레임 뒤처진다.
+    // captureWindowList(직전 프레임에서 저장한 DWM 좌표)를 스냅샷으로 쓰면
+    // 픽셀 내용과 마스크 위치가 정확히 동기화된다.
     uint64_t ts = obs_get_video_frame_time();
+#ifdef _WIN32
+    filter->ringBuffer.pushFrame(parent, ts, &filter->captureWindowList);
+    // push 이후에 DWM 갱신 → 다음 프레임의 captureWindowList로 저장
+    sc_update_tracked_bounds(&filter->windowList);
+    filter->captureWindowList = filter->windowList;
+#else
     filter->ringBuffer.pushFrame(parent, ts);
+#endif
 
     // --- Step 3: AI 결과 채널에서 최신 마스킹 페이로드 Consume ---
     MaskPayload newMask{};
@@ -360,20 +506,63 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
     while (gs_effect_loop(draw, "Draw"))
         gs_draw_sprite(delayedTex, 0, w, h);
 
-    // --- 마스킹 오버레이: BlurRect 영역에 검정 박스 덮어쓰기 (Mock 시각화) ---
-    // TODO (Role A): 이 부분을 HLSL Pixel Blur Shader 호출로 교체
-    if (filter->lastMask.rectCount > 0) {
-        gs_effect_t* solid = obs_get_base_effect(OBS_EFFECT_SOLID);
-        gs_eparam_t* colorParam = gs_effect_get_param_by_name(solid, "color");
-        gs_effect_set_color(colorParam, 0xFF000000); // 불투명 검정
+    // --- 마스킹 오버레이 ---
+    // Role A: delayedSlot->windowSnapshot (프레임 캡처 시점의 창 위치 → 프레임과 동기화됨)
+    // Role B/C: lastMask (AI/MockAI 결과)
+    BlurRect all_rects[SC_MAX_BLUR_RECTS + SC_MAX_TRACKED_WINDOWS];
+    int all_count = 0;
 
+#ifdef _WIN32
+    // N프레임 전 스냅샷 (현재 렌더링 중인 지연 프레임과 동기화)
+    for (int i = 0; i < delayedSlot->windowSnapshot.count &&
+                    all_count < (int)(sizeof(all_rects) / sizeof(all_rects[0])); i++) {
+        BlurRect r = tracked_window_to_blur_rect(delayedSlot->windowSnapshot.items[i], w, h);
+        if (r.width > 0 && r.height > 0)
+            all_rects[all_count++] = r;
+    }
+    // N-1프레임 전 스냅샷 합집합: 한 프레임 이동 궤적 전체를 마스킹 (빠른 드래그 노출 방지)
+    {
+        const FrameRingBuffer::Slot* slotN1 =
+            filter->ringBuffer.peekSlotAtOffset(SC_RING_BUFFER_SLOTS - 1);
+        if (slotN1) {
+            for (int i = 0; i < slotN1->windowSnapshot.count &&
+                            all_count < (int)(sizeof(all_rects) / sizeof(all_rects[0])); i++) {
+                BlurRect r = tracked_window_to_blur_rect(slotN1->windowSnapshot.items[i], w, h);
+                if (r.width > 0 && r.height > 0)
+                    all_rects[all_count++] = r;
+            }
+        }
+    }
+    // Lingering rects: 사라진 창의 N프레임 잔영 (ring buffer에 남은 과거 프레임 커버)
+    for (int li = 0; li < filter->lingeringCount &&
+                     all_count < (int)(sizeof(all_rects) / sizeof(all_rects[0])); ++li) {
+        BlurRect r = tracked_window_to_blur_rect(filter->lingeringWindows[li].window, w, h);
+        if (r.width > 0 && r.height > 0)
+            all_rects[all_count++] = r;
+    }
+#endif
+    for (int i = 0; i < filter->lastMask.rectCount &&
+                    all_count < (int)(sizeof(all_rects) / sizeof(all_rects[0])); i++)
+        all_rects[all_count++] = filter->lastMask.rects[i];
+
+    if (all_count == 0)
+        return;
+
+    if (filter->blurEffect) {
+        // blur.effect 셰이더 사용 (Blur / Blackout technique)
+        for (int i = 0; i < all_count; i++)
+            render_blur_rect(filter->blurEffect, delayedTex, all_rects[i], w, h);
+    } else {
+        // 셰이더 로드 실패 시 fallback: 단색 검정 박스
+        gs_effect_t *solid = obs_get_base_effect(OBS_EFFECT_SOLID);
+        gs_effect_set_color(gs_effect_get_param_by_name(solid, "color"), 0xFF000000);
         gs_matrix_push();
         while (gs_effect_loop(solid, "Solid")) {
-            for (int i = 0; i < filter->lastMask.rectCount; i++) {
-                const BlurRect& r = filter->lastMask.rects[i];
+            for (int i = 0; i < all_count; i++) {
                 gs_matrix_identity();
-                gs_matrix_translate3f((float)r.x, (float)r.y, 0.0f);
-                gs_draw_sprite(nullptr, 0, (uint32_t)r.width, (uint32_t)r.height);
+                gs_matrix_translate3f((float)all_rects[i].x, (float)all_rects[i].y, 0.0f);
+                gs_draw_sprite(nullptr, 0, (uint32_t)all_rects[i].width,
+                               (uint32_t)all_rects[i].height);
             }
         }
         gs_matrix_pop();
@@ -395,7 +584,41 @@ static void securecast_video_tick(void* data, float seconds)
     if (!filter || !filter->isActive)
         return;
 
-    sc_tracker_tick(seconds, &filter->trackerAccumulator);
+#ifdef _WIN32
+    if (filter->winListener.checkAndClearRescan())
+        filter->trackerAccumulator = SCAN_INTERVAL_FORCE;
+    sc_tracker_tick(seconds, &filter->trackerAccumulator, &filter->windowList);
+
+    // Lingering: 직전 스캔에 있었지만 이번엔 사라진 창 감지.
+    // windowList는 slow-scan 주기(150ms)마다만 바뀌므로 비교는 실질적으로 그때만 의미 있다.
+    for (int pi = 0; pi < filter->prevWindowList.count; ++pi) {
+        HWND ph = filter->prevWindowList.items[pi].hwnd;
+        bool found = false;
+        for (int ci = 0; ci < filter->windowList.count && !found; ++ci)
+            found = (filter->windowList.items[ci].hwnd == ph);
+        if (!found) {
+            bool already = false;
+            for (int li = 0; li < filter->lingeringCount; ++li) {
+                if (filter->lingeringWindows[li].window.hwnd == ph) {
+                    filter->lingeringWindows[li].ticksRemaining = SC_RING_BUFFER_SLOTS;
+                    already = true;
+                    break;
+                }
+            }
+            if (!already && filter->lingeringCount < SC_MAX_LINGERING)
+                filter->lingeringWindows[filter->lingeringCount++] = {
+                    filter->prevWindowList.items[pi], SC_RING_BUFFER_SLOTS
+                };
+        }
+    }
+    filter->prevWindowList = filter->windowList;
+
+    // 매 tick 카운트다운 → 정확히 N프레임(ring buffer 지연) 후 자연 제거
+    for (int li = filter->lingeringCount - 1; li >= 0; --li) {
+        if (--filter->lingeringWindows[li].ticksRemaining <= 0)
+            filter->lingeringWindows[li] = filter->lingeringWindows[--filter->lingeringCount];
+    }
+#endif
 }
   
 // ================================================================

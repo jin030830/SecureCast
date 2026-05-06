@@ -31,6 +31,14 @@
 #include <obs-module.h>
 
 // ----------------------------------------------------
+// Platform Headers
+// ----------------------------------------------------
+#ifdef _WIN32
+#include "win_event_listener.h"
+#include "window_tracker.h"
+#endif
+
+// ----------------------------------------------------
 // Helpers & Macros
 // ----------------------------------------------------
 
@@ -71,6 +79,15 @@ struct MaskPayload {
     int rectCount;
 };
 
+#ifdef _WIN32
+// 창이 사라진 후 ring buffer에 남은 N프레임 동안 마스킹을 유지하는 잔영 항목.
+struct LingeringWindow {
+    TrackedWindow window;         // 마지막으로 알려진 창 정보 (bounds 포함)
+    int           ticksRemaining; // SC_RING_BUFFER_SLOTS에서 매 tick 카운트다운
+};
+constexpr int SC_MAX_LINGERING = SC_MAX_TRACKED_WINDOWS;
+#endif
+
 // ----------------------------------------------------
 // [Role C] N-Frame Ring Buffer
 // 
@@ -90,6 +107,11 @@ public:
     struct Slot {
         gs_texrender_t* texrender = nullptr; // OBS 안전 렌더 타겟 관리자
         uint64_t        timestamp = 0;
+#ifdef _WIN32
+        // 이 프레임이 캡처된 시점의 창 좌표 스냅샷.
+        // 렌더 시 delayedSlot->windowSnapshot을 사용해야 프레임 내용과 마스크 위치가 동기화됨.
+        TrackedWindowList windowSnapshot{};
+#endif
 
         // gs_texrender에서 결과 텍스처를 꺼내는 헬퍼
         gs_texture_t* getTexture() const {
@@ -104,10 +126,18 @@ public:
     bool initialize(uint32_t width, uint32_t height);
     void destroy();
 
-    // gs_texrender_begin/end를 사용하여 안전하게 프레임을 캡처
+    // gs_texrender_begin/end를 사용하여 안전하게 프레임을 캡처.
+    // wlist: 이 프레임 캡처 시점의 창 좌표 스냅샷 (null 허용).
+#ifdef _WIN32
+    void pushFrame(obs_source_t* source, uint64_t timestamp, const TrackedWindowList* wlist);
+#else
     void pushFrame(obs_source_t* source, uint64_t timestamp);
+#endif
 
     const Slot* peekDelayedSlot() const;
+    // framesBack=SC_RING_BUFFER_SLOTS이면 peekDelayedSlot()과 동일.
+    // framesBack=SC_RING_BUFFER_SLOTS-1이면 한 프레임 더 최신 슬롯 (빠른 이동 합집합용).
+    const Slot* peekSlotAtOffset(int framesBack) const;
 
     bool isInitialized() const { return m_initialized; }
     uint32_t getWidth()  const { return m_width;  }
@@ -194,6 +224,9 @@ struct SecureCastFilter {
     bool          isGameMode  = false;
     SecurityState currentState = SecurityState::SAFE;
 
+    // ----- [Role A] HLSL 마스킹 셰이더 -----
+    gs_effect_t*  blurEffect  = nullptr; // data/securecast_blur.effect 컴파일 결과
+
     // ----- [Role C] 담당 필드 -----
     FrameRingBuffer  ringBuffer;    // N-Frame 지연 버퍼
     MockAIWorker     mockWorker;    // 가짜 AI 워커 스레드
@@ -203,6 +236,15 @@ struct SecureCastFilter {
     // ----- [Role A] 담당 필드 -----
     float         trackerAccumulator = 0.0f; // window_tracker tick throttle 누산기
     // gs_effect_t* blurEffect = nullptr;  // 컴파일된 HLSL 셰이더
+#ifdef _WIN32
+    WinEventListener  winListener;
+    TrackedWindowList windowList{};          // 마지막 slow-scan 결과 (sc_tracker_tick 갱신)
+    TrackedWindowList captureWindowList{};   // pushFrame에 쓰는 스냅샷: 직전 프레임 DWM 좌표
+                                             // OBS 소스 캡처 ~1프레임 레이턴시 보정용
+    TrackedWindowList prevWindowList{};      // lingering 감지용 직전 스캔 결과
+    LingeringWindow   lingeringWindows[SC_MAX_LINGERING]{};
+    int               lingeringCount = 0;
+#endif
 
     // ----- TODO: Role B 담당 필드 -----
     // void* ocrEngine = nullptr;           // Windows.Media.Ocr 엔진 포인터
