@@ -585,9 +585,57 @@ static void securecast_video_tick(void* data, float seconds)
         return;
 
 #ifdef _WIN32
-    if (filter->winListener.checkAndClearRescan())
+    if (filter->winListener.checkAndClearRescan()) {
         filter->trackerAccumulator = SCAN_INTERVAL_FORCE;
+
+        // Quick restore: foreground 전환 이벤트 직후 recentlySeenList 조회 → 즉시 복원.
+        // EnumWindows 스캔(느림) 전에 captureWindowList를 채워
+        // 이번 render의 pushFrame 시점부터 마스킹이 적용되도록 한다.
+        HWND fgHwnd = GetForegroundWindow();
+        if (fgHwnd) {
+            for (int ri = 0; ri < filter->recentlySeenList.count; ++ri) {
+                if (filter->recentlySeenList.items[ri].hwnd != fgHwnd)
+                    continue;
+                bool alreadyTracked = false;
+                for (int wi = 0; wi < filter->windowList.count; ++wi) {
+                    if (filter->windowList.items[wi].hwnd == fgHwnd) {
+                        alreadyTracked = true;
+                        break;
+                    }
+                }
+                if (!alreadyTracked && filter->windowList.count < SC_MAX_TRACKED_WINDOWS) {
+                    const TrackedWindow& tw = filter->recentlySeenList.items[ri];
+                    filter->windowList.items[filter->windowList.count++] = tw;
+                    // captureWindowList에도 즉시 반영: 이번 render pushFrame 스냅샷에 포함
+                    if (filter->captureWindowList.count < SC_MAX_TRACKED_WINDOWS)
+                        filter->captureWindowList.items[filter->captureWindowList.count++] = tw;
+                }
+                break;
+            }
+        }
+    }
     sc_tracker_tick(seconds, &filter->trackerAccumulator, &filter->windowList);
+
+    // recentlySeenList 유지: windowList 항목을 upsert, 완전히 닫힌 HWND 제거.
+    // recentlySeenList는 앱이 다시 등장했을 때 quick restore의 소스가 된다.
+    for (int wi = 0; wi < filter->windowList.count; ++wi) {
+        HWND wh = filter->windowList.items[wi].hwnd;
+        bool found = false;
+        for (int ri = 0; ri < filter->recentlySeenList.count; ++ri) {
+            if (filter->recentlySeenList.items[ri].hwnd == wh) {
+                filter->recentlySeenList.items[ri] = filter->windowList.items[wi];
+                found = true;
+                break;
+            }
+        }
+        if (!found && filter->recentlySeenList.count < SC_MAX_TRACKED_WINDOWS)
+            filter->recentlySeenList.items[filter->recentlySeenList.count++] = filter->windowList.items[wi];
+    }
+    // 완전히 닫힌 프로세스의 HWND 정리 (최소화/숨김은 IsWindow=true라 유지됨)
+    for (int ri = filter->recentlySeenList.count - 1; ri >= 0; --ri) {
+        if (!IsWindow(filter->recentlySeenList.items[ri].hwnd))
+            filter->recentlySeenList.items[ri] = filter->recentlySeenList.items[--filter->recentlySeenList.count];
+    }
 
     // Lingering: 직전 스캔에 있었지만 이번엔 사라진 창 감지.
     // windowList는 slow-scan 주기(150ms)마다만 바뀌므로 비교는 실질적으로 그때만 의미 있다.

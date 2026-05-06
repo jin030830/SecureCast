@@ -238,10 +238,10 @@ struct SecureCastFilter {
     // gs_effect_t* blurEffect = nullptr;  // 컴파일된 HLSL 셰이더
 #ifdef _WIN32
     WinEventListener  winListener;
-    TrackedWindowList windowList{};          // 마지막 slow-scan 결과 (sc_tracker_tick 갱신)
-    TrackedWindowList captureWindowList{};   // pushFrame에 쓰는 스냅샷: 직전 프레임 DWM 좌표
-                                             // OBS 소스 캡처 ~1프레임 레이턴시 보정용
+    TrackedWindowList windowList{};          // 현재 추적 중인 창 목록
+    TrackedWindowList captureWindowList{};   // pushFrame 스냅샷: 직전 프레임 DWM 좌표 (캡처 레이턴시 보정)
     TrackedWindowList prevWindowList{};      // lingering 감지용 직전 스캔 결과
+    TrackedWindowList recentlySeenList{};    // 과거에 추적했던 창 목록 (quick restore용, 닫힐 때까지 유지)
     LingeringWindow   lingeringWindows[SC_MAX_LINGERING]{};
     int               lingeringCount = 0;
 #endif
