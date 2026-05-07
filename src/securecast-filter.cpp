@@ -66,10 +66,10 @@ static float sampleCpuUsage(FILETIME* prevIdle, FILETIME* prevKernel, FILETIME* 
     *prevUser   = user;
 
     uint64_t total = kernelDiff + userDiff;
-    if (total == 0)
+    if (total == 0 || idleDiff > total)
         return 0.0f;
 
-    return (float)(total - idleDiff) / (float)total * 100.0f;
+    return std::clamp((float)(total - idleDiff) / (float)total * 100.0f, 0.0f, 100.0f);
 }
 #endif
 
@@ -584,6 +584,40 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
         });
     }
 
+    // --- Panic Mode: pushFrame 이전에 차단 ---
+    // 패닉 중에는 링 버퍼를 파괴해 GPU 낭비를 막고,
+    // 해제 직후 패닉 중 캡처된 프레임이 스트림에 유출되는 것을 방지한다.
+    // ringBuffer.destroy()는 이미 파괴된 경우 no-op이라 매 프레임 호출해도 안전.
+    if (filter->panicMode.load(std::memory_order_relaxed)) {
+        filter->ringBuffer.destroy();
+
+        gs_effect_t* solid = obs_get_base_effect(OBS_EFFECT_SOLID);
+
+        gs_effect_set_color(gs_effect_get_param_by_name(solid, "color"), 0xFF000000);
+        while (gs_effect_loop(solid, "Solid"))
+            gs_draw_sprite(nullptr, 0, w, h);
+
+        constexpr uint32_t BORDER = 6;
+        gs_effect_set_color(gs_effect_get_param_by_name(solid, "color"), 0xFFFF0000);
+        while (gs_effect_loop(solid, "Solid")) {
+            gs_matrix_push(); gs_matrix_identity();
+            gs_draw_sprite(nullptr, 0, w, BORDER);
+            gs_matrix_pop();
+            gs_matrix_push(); gs_matrix_identity();
+            gs_matrix_translate3f(0.0f, (float)(h - BORDER), 0.0f);
+            gs_draw_sprite(nullptr, 0, w, BORDER);
+            gs_matrix_pop();
+            gs_matrix_push(); gs_matrix_identity();
+            gs_draw_sprite(nullptr, 0, BORDER, h);
+            gs_matrix_pop();
+            gs_matrix_push(); gs_matrix_identity();
+            gs_matrix_translate3f((float)(w - BORDER), 0.0f, 0.0f);
+            gs_draw_sprite(nullptr, 0, BORDER, h);
+            gs_matrix_pop();
+        }
+        return;
+    }
+
     // --- Step 2: 현재 프레임을 Ring Buffer HEAD에 Push ---
     // OBS 소스 내부 버퍼링으로 obs_source_video_render()가 반환하는 픽셀은
     // 실제 DWM 쿼리보다 ~1프레임 뒤처진다.
@@ -603,39 +637,6 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
     MaskPayload newMask{};
     if (filter->maskChannel.consume(newMask))
         filter->lastMask = newMask;
-
-    // --- Panic Mode (Ctrl+Shift+F12) ---
-    // ring buffer는 계속 채우되 인코더로는 전체 블랙 + 빨간 테두리만 출력.
-    // 스트리머는 빨간 테두리로 패닉 활성 여부를 확인할 수 있다.
-    if (filter->panicMode.load(std::memory_order_relaxed)) {
-        gs_effect_t* solid = obs_get_base_effect(OBS_EFFECT_SOLID);
-
-        // 전체 블랙아웃
-        gs_effect_set_color(gs_effect_get_param_by_name(solid, "color"), 0xFF000000);
-        while (gs_effect_loop(solid, "Solid"))
-            gs_draw_sprite(nullptr, 0, w, h);
-
-        // 빨간 테두리 6px
-        constexpr uint32_t BORDER = 6;
-        gs_effect_set_color(gs_effect_get_param_by_name(solid, "color"), 0xFFFF0000);
-        while (gs_effect_loop(solid, "Solid")) {
-            gs_matrix_push(); gs_matrix_identity();
-            gs_draw_sprite(nullptr, 0, w, BORDER);                          // top
-            gs_matrix_pop();
-            gs_matrix_push(); gs_matrix_identity();
-            gs_matrix_translate3f(0.0f, (float)(h - BORDER), 0.0f);
-            gs_draw_sprite(nullptr, 0, w, BORDER);                          // bottom
-            gs_matrix_pop();
-            gs_matrix_push(); gs_matrix_identity();
-            gs_draw_sprite(nullptr, 0, BORDER, h);                          // left
-            gs_matrix_pop();
-            gs_matrix_push(); gs_matrix_identity();
-            gs_matrix_translate3f((float)(w - BORDER), 0.0f, 0.0f);
-            gs_draw_sprite(nullptr, 0, BORDER, h);                          // right
-            gs_matrix_pop();
-        }
-        return;
-    }
 
     // --- Step 4~5: N프레임 지연된 슬롯 꺼내기 ---
     const FrameRingBuffer::Slot* delayedSlot = filter->ringBuffer.peekDelayedSlot();
