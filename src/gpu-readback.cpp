@@ -226,10 +226,15 @@ void GpuReadback::resizePool(const std::vector<std::pair<int, int>>& slotSizes) 
             if (FAILED(hr)) {
                 blog(LOG_ERROR, "[SecureCast] CreateTexture2D failed for slot[%d] size=%dx%d (hr=0x%08X)",
                      i, slotSizes[i].first, slotSizes[i].second, hr);
+                // [C2-6 수정] 실패한 슬롯도 push하되 staging=nullptr로 남겨둠.
+                // enqueueCopy/readStagingBuffer 둘 다 staging nullptr 가드가 있어 안전하게 스킵됨.
             }
             m_pool[p].push_back(slot);
         }
     }
+    // [C2-6 수정] CreateTexture2D 실패 여부와 무관하게 newSize를 설정하되,
+    // 실패한 슬롯은 enqueueCopy 및 readStagingBuffer에서 nullptr 체크로 방어됨.
+    // (enqueueCopy line 81: if (!nativeRT || !slot.staging) return;)
     m_totalSlots = newSize;
     blog(LOG_INFO, "[SecureCast] resizePool complete: %d slots (Slot0: %dx%d, Slot1: %dx%d)",
          newSize,

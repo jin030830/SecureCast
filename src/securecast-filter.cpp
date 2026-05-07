@@ -259,7 +259,10 @@ static void securecast_destroy(void* data)
 
 #ifdef _WIN32
     obs_enter_graphics();
-    filter->readback.destroy();
+    // [C2-5 수정] shutdown 경로에서는 spin-wait가 없는 destroyImmediate() 사용.
+    // readback.destroy()는 내부에서 최대 100k 사이클 스핀을 수행하므로
+    // GPU 정체 시 OBS 종료가 수초 지연될 수 있음.
+    filter->readback.destroyImmediate();
     filter->ringBuffer.destroy(); // [NEW-2 수정] gs_texrender_destroy는 graphics context 안에서만 안전
     obs_leave_graphics();
 #else
@@ -434,10 +437,10 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
                     // filter->aiWorker.feedFrame(result);
                 }
             } else {
-                static int sc_unchanged = 0;
-                if (++sc_unchanged >= 120) {
+                // [C2-3 수정] static → 멤버 변수 사용 (다중 인스턴스 공유 방지)
+                if (++filter->logUnchangedFrames >= 120) {
                     blog(LOG_INFO, "[SecureCast] No change for 120 frames.");
-                    sc_unchanged = 0;
+                    filter->logUnchangedFrames = 0;
                 }
             }
         } else {
@@ -447,8 +450,8 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
     } else {
         filter->health.onCollectFailure();
         if (filter->readback.isPipelineFull()) {
-            static int sc_stallLog = 0;
-            if (sc_stallLog++ % 30 == 0)
+            // [C2-3 수정] static → 멤버 변수 사용
+            if (filter->logStallCount++ % 30 == 0)
                 blog(LOG_WARNING, "[SecureCast] Pipeline FULL, GPU not responding.");
         }
     }
@@ -522,14 +525,26 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
             filter->readback.enqueueCopy(delayedTex, screenRect, 1, ocrW, ocrH);
             // [C-7 수정] submitFrame은 shouldCopy 블록 안으로
             filter->readback.submitFrame();
-            static int sc_enqLog = 0;
-            if (sc_enqLog++ % 300 == 0)
+            // [C2-2 수정] frameCounter도 shouldCopy 블록 안으로 이동 (실제 제출된 프레임만 카운트)
+            filter->frameCounter++;
+            // [C2-3 수정] static → 멤버 변수 사용
+            if (filter->logEnqueueCount++ % 300 == 0)
                 blog(LOG_INFO, "[SecureCast] Enqueued frame batch OK.");
         }
-        filter->frameCounter++;
     }
 
-    // Phase 4: Health Check & Reset
+    // Phase 4: Health Check & Reset + [C2-1 수정] currentState 갱신
+    // - CRITICAL(isCritical) → RISK : GPU 완전 정체, 파이프라인 리셋 필요 상태
+    // - 마스킹 활성(lastMask.rectCount > 0) → PARTIAL : PII 감지되어 마스킹 동작 중
+    // - 그 외 → SAFE
+    if (filter->health.isCritical()) {
+        filter->currentState = SecurityState::RISK;
+    } else if (filter->lastMask.rectCount > 0 || blacklistSnapshot.rectCount > 0) {
+        filter->currentState = SecurityState::PARTIAL;
+    } else {
+        filter->currentState = SecurityState::SAFE;
+    }
+
     if (filter->health.shouldReset()) {
         blog(LOG_ERROR, "[SecureCast] Pipeline CRITICAL. Resetting.");
         MaskPayload bo{}; bo.rectCount = 1;
