@@ -113,6 +113,13 @@ bool GpuReadback::tryCollectPreviousFrame() {
         if (m_queryFailCount % 30 == 0) {
             blog(LOG_INFO, "[SecureCast] GPU query still in progress (S_FALSE) for slot %d. count: %d", prev, m_queryFailCount);
         }
+        // [Suggestion 반영] 드라이버 버그 등으로 인한 무한 정체 방지를 위해
+        // 45회 연속 실패 시(약 0.75초) 강제로 슬롯을 해제하는 소프트 복구를 트리거합니다.
+        if (m_queryFailCount > 45) {
+            blog(LOG_WARNING, "[SecureCast] Persistent query failure (45 stalls). Forcing health soft recovery.");
+            forceReleaseOldestSlot();
+            m_queryFailCount = 0;
+        }
         return false;
     }
 

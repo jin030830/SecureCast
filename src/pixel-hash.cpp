@@ -79,7 +79,13 @@ bool PixelHashCache::hasChanged(const uint8_t* data, size_t size, int minPixelCh
                 }
             }
         }
-        significantChange = (changedPixels >= minPixelChange);
+        // [Suggestion 반영] 해상도 변화 대응: 입력 버퍼 크기에 따른 적응형 임계값 연산
+        int adaptiveThreshold = minPixelChange;
+        if (minPixelChange == 204 && size > 0) {
+            int pixelCount = (int)(size / 4);
+            adaptiveThreshold = (pixelCount * CHANGE_THRESHOLD_PERCENT) / 100;
+        }
+        significantChange = (changedPixels >= adaptiveThreshold);
         
         if (significantChange && outChangedGrid) {
             outChangedGrid->x = minX;
