@@ -4,6 +4,10 @@
 #include <cstdlib>  // std::abs (int형)
 #include <util/platform.h>
 
+inline uint8_t abs_diff(uint8_t a, uint8_t b) {
+    return (a >= b) ? (a - b) : (b - a);
+}
+
 PixelHashCache::PixelHashCache() {
     reset();
 }
@@ -66,9 +70,9 @@ bool PixelHashCache::hasChanged(const uint8_t* data, size_t size, int minPixelCh
         for (int y = 0; y < 64; y++) {
             for (int x = 0; x < 64; x++) {
                 int idx = (y * 64 + x) * 4;
-                int diffB = std::abs((int)data[idx]   - (int)m_prevData[idx]);
-                int diffG = std::abs((int)data[idx+1] - (int)m_prevData[idx+1]);
-                int diffR = std::abs((int)data[idx+2] - (int)m_prevData[idx+2]);
+                uint8_t diffB = abs_diff(data[idx],   m_prevData[idx]);
+                uint8_t diffG = abs_diff(data[idx+1], m_prevData[idx+1]);
+                uint8_t diffR = abs_diff(data[idx+2], m_prevData[idx+2]);
                 
                 if (diffR > PIXEL_DIFF_THRESHOLD || diffG > PIXEL_DIFF_THRESHOLD || diffB > PIXEL_DIFF_THRESHOLD) {
                     changedPixels++;
@@ -79,11 +83,11 @@ bool PixelHashCache::hasChanged(const uint8_t* data, size_t size, int minPixelCh
                 }
             }
         }
-        // [Suggestion 반영] 해상도 변화 대응: 입력 버퍼 크기에 따른 적응형 임계값 연산
+        // [F5 Fix] 해상도 변화 대응: std::max를 사용하여 5% floor를 보장하며 가변 대응
         int adaptiveThreshold = minPixelChange;
-        if (minPixelChange == 204 && size > 0) {
+        if (size > 0) {
             int pixelCount = (int)(size / 4);
-            adaptiveThreshold = (pixelCount * CHANGE_THRESHOLD_PERCENT) / 100;
+            adaptiveThreshold = std::max(minPixelChange, (pixelCount * CHANGE_THRESHOLD_PERCENT) / 100);
         }
         significantChange = (changedPixels >= adaptiveThreshold);
         
@@ -106,9 +110,11 @@ bool PixelHashCache::hasChanged(const uint8_t* data, size_t size, int minPixelCh
         m_hasPrevData = true;
         m_lastUpdateMs = nowMs;
 
-        // 새로운 해시값을 링 버퍼에 기록 (Stale 리셋 시에는 기록하지 않아도 무방하나 일관성을 위해 기록)
-        m_hashRing[m_ringIdx] = currentHash;
-        m_ringIdx = (m_ringIdx + 1) % RING_SIZE;
+        // [F10 Fix] 정적 무변화 해시의 중복 등록(Flooding) 방지: 오직 실제 의미 있는 변화가 발생했을 때만 해시 링 버퍼에 기록
+        if (significantChange) {
+            m_hashRing[m_ringIdx] = currentHash;
+            m_ringIdx = (m_ringIdx + 1) % RING_SIZE;
+        }
         m_cacheHitCount = 0;
 
         // 실제 유의미한 변화였을 때만 true 반환 (단순 Stale 리셋은 false)

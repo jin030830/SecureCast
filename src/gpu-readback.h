@@ -31,6 +31,13 @@ struct PoolSlot {
     int              unusedFrames = 0;
 };
 
+enum class CollectResult {
+    OK,
+    PENDING,
+    SOFT_RECOVERED,
+    FAILED
+};
+
 class GpuReadback {
     ID3D11Device*        m_device = nullptr;
     ID3D11DeviceContext* m_context = nullptr;
@@ -62,7 +69,7 @@ public:
      * @brief 비동기 쿼리 수확 (Non-blocking)
      * @return true 수확 성공, false 아직 진행 중이거나 실패
      */
-    bool tryCollectPreviousFrame();
+    CollectResult tryCollectPreviousFrame();
     void releaseFrame(); // 읽기가 완료된 슬롯 비우기
     bool isPipelineFull(); // 모든 슬롯이 작업 중인지 확인
     

@@ -204,6 +204,7 @@ struct SecureCastFilter {
     int  logUnchangedFrames = 0;  // 미변화 상태 로그 주기 카운터 (120프레임마다 1회)
     int  logStallCount      = 0;  // 파이프라인 포화 경고 로그 주기 카운터 (30프레임마다 1회)
     int  logEnqueueCount    = 0;  // enqueue 성공 로그 주기 카운터 (300프레임마다 1회)
+    int  logScanThrottle    = 0;  // [F8 Fix] 스캔 로그 스로틀 멤버 이전 (다중 인스턴스 격리)
 
     // ----- [Role A 담당: 윈도우 추적 및 블랙리스트] -----
     float         trackerAccumulator = 0.0f; // 윈도우 스캔 틱 조절(0.15초 단위)용 시간 누산기

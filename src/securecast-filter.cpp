@@ -38,7 +38,13 @@ bool FrameRingBuffer::initialize(uint32_t width, uint32_t height)
         slot.texrender = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
         if (!slot.texrender) {
             blog(LOG_ERROR, "Failed to allocate gs_texrender slot.");
-            destroy();
+            // [F13 Fix] 실패 시 이미 생성된 렌더러들을 로컬에서 직접 파괴하여 메모리 누수를 막고 destroy() 내 obs_enter_graphics() 이중 잠금 차단
+            for (auto& clean_slot : m_slots) {
+                if (clean_slot.texrender) {
+                    gs_texrender_destroy(clean_slot.texrender);
+                    clean_slot.texrender = nullptr;
+                }
+            }
             return false;
         }
         slot.timestamp = 0;
@@ -164,7 +170,8 @@ void MockAIWorker::workerLoop()
         if (!m_running.load())
             break;
 
-        // 가짜 마스킹 결과 생성: 화면 정중앙에 200x100 픽셀의 블랙아웃 박스 하나
+        // [F4 Fix] 프로덕션에서 가짜 마스킹 박스가 영구 출력되는 데모 회귀 방지를 위해 디버그용 MOCK 가드를 둡니다.
+#ifdef SC_DEBUG_MOCK
         MaskPayload payload{};
         payload.rectCount = 1;
         payload.rects[0].x     = static_cast<int>(m_frameWidth  / 2) - 100;
@@ -175,6 +182,12 @@ void MockAIWorker::workerLoop()
 
         if (m_callback)
             m_callback(payload);
+#else
+        // 실운영(Production) 시에는 빈 마스크를 주기적으로 전달하거나 스핀만 유지시킵니다.
+        MaskPayload payload{};
+        if (m_callback)
+            m_callback(payload);
+#endif
     }
 }
 
@@ -388,6 +401,22 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
              filter->health.getConsecutiveFailures());
     }
 
+    // [THREAD-SAFE] [F6 Fix / F11 Fix] currentState 갱신 및 로컬 스택 임시 객체(ocrSnapshot, blacklistSnapshot) 추출을 delayedSlot 이전으로 상향 이동하여 Torn-Read 차단 및 실시간성 확보
+    MaskPayload ocrSnapshot = filter->lastMask;
+    MaskPayload blacklistSnapshot;
+    {
+        std::lock_guard<std::mutex> lock(filter->blacklistMutex);
+        blacklistSnapshot = filter->blacklistMask;
+    }
+
+    if (filter->health.isCritical()) {
+        filter->currentState = SecurityState::RISK;
+    } else if (ocrSnapshot.rectCount > 0 || blacklistSnapshot.rectCount > 0) {
+        filter->currentState = SecurityState::PARTIAL;
+    } else {
+        filter->currentState = SecurityState::SAFE;
+    }
+
 #ifdef _WIN32
     // ---------------------------------------------------------
     // [C-5 수정] Phase 1(Collect+Hash) 도중에 돌려 delayedSlot early-return 앞에 실행.
@@ -407,9 +436,13 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
     }
 
     // Phase 1: Collect (이전 프레임 결과 수확 — delayedSlot 없어도 무조건 시도)
-    bool sc_collected = filter->readback.tryCollectPreviousFrame();
-    if (sc_collected) {
-        filter->health.onCollectSuccess();
+    CollectResult sc_collected = filter->readback.tryCollectPreviousFrame();
+    if (sc_collected == CollectResult::OK || sc_collected == CollectResult::SOFT_RECOVERED) {
+        if (sc_collected == CollectResult::SOFT_RECOVERED) {
+            filter->health.onForceRelease(); // [F3 Fix] 자체 소프트 복구 시 onForceRelease()를 호출하여 가짜 CRITICAL 예방
+        } else {
+            filter->health.onCollectSuccess();
+        }
         bool forceCheck = filter->readback.wasForceReleased();
         uint8_t* fullBuf = filter->readbackBuffer.data();
         if (filter->readback.readStagingBuffer(0, fullBuf, 64 * 4, 64)) {
@@ -427,12 +460,15 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
                 };
                 uint8_t* ocrBuf = filter->readbackBuffer.data() + (64 * 64 * 4);
                 if (filter->readback.readStagingBuffer(1, ocrBuf, ocrW * 4, ocrH)) {
+                    // [F7 Fix] feedFrame 비활성화 중 무의미한 8.3MB alloc + memcpy + free 방지
+                    /*
                     ReadbackResult result;
                     result.ownedData.assign(ocrBuf, ocrBuf + (size_t)(ocrW * ocrH * 4));
                     result.hashData   = result.ownedData.data();
                     result.hashSize   = (size_t)(ocrW * ocrH * 4);
                     result.bbox       = finalBox;
                     result.frameIndex = filter->frameCounter;
+                    */
                     // [Role B 연계 포인트]
                     // filter->aiWorker.feedFrame(result);
                 }
@@ -497,15 +533,9 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
 
     // 1. AI가 찾은 OCR 마스크 그리기 (약간 반투명한 빨간색으로 시각적 구분)
     // [C-10 수정] 0xAAFF0000 (Alpha: AA, Red: FF, Green: 00, Blue: 00)
-    renderMask(filter->lastMask, 0xAAFF0000);
+    renderMask(ocrSnapshot, 0xAAFF0000);
     
     // 2. 무조건 차단할 블랙리스트 마스크 덮어그리기 (불투명 검정색으로 최우선 차단)
-    // [THREAD-SAFE] video_tick이 쓰는 blacklistMask를 안전하게 읽기 위해 복사 후 렌더링
-    MaskPayload blacklistSnapshot;
-    {
-        std::lock_guard<std::mutex> lock(filter->blacklistMutex);
-        blacklistSnapshot = filter->blacklistMask;
-    }
     renderMask(blacklistSnapshot, 0xFF000000);
 
 #ifdef _WIN32
@@ -533,18 +563,7 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
         }
     }
 
-    // Phase 4: Health Check & Reset + [C2-1 수정] currentState 갱신
-    // - CRITICAL(isCritical) → RISK : GPU 완전 정체, 파이프라인 리셋 필요 상태
-    // - 마스킹 활성(lastMask.rectCount > 0) → PARTIAL : PII 감지되어 마스킹 동작 중
-    // - 그 외 → SAFE
-    if (filter->health.isCritical()) {
-        filter->currentState = SecurityState::RISK;
-    } else if (filter->lastMask.rectCount > 0 || blacklistSnapshot.rectCount > 0) {
-        filter->currentState = SecurityState::PARTIAL;
-    } else {
-        filter->currentState = SecurityState::SAFE;
-    }
-
+    // Phase 4: Health Check & Reset
     if (filter->health.shouldReset()) {
         blog(LOG_ERROR, "[SecureCast] Pipeline CRITICAL. Resetting.");
         MaskPayload bo{}; bo.rectCount = 1;
@@ -555,8 +574,7 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
         std::vector<std::pair<int,int>> ss = {{64,64},{ocrW,ocrH}};
         filter->readback.resizePool(ss);
         filter->health.reset();
-        // [C-9 수정] 복구 직후 포스 DEGRADED 중 닫힌 창의 오래된 블랙아웃 해제
-        filter->lastMask = MaskPayload{};
+        // [C-9 수정 / F2 Fix] 복구 직후 새 마스크 결과가 들어올 때까지 풀스크린 블랙아웃(bo)을 안전하게 유지 (Fail-Secure)
         filter->readback.setForceReleasedFlag(true);
     }
 #endif
@@ -600,8 +618,7 @@ static void securecast_video_tick(void* data, float seconds)
             }
 
             if (list.count > 0) {
-                static int scanLogThrottle = 0;
-                if (scanLogThrottle++ % 10 == 0) { // 0.15초 * 10 = 1.5초 주기 로그
+                if (filter->logScanThrottle++ % 10 == 0) { // 0.15초 * 10 = 1.5초 주기 로그
                     blog(LOG_INFO, "[SecureCast] %d blacklisted windows tracked in video_tick. Priority blackout applied.", list.count);
                 }
             }

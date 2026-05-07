@@ -44,8 +44,8 @@ PipelineHealth::Status PipelineHealth::evaluate() const {
         return Status::CRITICAL;
     }
 
-    // 3. 현재 지연이 진행 중인 상태
-    if (m_consecutiveFailures > 0) {
+    // 3. 현재 지연이 진행 중인 상태 (임계값 5회로 완화하여 가짜 DEGRADED 완화)
+    if (m_consecutiveFailures >= 5) {
         return Status::DEGRADED;
     }
 
