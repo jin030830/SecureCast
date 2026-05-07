@@ -17,7 +17,9 @@
 
 #include "securecast-filter.h"
 #include "plugin-support.h"   // obs_log
+#ifdef _WIN32
 #include "window_tracker.h"   // sc_scan_blacklisted_windows (Role A: 블랙리스트 앱 좌표 수집)
+#endif
 #include <chrono>
 #include <stdlib.h>
 #include <string.h>
@@ -497,9 +499,13 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
     const FrameRingBuffer::Slot* delayedSlot = filter->ringBuffer.peekDelayedSlot();
 
     if (!delayedSlot || !delayedSlot->getTexture()) {
-        // 버퍼가 아직 충분히 안 쌓였을 때는 필터를 건너뛰고 원본 화면을 그대로 출력.
-        // obs_source_skip_video_filter 하나만으로 패스스루 렌더링이 완료됩니다.
-        obs_source_skip_video_filter(filter->context);
+        // [P1 Fix] Fail-Secure 최우선 정책: 버퍼가 아직 충분히 준비되지 않은 첫 N프레임 초기 구간에서 민감한 원본 화면이 노출되지 않도록 전면 블랙 렌더링 적용
+        gs_effect_t* solid = obs_get_base_effect(OBS_EFFECT_SOLID);
+        gs_eparam_t* colorParam = gs_effect_get_param_by_name(solid, "color");
+        gs_effect_set_color(colorParam, 0xFF000000); // 100% 불투명 검정색
+        while (gs_effect_loop(solid, "Solid")) {
+            gs_draw_sprite(nullptr, 0, w, h);
+        }
         return;
     }
 
@@ -599,6 +605,7 @@ static void securecast_video_tick(void* data, float seconds)
     if (filter->trackerAccumulator >= 0.15f) {
         filter->trackerAccumulator = 0.0f;
         
+#ifdef _WIN32
         TrackedWindowList list{};
         sc_scan_blacklisted_windows(&list);
         
@@ -623,6 +630,7 @@ static void securecast_video_tick(void* data, float seconds)
                 }
             }
         }
+#endif
     }
 }
   

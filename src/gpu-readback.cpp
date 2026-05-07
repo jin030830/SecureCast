@@ -34,7 +34,11 @@ bool GpuReadback::initialize() {
   // 비동기 쿼리 생성
   D3D11_QUERY_DESC qd = {D3D11_QUERY_EVENT, 0};
   for (int i = 0; i < SLOT_COUNT; i++) {
-    m_device->CreateQuery(&qd, &m_queries[i]);
+    HRESULT hr = m_device->CreateQuery(&qd, &m_queries[i]);
+    if (FAILED(hr)) {
+      blog(LOG_ERROR, "[SecureCast] CreateQuery failed for query %d (hr=0x%08X)", i, hr);
+      m_queries[i] = nullptr;
+    }
     m_querySubmitted[i] = false;
     m_submitTime[i] = 0;
   }
@@ -143,6 +147,9 @@ CollectResult GpuReadback::tryCollectPreviousFrame() {
   if (FAILED(hr)) {
     blog(LOG_ERROR, "[SecureCast] GPU query failed (0x%08X)", hr);
     m_querySubmitted[prev] = false;
+    // [P1 Fix] 실패한 슬롯도 인출을 진행(m_collectQuery 진행 및 m_pendingCount 감소)시켜 파이프라인 영구 교착 예방
+    m_collectQuery = (m_collectQuery + 1) % SLOT_COUNT;
+    m_pendingCount--;
     return CollectResult::FAILED;
   }
 
@@ -213,6 +220,8 @@ bool GpuReadback::readStagingBuffer(int idx, uint8_t *out, size_t expectedPitch,
 
 void GpuReadback::resizePool(
     const std::vector<std::pair<int, int>> &slotSizes) {
+  if (!m_device || !m_context)
+    return;
   int newSize = (int)slotSizes.size();
 
   // 대기 중인 쿼리 완료 보장 (spin-wait)

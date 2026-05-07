@@ -2,6 +2,7 @@
 #include "securecast-types.h"
 #include <cstring>
 #include <cstdlib>  // std::abs (int형)
+#include <algorithm>
 #include <util/platform.h>
 
 inline uint8_t abs_diff(uint8_t a, uint8_t b) {
