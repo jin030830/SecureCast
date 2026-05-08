@@ -210,6 +210,8 @@ target_sources(
     src/pipeline-health.h
     src/ocr-engine.cpp            # Role B: OCR + RE2 기반 PII 탐지
     src/ocr-engine.h              # Role B: OCR 엔진 인터페이스
+    src/visual-tracker.cpp        # Role B: NCC 기반 프레임별 박스 추적
+    src/visual-tracker.h
 )
 
 if(WIN32)

@@ -65,3 +65,19 @@ add_test(
     COMMAND test_pii "${CMAKE_CURRENT_SOURCE_DIR}/pii_corpus.txt"
     WORKING_DIRECTORY "$<TARGET_FILE_DIR:test_pii>"
 )
+
+# ──────────────────────────────────────────────
+# test_tracker: VisualTrackerManager NCC 단위 테스트
+# ──────────────────────────────────────────────
+add_executable(test_tracker
+    test_tracker.cpp
+    ../src/visual-tracker.cpp
+)
+
+target_compile_features(test_tracker PRIVATE cxx_std_17)
+
+add_test(
+    NAME tracker
+    COMMAND test_tracker
+    WORKING_DIRECTORY "$<TARGET_FILE_DIR:test_tracker>"
+)
