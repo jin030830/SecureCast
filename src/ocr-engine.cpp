@@ -1037,6 +1037,10 @@ std::vector<SecureCastOcrBox> SecureCastOcrEngine::detect_pii(
                     std::string digits13 = d1 + d2;
                     static const auto rrn_checksum = [](const std::string& d) -> bool {
                         if (d.size() != 13) return false;
+                        const int month = (d[2]-'0')*10 + (d[3]-'0');
+                        const int day   = (d[4]-'0')*10 + (d[5]-'0');
+                        if (month < 1 || month > 12) return false;
+                        if (day   < 1 || day   > 31) return false;
                         static const int w[12] = {2,3,4,5,6,7,8,9,2,3,4,5};
                         int sum = 0;
                         for (int i = 0; i < 12; ++i) sum += (d[i]-'0') * w[i];
