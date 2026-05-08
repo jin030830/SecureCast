@@ -13,5 +13,6 @@ struct BlurRect {
     int y;
     int width;
     int height;
-    int type; // 0: Blur, 1: Blackout
+    int type;       // 0: Blur, 1: Blackout
+    uint64_t expireTs; // ms; 0=만료 없음; now > expireTs 이면 제거
 };

@@ -7,6 +7,7 @@ PipelineHealth::PipelineHealth() {
 }
 
 void PipelineHealth::onCollectSuccess() {
+    m_hasEverSucceeded = true;
     m_lastSuccessTime = os_gettime_ns() / 1000000;
     m_consecutiveFailures = 0;
 }
@@ -35,7 +36,9 @@ PipelineHealth::Status PipelineHealth::evaluate() const {
     uint64_t elapsedSinceSuccess = (m_lastSuccessTime > 0) ? (now - m_lastSuccessTime) : 0;
 
     // 1. 1초 이상 수확 성공이 없는 경우 (GPU 완전 정체 의심)
-    if (m_lastSuccessTime > 0 && elapsedSinceSuccess > CRITICAL_TIMEOUT_MS) {
+    // GpuReadback이 한 번이라도 실제 성공한 뒤에만 체크한다.
+    // 파이프라인이 아직 연결되지 않은 상태(enqueueCopy 미호출)에서는 오탐 리셋을 막기 위함.
+    if (m_hasEverSucceeded && m_lastSuccessTime > 0 && elapsedSinceSuccess > CRITICAL_TIMEOUT_MS) {
         return Status::CRITICAL;
     }
 

@@ -301,7 +301,18 @@ struct SecureCastFilter {
     int                  ocrPendingHeight = 0;
     int                  ocrPendingStride = 0;
 
-    // filter 인스턴스별 OCR throttle counter.
-    // render 함수 내부 static counter를 쓰면 여러 filter 인스턴스가 값을 공유하므로 사용하지 않는다.
-    uint32_t ocrFrameCounter = 0;
+    // back-pressure: idle이면 즉시 새 프레임 수용, busy면 GPU readback 건너뜀
+    std::atomic<bool> ocrWorkerIdle{true};
+
+    // 직전 OCR 사이클의 박스 수. 변경 시에만 LOG_INFO, 매 사이클은 LOG_DEBUG.
+    int lastLoggedOcrCount = -1;
+
+    // ── OCR 박스 누적 + TTL 관리 ─────────────────────────────────
+    // lastMask.rects[i]의 잔여 수명. 매 OCR 사이클마다 1씩 감소.
+    // OCR이 같은 위치의 박스를 다시 감지하면 TTL이 SC_OCR_BOX_TTL로 리셋된다.
+    // TTL이 0이 된 박스만 제거하므로, OCR이 한두 번 놓쳐도 마스크가 유지된다.
+    int ocrBoxTtl[SC_MAX_BLUR_RECTS]{};
+    static constexpr int SC_OCR_BOX_TTL = 6;    // 6 사이클 연속 미매칭 시 cycle TTL 만료
+    int emptyResultStreak = 0;                   // 연속 빈 OCR 결과 횟수
+    static constexpr int SC_EMPTY_HYSTERESIS = 3; // 이 값 이상 연속 빈 결과여야 lastMask 해제
 };

@@ -30,6 +30,7 @@
 #include <chrono>
 #include <stdlib.h>
 #include <string.h>
+#include <util/platform.h>
 
 // ================================================================
 // SecureCastFilter 구현부
@@ -511,6 +512,7 @@ static MaskPayload build_mask_payload_from_ocr_boxes(
     payload.rectCount = 0;
 
     const int maxRects = (int)(sizeof(payload.rects) / sizeof(payload.rects[0]));
+    const uint64_t nowMs = os_gettime_ns() / 1000000;
 
     for (const auto& box : boxes) {
         if (payload.rectCount >= maxRects)
@@ -537,11 +539,14 @@ static MaskPayload build_mask_payload_from_ocr_boxes(
             continue;
 
         BlurRect& r = payload.rects[payload.rectCount++];
-        r.x      = x;
-        r.y      = y;
-        r.width  = width;
-        r.height = height;
-        r.type   = 1;
+        r.x        = x;
+        r.y        = y;
+        r.width    = width;
+        r.height   = height;
+        r.type     = 1;
+        r.expireTs = nowMs + 2500; // 2500ms 보장
+        // 800ms → 2500ms: 트래커 소멸 후 full OCR 재시도(~460ms) + 인식 실패 2-3회 여유를
+        // 모두 포괄해 OCR이 간헐적으로 miss해도 mask가 깜빡이지 않도록 한다.
     }
 
     return payload;
@@ -634,9 +639,19 @@ static void ocr_worker_loop(SecureCastFilter* filter)
 
         MaskPayload payload = build_mask_payload_from_ocr_boxes(ocrBoxes, width, height);
 
-        filter->maskChannel.publish(payload);
+        // (c) 빈 결과는 publish하지 않는다 — lastMask를 expireTs가 자연 소멸시킴
+        if (payload.rectCount > 0)
+            filter->maskChannel.publish(payload);
 
-        blog(LOG_INFO, "[securecast][ocr] OCR boxes: %d", payload.rectCount);
+        blog(LOG_DEBUG, "[securecast][ocr] OCR boxes: %d", payload.rectCount);
+        if (payload.rectCount != filter->lastLoggedOcrCount) {
+            blog(LOG_INFO, "[securecast][ocr] mask count changed: %d -> %d",
+                 filter->lastLoggedOcrCount, payload.rectCount);
+            filter->lastLoggedOcrCount = payload.rectCount;
+        }
+
+        // back-pressure 해제: 다음 프레임 readback 허용
+        filter->ocrWorkerIdle.store(true, std::memory_order_release);
     }
 
     blog(LOG_INFO, "[securecast][ocr] OCR worker stopped.");
@@ -666,6 +681,10 @@ static void stop_ocr_worker(SecureCastFilter* filter)
     bool wasRunning = filter->ocrWorkerRunning.exchange(false, std::memory_order_acq_rel);
     if (!wasRunning)
         return;
+
+    // 진행 중인 RecognizeAsync를 취소하여 .get() 블로킹을 즉시 해제한다.
+    if (filter->ocrEngine)
+        filter->ocrEngine->cancel_current();
 
     filter->ocrWorkerCv.notify_all();
 
@@ -958,16 +977,73 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
     // GPU 정체 중에 들어온 분석 결과는 정체 이전의 오래된 픽셀 데이터를 기반으로 하므로,
     // 신뢰할 수 없습니다. 정상(OK) 상태일 때만 lastMask를 갱신합니다.
     if (!filter->health.isDegraded()) {
+        const uint64_t nowMs = os_gettime_ns() / 1000000;
         MaskPayload newMask{};
         if (filter->maskChannel.consume(newMask)) {
-            filter->lastMask = newMask;
+            if (newMask.rectCount > 0) {
+                filter->emptyResultStreak = 0;
+                // Step 1: 기존 박스 cycle TTL 감소
+                for (int i = 0; i < filter->lastMask.rectCount; ++i)
+                    filter->ocrBoxTtl[i]--;
+                // Step 2: 공간 매칭 — 가까운 박스는 위치·expireTs 갱신 + cycle TTL 리셋, 새 박스는 추가
+                for (int ni = 0; ni < newMask.rectCount; ++ni) {
+                    const BlurRect& nr = newMask.rects[ni];
+                    int ncx = nr.x + nr.width / 2;
+                    int ncy = nr.y + nr.height / 2;
+                    bool matched = false;
+                    for (int ei = 0; ei < filter->lastMask.rectCount; ++ei) {
+                        BlurRect& er = filter->lastMask.rects[ei];
+                        int ecx = er.x + er.width / 2;
+                        int ecy = er.y + er.height / 2;
+                        if (abs(ncx - ecx) < 100 && abs(ncy - ecy) < 60) {
+                            er = nr; // 위치 + expireTs 갱신
+                            filter->ocrBoxTtl[ei] = SecureCastFilter::SC_OCR_BOX_TTL;
+                            matched = true;
+                            break;
+                        }
+                    }
+                    if (!matched && filter->lastMask.rectCount < SC_MAX_BLUR_RECTS) {
+                        int idx = filter->lastMask.rectCount++;
+                        filter->lastMask.rects[idx] = nr;
+                        filter->ocrBoxTtl[idx] = SecureCastFilter::SC_OCR_BOX_TTL;
+                    }
+                }
+                // Step 3: expireTs 만료된 박스 제거 (cycle TTL은 공간 매칭 추적용, 제거 기준 아님)
+                int wr = 0;
+                for (int rd = 0; rd < filter->lastMask.rectCount; ++rd) {
+                    if (filter->lastMask.rects[rd].expireTs > nowMs) {
+                        filter->lastMask.rects[wr] = filter->lastMask.rects[rd];
+                        filter->ocrBoxTtl[wr] = filter->ocrBoxTtl[rd];
+                        ++wr;
+                    }
+                }
+                filter->lastMask.rectCount = wr;
+            } else {
+                // (c)로 빈 결과는 publish되지 않지만 방어용 hysteresis
+                if (++filter->emptyResultStreak >= SecureCastFilter::SC_EMPTY_HYSTERESIS) {
+                    filter->lastMask = MaskPayload{};
+                    memset(filter->ocrBoxTtl, 0, sizeof(filter->ocrBoxTtl));
+                    filter->emptyResultStreak = 0;
+                }
+            }
+        }
+        // consume 여부와 무관하게 매 프레임 expireTs 만료 박스 정리
+        {
+            int wr = 0;
+            for (int rd = 0; rd < filter->lastMask.rectCount; ++rd) {
+                if (filter->lastMask.rects[rd].expireTs == 0 ||
+                    filter->lastMask.rects[rd].expireTs > nowMs) {
+                    filter->lastMask.rects[wr] = filter->lastMask.rects[rd];
+                    filter->ocrBoxTtl[wr] = filter->ocrBoxTtl[rd];
+                    ++wr;
+                }
+            }
+            filter->lastMask.rectCount = wr;
         }
     } else {
         // DEGRADED 중에는 채널을 비워서 큐 포화를 방지하되, lastMask는 건드리지 않음
         MaskPayload drainMask{};
-        filter->maskChannel.consume(drainMask); // 결과 버림 (큐 드레인 목적)
-        blog(LOG_INFO, "[SecureCast] Mask hold active (DEGRADED, stall_count=%d). Discarding new AI result.",
-             filter->health.getConsecutiveFailures());
+        filter->maskChannel.consume(drainMask);
     }
 
     // [THREAD-SAFE] [F6 Fix / F11 Fix] currentState 갱신 및 로컬 스택 임시 객체(ocrSnapshot, blacklistSnapshot) 추출을 delayedSlot 이전으로 상향 이동하여 Torn-Read 차단 및 실시간성 확보
@@ -1053,7 +1129,11 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
         }
         filter->readback.releaseFrame();
     } else {
-        filter->health.onCollectFailure();
+        // PENDING(m_pendingCount==0)은 파이프라인 미사용 상태이므로 헬스 실패로 집계하지 않는다.
+        // FAILED만 실제 D3D11 오류이므로 헬스에 반영한다.
+        if (sc_collected == CollectResult::FAILED) {
+            filter->health.onCollectFailure();
+        }
         if (filter->readback.isPipelineFull()) {
             // [C2-3 수정] static → 멤버 변수 사용
             if (filter->logStallCount++ % 30 == 0)
@@ -1076,10 +1156,9 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
         return;
     }
 
-    // --- Step 5a: OCR 프레임 제출. OCR 인식으로 render thread를 막지 않는다. ---
-    filter->ocrFrameCounter++;
-    if (filter->ocrFrameCounter >= 15) {
-        filter->ocrFrameCounter = 0;
+    // --- Step 5a: OCR 프레임 제출. worker가 idle일 때만 새 프레임을 readback한다. ---
+    if (filter->ocrWorkerIdle.load(std::memory_order_acquire)) {
+        filter->ocrWorkerIdle.store(false, std::memory_order_release);
 
         std::vector<uint8_t> bgraPixels;
         int stride = 0;
@@ -1087,6 +1166,8 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
         gs_texture_t* ocrTex = delayedSlot->getTexture();
         if (read_texture_bgra_to_cpu(filter, ocrTex, w, h, bgraPixels, stride)) {
             submit_ocr_frame(filter, std::move(bgraPixels), (int)w, (int)h, stride);
+        } else {
+            filter->ocrWorkerIdle.store(true, std::memory_order_release);
         }
     }
 

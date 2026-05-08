@@ -42,6 +42,11 @@ public:
     // === OCR 사용 가능 여부 ===
     bool available() const;
 
+    // === 진행 중인 RecognizeAsync 취소 ===
+    // stop_ocr_worker가 join() 전에 호출하여 종료 지연을 방지한다.
+    // 완료된 op에 Cancel()은 no-op이므로 경쟁 조건 없이 안전하다.
+    void cancel_current();
+
     // ========================================================
     // 전체 파이프라인 실행
     // Dirty Skip → OCR → RE2 PII 탐지
@@ -64,25 +69,64 @@ private:
     bool available_ = false;
 
     // ========================================================
-    // Dirty Rect Skip 캐시
+    // Dirty Skip — dHash 기반 2-Level 캐시
     //
-    // lastFrameWidth_ / lastFrameHeight_는 해상도 변경 시
-    // 이전 프레임의 Bounding Box 좌표가 재사용되는 문제를 막기 위해 필요하다.
+    // L1: ROI dHash — PII 박스 영역만 해시. 시계·커서 등 배경 노이즈 무시.
+    //     hamming_distance ≤ 2 → 동일 프레임 간주 → OCR 생략.
+    //
+    // L2: 라인별 dHash — 변경된 라인만 crop OCR 재인식.
+    //     변경 없는 라인은 이전 박스 재사용 (OCR 비용 1/5~1/10).
+    //
+    // lastFrameWidth_/Height_: 해상도 변경 시 좌표 오탐 방지.
     // ========================================================
-    uint64_t lastFrameHash_ = 0;
-    bool hasLastFrameHash_ = false;
+    uint64_t lastRoiDhash_ = 0;
+    bool hasLastRoiDhash_ = false;
     int lastFrameWidth_ = 0;
     int lastFrameHeight_ = 0;
     std::vector<SecureCastOcrBox> lastBoxes_;
 
-    // FNV-1a 기반 프레임 해시.
-    // 작은 텍스트 변경 누락을 줄이기 위해 샘플링이 아니라 전체 픽셀 기준으로 계산한다.
-    uint64_t compute_frame_hash(
-        const uint8_t *pixels,
-        int width,
-        int height,
-        int stride
-    );
+    struct LineDHashCache {
+        int x, y, w, h;
+        uint64_t dhash;
+        bool hasBox;
+        SecureCastOcrBox box;
+    };
+    std::vector<LineDHashCache> lastLineDhashes_;
+    int consecutiveSkips_ = 0;
+    // 이 값 이상 연속 L1 히트 시 주기적 full OCR (새 텍스트 발견용)
+    // 29→10: 트래커 소멸 후 빈 lastBoxes_가 L1에 캐싱되는 구간을 464ms→160ms로 단축.
+    static constexpr int kMaxConsecutiveSkips = 10;
+
+    // 8×8 구역 dHash: 9×8 샘플 격자 → 인접 밝기 비교 → 64비트
+    uint64_t compute_dhash_region(const uint8_t* px, int stride,
+                                   int x, int y, int w, int h) const;
+    // ROI 합산 dHash: 박스 있으면 각 박스 영역 FNV 혼합, 없으면 전체 coarse dHash
+    uint64_t compute_roi_dhash(const uint8_t* px, int stride, int width, int height,
+                                const std::vector<SecureCastOcrBox>& boxes) const;
+    // 해밍 거리 (XOR 후 set bit 수)
+    static int hamming_distance(uint64_t a, uint64_t b);
+    // L2용: crop 영역만 OCR 실행, 반환 좌표는 원본 프레임 기준
+    std::vector<SecureCastOcrLine> recognize_text_crop(
+        const uint8_t* px, int width, int height, int stride,
+        int cx, int cy, int cw, int ch);
+
+    // ========================================================
+    // IoU 기반 박스 트래커 — OCR 깜빡임 제거 + EMA 좌표 보정
+    //
+    // 매 OCR 사이클마다:
+    //   1) 신규 박스 N개 × 기존 트래커 M개 IoU 행렬 계산
+    //   2) IoU >= 0.3 greedy 매칭 → 좌표 EMA 업데이트 (0.7×old + 0.3×new)
+    //   3) 매칭 안 된 신규 박스 → 신규 트래커 추가
+    //   4) 매칭 안 된 기존 트래커 → missingFrames++; >= 12면 제거
+    // ========================================================
+    struct TrackedBox {
+        SecureCastOcrBox box;
+        int missingFrames = 0;
+    };
+    std::vector<TrackedBox> trackers_;
+    static float iou(const SecureCastOcrBox& a, const SecureCastOcrBox& b);
+    std::vector<SecureCastOcrBox> apply_tracker(
+        const std::vector<SecureCastOcrBox>& detections);
 
     // === Windows.Media.Ocr — 텍스트와 좌표 추출 ===
     std::vector<SecureCastOcrLine> recognize_text(
@@ -100,13 +144,5 @@ private:
     // === OCR 오류 보정: O/o → 0, I/l → 1 ===
     std::string normalize_numeric_candidate(
         const std::string& text
-    );
-
-    // === PII 타입 안전 필터 ===
-    // detect_pii() 내부에서 이미 타입을 엄격하게 결정한다.
-    // 이 함수는 호환성과 방어적 검사를 위해 유지한다.
-    bool heuristic_filter(
-        const SecureCastOcrBox& box,
-        const std::string& rawText
     );
 };
