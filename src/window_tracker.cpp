@@ -2,13 +2,13 @@
 // window_tracker.cpp — Role A 1주차 골격: 블랙리스트 앱 좌표 스캐너
 //
 // 동작 흐름:
-//   sc_tracker_tick (video_tick에서 매 프레임 호출)
-//     └─ throttle (0.15초 미만이면 즉시 리턴)
+//   securecast_video_tick (매 프레임, 60fps)
+//     └─ trackerAccumulator 누산 (0.15초 미만이면 즉시 리턴) [C-1: 인라인 직접 처리]
 //        └─ sc_scan_blacklisted_windows
 //             └─ EnumWindows(enum_proc) — 모든 최상위 창 순회
 //                  └─ enum_proc: 보이는 창 → DWM 좌표 → PID → exe명 → 블랙리스트 매칭
 //                       └─ 매칭되면 TrackedWindowList에 슬롯 추가
-//        └─ 결과를 obs_log로 출력 (현재는 디버깅용, 후속 단계에서 마스킹 좌표로 연결)
+//        └─ 결과를 blacklistMask에 저장 (mutex 보호)
 //
 // Win32 API 선택 이유:
 //   - DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS): GetWindowRect는 창
@@ -168,29 +168,4 @@ extern "C" void sc_scan_blacklisted_windows(TrackedWindowList *out)
 	EnumWindows(enum_proc, reinterpret_cast<LPARAM>(out));
 }
 
-// 60fps tick에서 매번 호출되어도 실제 무거운 EnumWindows는 0.15초마다 1회만 실행.
-// 매칭된 창은 일단 obs_log로만 출력 — 후속 단계에서 BlurRect로 변환 후 셰이더에 전달.
-extern "C" void sc_tracker_tick(float seconds, float *accumulator)
-{
-	if (!accumulator)
-		return;
 
-	*accumulator += seconds;
-	if (*accumulator < SCAN_INTERVAL_SEC)
-		return;
-	*accumulator = 0.0f;
-
-	TrackedWindowList list{};
-	sc_scan_blacklisted_windows(&list);
-
-	if (list.count == 0)
-		return;
-
-	// 디버그 출력. 운영 단계에서는 빈도 줄이거나 LOG_DEBUG로 강등 예정.
-	for (int i = 0; i < list.count; ++i) {
-		const auto &w = list.items[i];
-		obs_log(LOG_INFO, "[tracker] %ls @ (%ld,%ld)-(%ld,%ld) %ldx%ld", w.exe_name,
-			w.bounds.left, w.bounds.top, w.bounds.right, w.bounds.bottom,
-			w.bounds.right - w.bounds.left, w.bounds.bottom - w.bounds.top);
-	}
-}

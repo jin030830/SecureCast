@@ -47,15 +47,13 @@
 // ----------------------------------------------------
 // Global Configurations (Config)
 // ----------------------------------------------------
-// 컴파일 타임 상수. 런타임에 바꿀 일이 없으므로 constexpr로 둔다.
-constexpr int SC_MAX_BLUR_RECTS = 32;       // 한 프레임에 동시에 마스킹 가능한 최대 영역 수
-constexpr int SC_RING_BUFFER_SLOTS = 5;     // Bounded Exposure: AI 검증을 위해 N프레임만큼 송출 지연 슬롯 수 (고정 3~5)
+constexpr int SC_MAX_BLUR_RECTS = 32;
+constexpr int SC_RING_BUFFER_SLOTS = 5;
 
 // ----------------------------------------------------
 // Shared Types (Types) - Moved to securecast-types.h
 // ----------------------------------------------------
 
-// AI Thread에서 만든 마스킹 결과 → Render Thread로 넘기는 락프리 버퍼 팩(전달 페이로드)
 struct MaskPayload {
     BlurRect rects[SC_MAX_BLUR_RECTS];
     int rectCount;
@@ -63,25 +61,13 @@ struct MaskPayload {
 
 // ----------------------------------------------------
 // [Role C] N-Frame Ring Buffer
-//
-// 송출 지연(Bounded Exposure) 구현의 핵심 자료구조.
-// SC_RING_BUFFER_SLOTS 개의 슬롯(텍스처 핸들)을
-// 순환배열로 관리하여 렌더 스레드가 블로킹 없이
-// N프레임 전의 "안전한" 프레임을 꺼낼 수 있게 한다.
-//
-// 슬롯 상태 다이어그램:
-//   HEAD(쓰기) → [0][1][2][3][4] → TAIL(읽기)
-//   Render Thread: push → HEAD++
-//   Render Thread: pop  ← TAIL (HEAD - N 위치)
 // ----------------------------------------------------
 class FrameRingBuffer {
 public:
-    // 각 슬롯이 보유하는 데이터: gs_texrender + 타임스탬프
     struct Slot {
-        gs_texrender_t* texrender = nullptr; // OBS 안전 렌더 타겟 관리자
+        gs_texrender_t* texrender = nullptr;
         uint64_t        timestamp = 0;
 
-        // gs_texrender에서 결과 텍스처를 꺼내는 헬퍼
         gs_texture_t* getTexture() const {
             return texrender ? gs_texrender_get_texture(texrender) : nullptr;
         }
@@ -93,11 +79,7 @@ public:
 
     bool initialize(uint32_t width, uint32_t height);
     void destroy();
-
-    // gs_texrender_begin/end를 사용하여 안전하게 프레임을 캡처
-    // [C-2 수정] 미사용 source 인자 제거 — obs_filter_get_target(filter_context)으로만 타겟을 구함
     void pushFrame(uint64_t timestamp, obs_source_t* filter_context);
-
     const Slot* peekDelayedSlot() const;
 
     bool isInitialized() const { return m_initialized; }
@@ -115,21 +97,14 @@ private:
 
 // ----------------------------------------------------
 // [Role C] Mock AI Worker Thread
-//
-// 실제 AI/OCR 모듈이 완성되기 전까지 동작을 시뮬레이션한다.
-// - 50ms sleep(AI 처리 시간 모의) 후
-// - 화면 한가운데 고정 BlurRect를 MaskPayload에 담아 콜백으로 전달
-// Role B의 실제 AI Worker로 교체될 예정
 // ----------------------------------------------------
 class MockAIWorker {
 public:
-    // resultCallback: AI 분석이 끝날 때마다 Render Thread에서 읽을 결과를 전달하는 함수
     using ResultCallback = std::function<void(const MaskPayload&)>;
 
     MockAIWorker()  = default;
     ~MockAIWorker() { stop(); }
 
-    // 워커 스레드 시작. frameWidth/Height로 가짜 중앙 좌표를 계산한다.
     void start(uint32_t frameWidth, uint32_t frameHeight, ResultCallback callback);
     void stop();
 
@@ -150,25 +125,14 @@ private:
 
 // ----------------------------------------------------
 // [Role C] Lock-Free Result Slot
-//
-// MockAIWorker(AI Thread) → Render Thread 단방향 채널.
-// 단일 producer / 단일 consumer 구조이므로
-// std::atomic으로 충분히 data-race-free를 보장한다.
-//
-// 상태 전이:
-//   AI Thread: 결과 계산 완료 → write pending payload → m_ready.store(true)
-//   Render Thread: m_ready.load() == true → 읽고 → m_ready.store(false)
 // ----------------------------------------------------
 class AtomicMaskChannel {
 public:
-    // AI 스레드에서 호출 (produce)
     void publish(const MaskPayload& payload);
-
-    // 렌더 스레드에서 호출 (consume). 새 데이터가 없으면 false 반환
     bool consume(MaskPayload& out);
 
 private:
-    std::mutex                    m_mutex;    // m_pending 접근 보호 (torn read 방지)
+    std::mutex                    m_mutex;
     alignas(64) MaskPayload      m_pending{};
     alignas(64) std::atomic<bool> m_ready{false};
 };
@@ -176,50 +140,44 @@ private:
 // ----------------------------------------------------
 // Core Filter Context
 // ----------------------------------------------------
-// 모든 Role이 협업하며 참조하는 메인 필터 인스턴스 구조체
-// ----------------------------------------------------
 struct SecureCastFilter {
-    obs_source_t* context = nullptr; // OBS 필터 컨텍스트 포인터
+    obs_source_t* context = nullptr;
 
-    // UI 및 운영 토글 상태
-    bool          isActive     = true;                  // 필터 활성화 여부
+    bool          isActive     = true;
     // bool        isGameMode  = false;                 // [v2] 게임 모드 — 현재 스코프 외
-    SecurityState currentState = SecurityState::SAFE;   // 현재 보안 등급 (SAFE/PARTIAL/RISK)
+    SecurityState currentState = SecurityState::SAFE;
 
-    // ----- [Role C 담당: 렌더링 파이프라인 및 GPU Readback] -----
-    FrameRingBuffer  ringBuffer;         // Bounded Exposure(송출 지연) 구현용 N-프레임 텍스처 버퍼
-    MockAIWorker     mockWorker;         // [Role B 작업용] Role B가 AI/OCR을 연결하기 전까지 모의 데이터를 발생시키는 워커
-    AtomicMaskChannel maskChannel;       // AI 스레드 -> 비디오 렌더 스레드로 마스크 데이터를 안전하게 전달하는 단방향 채널
-    MaskPayload      lastMask{};         // AI가 마지막으로 검출하여 발행한 블러/블랙아웃 처리 영역 정보
+    // ----- [Role C] -----
+    FrameRingBuffer   ringBuffer;
+    MockAIWorker      mockWorker;
+    AtomicMaskChannel maskChannel;
+    MaskPayload       lastMask{};
 
 #ifdef _WIN32
-    GpuReadback      readback;           // GPU 텍스처를 CPU 메모리로 지연 없이 복사하는 다중 슬롯 텍스처 풀
-    OverlayWindow    overlay;            // [Role D] 스트리머 전용 보안 상태 HUD (OBS 캡처에서 제외됨)
+    GpuReadback   readback;
+    OverlayWindow overlay;   // [Role D] 스트리머 전용 보안 상태 HUD (OBS 캡처에서 제외됨)
 #endif
-    PixelHashCache       fullScreenHash;   // FNV-1a 기반으로 화면 변화(Smart Grid)를 감지하여 AI 동작을 제어하는 객체
-    // [C-3 수정] fullScreenBuffer 제거 — 실제 해시 입력은 readbackBuffer.data()(슬롯 0)에서 가져옴
+    PixelHashCache       fullScreenHash;
+    std::vector<uint8_t> readbackBuffer;
+    uint64_t             frameCounter = 0;
+    PipelineHealth       health;
 
-    std::vector<uint8_t> readbackBuffer;  // Readback을 통해 수확한 픽셀 데이터를 저장하는 CPU 버퍼 (Slot 0 + Slot 1)
-    uint64_t             frameCounter = 0; // GPU와 CPU 간의 프레임 정합성을 맞추기 위한 카운터
-    PipelineHealth       health;           // GPU 스톨 또는 쿼리 실패 감지 시 자가 치유(Reset)를 담당하는 헬스 매니저
+    int  logUnchangedFrames = 0;
+    int  logStallCount      = 0;
+    int  logEnqueueCount    = 0;
+    int  logScanThrottle    = 0;
 
-    // [C2-3 수정] 함수-scope static → 멤버 변수로 이동 (다중 필터 인스턴스 간 공유 방지)
-    int  logUnchangedFrames = 0;  // 미변화 상태 로그 주기 카운터 (120프레임마다 1회)
-    int  logStallCount      = 0;  // 파이프라인 포화 경고 로그 주기 카운터 (30프레임마다 1회)
-    int  logEnqueueCount    = 0;  // enqueue 성공 로그 주기 카운터 (300프레임마다 1회)
-    int  logScanThrottle    = 0;  // [F8 Fix] 스캔 로그 스로틀 멤버 이전 (다중 인스턴스 격리)
+    // ----- [Role A] -----
+    float      trackerAccumulator = 0.0f;
+    std::mutex blacklistMutex;
+    MaskPayload blacklistMask{};
 
-    // ----- [Role A 담당: 윈도우 추적 및 블랙리스트] -----
-    float         trackerAccumulator = 0.0f; // 윈도우 스캔 틱 조절(0.15초 단위)용 시간 누산기
-    std::mutex    blacklistMutex;            // video_tick(비디오)과 video_render(렌더) 간의 동시 접근을 막는 뮤텍스
-    MaskPayload   blacklistMask{};           // [우선순위 1] Role A가 추적한 블랙리스트 앱 좌표 (AI 처리 전에 최상단에 덮어씌움)
+    // ----- [Role D] -----
+    mutable std::mutex settingsMutex;
+    std::string  blacklistApps  = "";
+    float        blurIntensity  = 5.0f;
+    float        sensitivity    = 0.5f;
 
-    // ----- [Role D 담당: UI 설정값] -----
-    mutable std::mutex settingsMutex;        // GUI 스레드(update) ↔ Render 스레드 간 설정값 보호
-    std::string  blacklistApps  = "";        // 블랙리스트 앱 목록 (줄바꿈 구분)
-    float        blurIntensity  = 5.0f;      // 블러 강도 (1.0 ~ 10.0)
-    float        sensitivity    = 0.5f;      // 감지 민감도 (0.0 ~ 1.0)
-
-    // ----- [Role B 담당 연계 포인트: AI / OCR] -----
-    // void* ocrEngine = nullptr;            // Role B가 작업할 Windows Media OCR 엔진의 핸들/포인터
+    // ----- [Role B 연계 포인트] -----
+    // void* ocrEngine = nullptr;
 };

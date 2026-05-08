@@ -1,0 +1,58 @@
+#!/usr/bin/env zsh
+
+# CI-compatible run-clang-format wrapper
+# Handles --check, --fail-never, --fail-error, --fail-fast
+
+zmodload zsh/terminfo
+
+fail_on_error=0
+check_only=0
+files=()
+
+while (( $# )); do
+    case "$1" in
+        -c|--check) check_only=1 ;;
+        --fail-never) fail_on_error=0 ;;
+        --fail-error|--fail-fast) fail_on_error=1 ;;
+        *) files+=("$1") ;;
+    esac
+    shift
+done
+
+# If no files specified, find all relevant files
+if (( ${#files} == 0 )); then
+    files=(src/**/*.(c|cpp|h|hpp|m|mm)(.N))
+fi
+
+if (( ${#files} == 0 )); then
+    exit 0
+fi
+
+# Detect clang-format version
+if (( ${+commands[clang-format-19]} )); then
+    FORMATTER=clang-format-19
+elif (( ${+commands[clang-format]} )); then
+    FORMATTER=clang-format
+else
+    echo "Error: clang-format not found."
+    exit 1
+fi
+
+status=0
+
+if (( check_only )); then
+    for file in "${files[@]}"; do
+        if ! "${FORMATTER}" -style=file "${file}" | diff -q "${file}" - > /dev/null; then
+            echo "Formatting error in: ${file}"
+            status=1
+        fi
+    done
+else
+    "${FORMATTER}" -i -style=file "${files[@]}"
+fi
+
+if (( status && fail_on_error )); then
+    exit 1
+fi
+
+exit 0

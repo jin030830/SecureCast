@@ -497,6 +497,7 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
                     */
                     // [Role B 연계 포인트]
                     // filter->aiWorker.feedFrame(result);
+                    (void)finalBox;
                 }
             } else {
                 // [C2-3 수정] static → 멤버 변수 사용 (다중 인스턴스 공유 방지)
