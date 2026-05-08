@@ -868,6 +868,49 @@ static const std::unordered_set<std::string> NAME_BLOCKLIST = {
     "윤리",
 };
 
+// Luhn checksum (ISO/IEC 7812-1)
+// 무작위 16자리 숫자의 약 90%가 이 체크를 통과하지 못한다.
+static bool luhn_check(const std::string& digits)
+{
+    if (digits.size() != 16) return false;
+    int sum = 0;
+    for (int i = 0; i < 16; ++i) {
+        int d = digits[15 - i] - '0'; // 오른쪽에서 i번째 자리
+        if (i % 2 == 1) {             // 오른쪽 2번째, 4번째... 자리는 2배
+            d *= 2;
+            if (d > 9) d -= 9;        // 두 자리이면 각 자리 합 (= d-9)
+        }
+        sum += d;
+    }
+    return sum % 10 == 0;
+}
+
+// IIN (Issuer Identification Number) 검증 — 주요 카드사 prefix 화이트리스트
+// Visa(4), Mastercard(51-55 / 2221-2720), Discover(6011/65/644-649),
+// JCB(3528-3589), UnionPay(62)
+static bool valid_card_iin(const std::string& digits)
+{
+    if (digits.size() < 6) return false;
+
+    const int p1 = digits[0] - '0';
+    const int p2 = p1 * 10 + (digits[1] - '0');
+    const int p3 = p2 * 10 + (digits[2] - '0');
+    const int p4 = p3 * 10 + (digits[3] - '0');
+    const int p6 = p4 * 100 + (digits[4] - '0') * 10 + (digits[5] - '0');
+
+    if (p1 == 4)                          return true; // Visa
+    if (p2 >= 51 && p2 <= 55)             return true; // Mastercard (classic)
+    if (p4 >= 2221 && p4 <= 2720)         return true; // Mastercard (new range)
+    if (p4 == 6011)                       return true; // Discover
+    if (p2 == 65)                         return true; // Discover
+    if (p3 >= 644 && p3 <= 649)           return true; // Discover
+    if (p6 >= 622126 && p6 <= 622925)     return true; // Discover/UnionPay
+    if (p4 >= 3528 && p4 <= 3589)         return true; // JCB
+    if (p2 == 62)                         return true; // UnionPay
+
+    return false;
+}
+
 } // namespace
 
 // === STEP 2-0: OCR 오류 보정 ===
@@ -911,9 +954,9 @@ std::vector<SecureCastOcrBox> SecureCastOcrEngine::detect_pii(
         R"([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})"
     );
 
-    // 4) 신용카드 번호: 정확히 4-4-4-4 구조 + \b
+    // 4) 신용카드 번호: 정확히 4-4-4-4 구조 + 그룹 캡처 (Luhn/IIN 검증용)
     static const re2::RE2 PATTERN_CARD(
-        R"(\b\d{4}[-\s]\d{4}[-\s]\d{4}[-\s]\d{4}\b)"
+        R"(\b(\d{4})[-\s](\d{4})[-\s](\d{4})[-\s](\d{4})\b)"
     );
 
     // 5) IP 주소: 각 옥텟 캡처 (사설/예약 대역 제외는 아래 is_valid_public_ip로 검증)
@@ -1011,10 +1054,16 @@ std::vector<SecureCastOcrBox> SecureCastOcrEngine::detect_pii(
                 type = "PHONE";
             }
 
-            // CARD: 4-4-4-4 정확 구조
-            if (type == nullptr &&
-                RE2::PartialMatch(normalizedLine, PATTERN_CARD)) {
-                type = "CARD";
+            // CARD: 4-4-4-4 구조 + Luhn checksum + IIN 검증
+            // Luhn만으로 무작위 16자리의 ~90%를, IIN으로 추가 ~50%를 배제한다.
+            if (type == nullptr) {
+                std::string g1, g2, g3, g4;
+                if (RE2::PartialMatch(normalizedLine, PATTERN_CARD,
+                                      &g1, &g2, &g3, &g4)) {
+                    const std::string digits = g1 + g2 + g3 + g4;
+                    if (luhn_check(digits) && valid_card_iin(digits))
+                        type = "CARD";
+                }
             }
 
             // (a) IP: 옥텟 범위 + 사설/예약 대역 제외 검증
