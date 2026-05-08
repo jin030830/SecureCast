@@ -39,6 +39,14 @@
 #include <obs-module.h>
 
 // ----------------------------------------------------
+// Platform Headers
+// ----------------------------------------------------
+#ifdef _WIN32
+#include "win_event_listener.h"
+#include "window_tracker.h"
+#endif
+
+// ----------------------------------------------------
 // Helpers & Macros
 // ----------------------------------------------------
 
@@ -59,6 +67,15 @@ struct MaskPayload {
     int rectCount;
 };
 
+#ifdef _WIN32
+// 창이 사라진 후 ring buffer에 남은 N프레임 동안 마스킹을 유지하는 잔영 항목.
+struct LingeringWindow {
+    TrackedWindow window;         // 마지막으로 알려진 창 정보 (bounds 포함)
+    int           ticksRemaining; // SC_RING_BUFFER_SLOTS에서 매 tick 카운트다운
+};
+constexpr int SC_MAX_LINGERING = SC_MAX_TRACKED_WINDOWS;
+#endif
+
 // ----------------------------------------------------
 // [Role C] N-Frame Ring Buffer
 // 
@@ -78,6 +95,11 @@ public:
     struct Slot {
         gs_texrender_t* texrender = nullptr; // OBS 안전 렌더 타겟 관리자
         uint64_t        timestamp = 0;
+#ifdef _WIN32
+        // 이 프레임이 캡처된 시점의 창 좌표 스냅샷.
+        // 렌더 시 delayedSlot->windowSnapshot을 사용해야 프레임 내용과 마스크 위치가 동기화됨.
+        TrackedWindowList windowSnapshot{};
+#endif
 
         // gs_texrender에서 결과 텍스처를 꺼내는 헬퍼
         gs_texture_t* getTexture() const {
@@ -92,11 +114,18 @@ public:
     bool initialize(uint32_t width, uint32_t height);
     void destroy();
 
-    // gs_texrender_begin/end를 사용하여 안전하게 프레임을 캡처
-    // [C-2 수정] 미사용 source 인자 제거 — obs_filter_get_target(filter_context)으로만 타겟을 구함
+    // gs_texrender_begin/end를 사용하여 안전하게 프레임을 캡처.
+    // wlist: 이 프레임 캡처 시점의 창 좌표 스냅샷 (null 허용).
+#ifdef _WIN32
+    void pushFrame(uint64_t timestamp, obs_source_t* filter_context, const TrackedWindowList* wlist);
+#else
     void pushFrame(uint64_t timestamp, obs_source_t* filter_context);
+#endif
 
     const Slot* peekDelayedSlot() const;
+    // framesBack=SC_RING_BUFFER_SLOTS이면 peekDelayedSlot()과 동일.
+    // framesBack=SC_RING_BUFFER_SLOTS-1이면 한 프레임 더 최신 슬롯 (빠른 이동 합집합용).
+    const Slot* peekSlotAtOffset(int framesBack) const;
 
     bool isInitialized() const { return m_initialized; }
     uint32_t getWidth()  const { return m_width;  }
@@ -130,14 +159,17 @@ public:
     // 워커 스레드 시작. frameWidth/Height로 가짜 중앙 좌표를 계산한다.
     void start(uint32_t frameWidth, uint32_t frameHeight, ResultCallback callback);
     void stop();
+    void setPaused(bool paused);
 
     bool isRunning() const { return m_running.load(); }
+    bool isPaused()  const { return m_paused.load();  }
 
 private:
     void workerLoop();
 
     std::thread             m_thread;
     std::atomic<bool>       m_running{false};
+    std::atomic<bool>       m_paused{false};
     std::mutex              m_mutex;
     std::condition_variable m_cv;
 
@@ -194,8 +226,7 @@ struct SecureCastFilter {
     GpuReadback      readback;           // GPU 텍스처를 CPU 메모리로 지연 없이 복사하는 다중 슬롯 텍스처 풀
 #endif
     PixelHashCache       fullScreenHash;   // FNV-1a 기반으로 화면 변화(Smart Grid)를 감지하여 AI 동작을 제어하는 객체
-    // [C-3 수정] fullScreenBuffer 제거 — 실제 해시 입력은 readbackBuffer.data()(슬롯 0)에서 가져옴
-
+    
     std::vector<uint8_t> readbackBuffer;  // Readback을 통해 수확한 픽셀 데이터를 저장하는 CPU 버퍼 (Slot 0 + Slot 1)
     uint64_t             frameCounter = 0; // GPU와 CPU 간의 프레임 정합성을 맞추기 위한 카운터
     PipelineHealth       health;           // GPU 스톨 또는 쿼리 실패 감지 시 자가 치유(Reset)를 담당하는 헬스 매니저
@@ -204,13 +235,35 @@ struct SecureCastFilter {
     int  logUnchangedFrames = 0;  // 미변화 상태 로그 주기 카운터 (120프레임마다 1회)
     int  logStallCount      = 0;  // 파이프라인 포화 경고 로그 주기 카운터 (30프레임마다 1회)
     int  logEnqueueCount    = 0;  // enqueue 성공 로그 주기 카운터 (300프레임마다 1회)
-    int  logScanThrottle    = 0;  // [F8 Fix] 스캔 로그 스로틀 멤버 이전 (다중 인스턴스 격리)
 
     // ----- [Role A 담당: 윈도우 추적 및 블랙리스트] -----
     float         trackerAccumulator = 0.0f; // 윈도우 스캔 틱 조절(0.15초 단위)용 시간 누산기
+    gs_effect_t*  blurEffect = nullptr;      // 컴파일된 HLSL 셰이더
     std::mutex    blacklistMutex;            // video_tick(비디오)과 video_render(렌더) 간의 동시 접근을 막는 뮤텍스
     MaskPayload   blacklistMask{};           // [우선순위 1] Role A가 추적한 블랙리스트 앱 좌표 (AI 처리 전에 최상단에 덮어씌움)
+#ifdef _WIN32
+    WinEventListener  winListener;
+    TrackedWindowList windowList{};          // 현재 추적 중인 창 목록
+    TrackedWindowList captureWindowList{};   // pushFrame 스냅샷: 직전 프레임 DWM 좌표 (캡처 레이턴시 보정)
+    TrackedWindowList prevWindowList{};      // lingering 감지용 직전 스캔 결과
+    TrackedWindowList recentlySeenList{};    // 과거에 추적했던 창 목록 (quick restore용, 닫힐 때까지 유지)
+    LingeringWindow   lingeringWindows[SC_MAX_LINGERING]{};
+    int               lingeringCount = 0;
 
-    // ----- [Role B 담당 연계 포인트: AI / OCR] -----
-    // void* ocrEngine = nullptr;            // Role B가 작업할 Windows Media OCR 엔진의 핸들/포인터
+    // ----- [Game Mode] CPU 사용률 기반 자동 전환 -----
+    float    cpuSampleAccumulator = 0.0f; // 1초 샘플링 누산기
+    float    cpuUsage             = 0.0f; // 최근 측정 시스템 CPU 사용률 (0~100)
+    float    gameModeEntryTimer   = 0.0f; // ≥40% 지속 시간 누산 (3초 도달 시 진입)
+    float    gameModeExitTimer    = 0.0f; // <30% 지속 시간 누산 (10초 도달 시 해제)
+    FILETIME prevIdleTime         = {};   // GetSystemTimes 이전 샘플
+    FILETIME prevKernelTime       = {};
+    FILETIME prevUserTime         = {};
+#endif
+
+    // ----- [Panic Button] Ctrl+Shift+F12 -----
+    std::atomic<bool> panicMode{false};
+    obs_hotkey_id     panicHotkeyId = OBS_INVALID_HOTKEY_ID;
+
+    // ----- TODO: Role B 담당 필드 -----
+    // void* ocrEngine = nullptr;           // Windows.Media.Ocr 엔진 포인터
 };

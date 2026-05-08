@@ -10,7 +10,7 @@
       "name": "template",
       "hidden": true,
       "cacheVariables": {
-        "ENABLE_FRONTEND_API": true, // 패닉 버튼 단축키 및 obs_hotkey_register_source 호출
+        "ENABLE_FRONTEND_API": true,
         "ENABLE_QT": false
       }
     },
