@@ -31,6 +31,7 @@
 #include "pixel-hash.h"
 #include "pipeline-health.h"
 #include "securecast-types.h"
+#include "visual-tracker.h"
 
 // ocr-engine.h는 이 헤더에서 직접 include하지 않는다.
 // WinRT/OCR 관련 의존성이 다른 translation unit으로 전파되는 것을 막기 위해
@@ -275,6 +276,13 @@ struct SecureCastFilter {
     // ----- [Panic Button] Ctrl+Shift+F12 -----
     std::atomic<bool> panicMode{false};
     obs_hotkey_id     panicHotkeyId = OBS_INVALID_HOTKEY_ID;
+
+    // ----- [Role B] Visual Tracker -----
+    // OCR("what": ~250ms) 과 Tracker("where": render rate) 분리.
+    // register_or_update() → OCR 완료 시 호출 (OCR worker thread)
+    // update_all()         → OCR readback 타이밍마다 호출 (render thread, ~4fps)
+    // active_boxes()       → 매 render 프레임 블러 좌표 조회
+    VisualTrackerManager trackerMgr;
 
     // ----- [Role B] OCR 엔진 -----
     // OCR 엔진은 render thread가 아니라 OCR worker thread 내부에서 init()한다.
