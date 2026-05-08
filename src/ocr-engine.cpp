@@ -911,6 +911,17 @@ static bool valid_card_iin(const std::string& digits)
     return false;
 }
 
+static bool valid_email(const std::string& e) {
+    const auto at = e.find('@');
+    if (at == std::string::npos || at < 1 || at > 64) return false;
+    const auto dot = e.rfind('.');
+    if (dot == std::string::npos || dot < at + 2 || dot >= e.size() - 2) return false;
+    const auto tldLen = e.size() - dot - 1;
+    if (tldLen < 2 || tldLen > 24) return false;
+    if (e.find("..") != std::string::npos) return false;
+    return true;
+}
+
 } // namespace
 
 // === STEP 2-0: OCR 오류 보정 ===
@@ -949,9 +960,9 @@ std::vector<SecureCastOcrBox> SecureCastOcrEngine::detect_pii(
         R"((?:\+82[-\s]?1[016-9]|\b01[016-9])[-\s]?\d{3,4}[-\s]?\d{4}\b|\b0(?:2[-\s]?\d{3,4}|[3-9]\d[-\s]?\d{3,4}|[3-9]\d{2}[-\s]?\d{3,4})[-\s]?\d{4}\b)"
     );
 
-    // 3) 이메일
+    // 3) 이메일: 전체를 그룹 1로 캡처 (valid_email 검증에 사용)
     static const re2::RE2 PATTERN_EMAIL(
-        R"([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})"
+        R"(([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}))"
     );
 
     // 4) 신용카드 번호: 정확히 4-4-4-4 구조 + 그룹 캡처 (Luhn/IIN 검증용)
@@ -991,8 +1002,12 @@ std::vector<SecureCastOcrBox> SecureCastOcrEngine::detect_pii(
         const char *type = nullptr;
 
         // === STEP 2-2: 이메일은 문자 기반이므로 먼저 검사 ===
-        if (re2::RE2::PartialMatch(rawText, PATTERN_EMAIL)) {
-            type = "EMAIL";
+        {
+            std::string emailMatch;
+            if (re2::RE2::PartialMatch(rawText, PATTERN_EMAIL, &emailMatch) &&
+                valid_email(emailMatch)) {
+                type = "EMAIL";
+            }
         }
 
         // === STEP 2-2-H: 이름 + 호칭 직접 탐지 (A-7) ===

@@ -66,6 +66,10 @@ EMAIL	Email: alice@gmail.com
 NONE	example.com
 NONE	hello@
 NONE	@domain.com
+# valid_email 검증: 로컬파트 65자 초과, TLD 1자, 연속 점
+NONE	ab@cd.e
+NONE	a..b@example.com
+NONE	user@domain
 
 # ──────────────────────────────────────────────
 # CARD (신용카드 번호)
