@@ -1301,7 +1301,7 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
             r.y      = static_cast<int>(tb.y);
             r.width  = static_cast<int>(tb.w);
             r.height = static_cast<int>(tb.h);
-            r.type   = 1; // Blackout
+            r.type   = 0; // Blur
             if (r.width > 0 && r.height > 0)
                 all_rects[all_count++] = r;
         }
