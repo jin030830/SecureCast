@@ -122,9 +122,10 @@ void VisualTrackerManager::update_one(
     const int sx1 = cx + radius - tr.tw / 2;
     const int sy1 = cy + radius - tr.th / 2;
 
+    // 초기 fallback: 현재 박스 기준 template top-left
     float bestScore = -1.0f;
-    int   bestX     = static_cast<int>(tr.x);
-    int   bestY     = static_cast<int>(tr.y);
+    int   bestX     = static_cast<int>(tr.x + (tr.bw - static_cast<float>(tr.tw)) * 0.5f);
+    int   bestY     = static_cast<int>(tr.y + (tr.bh - static_cast<float>(tr.th)) * 0.5f);
 
     for (int sy = sy0; sy <= sy1; sy += 2) {
         for (int sx = sx0; sx <= sx1; sx += 2) {
@@ -140,9 +141,20 @@ void VisualTrackerManager::update_one(
 
     tr.lastScore = bestScore;
     if (bestScore >= SCORE_LOST) {
-        tr.x              = static_cast<float>(bestX);
-        tr.y              = static_cast<float>(bestY);
+        // bestX/Y는 template top-left → box top-left로 역변환
+        tr.x = static_cast<float>(bestX) - (tr.bw - static_cast<float>(tr.tw)) * 0.5f;
+        tr.y = static_cast<float>(bestY) - (tr.bh - static_cast<float>(tr.th)) * 0.5f;
         tr.framesSinceMatch = 0;
+
+        // 고신뢰도 매치: 템플릿 갱신 (점진적 외형 변화 추적)
+        if (bestScore >= SCORE_REFRESH) {
+            int rdummy, cdummy;
+            auto refreshed = extract_gray_crop(gray, gstride, gw, gh,
+                                               bestX, bestY, tr.tw, tr.th,
+                                               rdummy, cdummy);
+            if (rdummy == tr.tw && cdummy == tr.th && !refreshed.empty())
+                tr.tmpl = std::move(refreshed);
+        }
     } else {
         ++tr.framesSinceMatch;
     }
@@ -200,7 +212,7 @@ void VisualTrackerManager::register_or_update(
             matchedOcr[n]  = true;
             matchedTr[bestM] = true;
 
-            // 좌표 재동기화 + 템플릿 재추출
+            // 좌표 재동기화 + 센터-크롭 템플릿 재추출
             auto& tr = trackers_[bestM];
             tr.x  = ocr_boxes[n].x;
             tr.y  = ocr_boxes[n].y;
@@ -209,11 +221,17 @@ void VisualTrackerManager::register_or_update(
             tr.framesSinceMatch = 0;
             tr.lastScore = 1.0f;
 
+            // 센터-크롭: 박스가 MAX_TMPL 초과 시 중앙 영역만 추출
+            int tcx = static_cast<int>(tr.x);
+            int tcy = static_cast<int>(tr.y);
+            int tcw = static_cast<int>(tr.bw);
+            int tch = static_cast<int>(tr.bh);
+            if (tcw > MAX_TMPL_W) { tcx += (tcw - MAX_TMPL_W) / 2; tcw = MAX_TMPL_W; }
+            if (tch > MAX_TMPL_H) { tcy += (tch - MAX_TMPL_H) / 2; tch = MAX_TMPL_H; }
+
             int tw, th;
             auto crop = extract_gray_crop(gray.data(), width, width, height,
-                                          static_cast<int>(tr.x), static_cast<int>(tr.y),
-                                          static_cast<int>(tr.bw), static_cast<int>(tr.bh),
-                                          tw, th);
+                                          tcx, tcy, tcw, tch, tw, th);
             if (!crop.empty()) {
                 tr.tw   = tw;
                 tr.th   = th;
@@ -227,24 +245,30 @@ void VisualTrackerManager::register_or_update(
         if (matchedOcr[n]) continue;
         const auto& box = ocr_boxes[n];
 
+        // 센터-크롭: 박스가 MAX_TMPL 초과 시 중앙 영역만 추출
+        int tcx = static_cast<int>(box.x);
+        int tcy = static_cast<int>(box.y);
+        int tcw = static_cast<int>(box.w);
+        int tch = static_cast<int>(box.h);
+        if (tcw > MAX_TMPL_W) { tcx += (tcw - MAX_TMPL_W) / 2; tcw = MAX_TMPL_W; }
+        if (tch > MAX_TMPL_H) { tcy += (tch - MAX_TMPL_H) / 2; tch = MAX_TMPL_H; }
+
         int tw, th;
         auto crop = extract_gray_crop(gray.data(), width, width, height,
-                                      static_cast<int>(box.x), static_cast<int>(box.y),
-                                      static_cast<int>(box.w), static_cast<int>(box.h),
-                                      tw, th);
+                                      tcx, tcy, tcw, tch, tw, th);
         if (crop.empty()) continue;
 
         Tracker tr;
-        tr.id              = nextId_++;
-        tr.type            = box.type;
-        tr.x               = box.x;
-        tr.y               = box.y;
-        tr.bw              = box.w;
-        tr.bh              = box.h;
-        tr.tw              = tw;
-        tr.th              = th;
-        tr.tmpl            = std::move(crop);
-        tr.lastScore       = 1.0f;
+        tr.id               = nextId_++;
+        tr.type             = box.type;
+        tr.x                = box.x;   // box top-left (full size)
+        tr.y                = box.y;
+        tr.bw               = box.w;   // box size (full, not capped)
+        tr.bh               = box.h;
+        tr.tw               = tw;      // template size (capped)
+        tr.th               = th;
+        tr.tmpl             = std::move(crop);
+        tr.lastScore        = 1.0f;
         tr.framesSinceMatch = 0;
         trackers_.push_back(std::move(tr));
     }

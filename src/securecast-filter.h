@@ -315,6 +315,9 @@ struct SecureCastFilter {
     // 직전 OCR 사이클의 박스 수. 변경 시에만 LOG_INFO, 매 사이클은 LOG_DEBUG.
     int lastLoggedOcrCount = -1;
 
+    // [SC-tracker] 주기 로그 카운터 (300 readback ≈ 75초마다 1회)
+    int trackerLogCounter = 0;
+
     // ── OCR 박스 누적 + TTL 관리 ─────────────────────────────────
     // lastMask.rects[i]의 잔여 수명. 매 OCR 사이클마다 1씩 감소.
     // OCR이 같은 위치의 박스를 다시 감지하면 TTL이 SC_OCR_BOX_TTL로 리셋된다.

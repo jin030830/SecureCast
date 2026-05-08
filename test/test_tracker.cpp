@@ -202,6 +202,44 @@ static void test_clear()
     check(ok, "Test 5: clear() removes all trackers");
 }
 
+// ──────────────────────────────────────────────────────────
+// 테스트 6: 센터-크롭 대형 박스
+//
+// 6a: active_boxes()는 캡 전 원본 bw/bh를 반환해야 한다.
+// 6b: 50 프레임 연속 생존 (트래커가 잘못 제거되지 않아야 한다).
+//
+// 참고: 순수 선형 그라디언트는 NCC 불변(I→aI+b)이므로 위치 정확도는
+//       Test 1/2에서만 검증하고, 여기서는 크래시/오버킬 없음을 확인한다.
+// ──────────────────────────────────────────────────────────
+static void test_large_box_center_crop()
+{
+    constexpr int W = 600, H = 400;
+    const int BX = 50, BY = 80;
+    const int BW = VisualTrackerManager::MAX_TMPL_W + 80; // 240 (캡 초과)
+    const int BH = VisualTrackerManager::MAX_TMPL_H + 20; // 100 (캡 초과)
+
+    VisualTrackerManager mgr;
+    auto frame = make_frame(W, H, BX, BY, BW, BH);
+
+    VtOcrBox box{"RRN", (float)BX, (float)BY, (float)BW, (float)BH};
+    mgr.register_or_update({box}, frame.data(), W, H, W * 4);
+
+    // 6a: bw/bh는 캡 전 원본 크기여야 함
+    auto boxes = mgr.active_boxes();
+    bool sizeOk = (!boxes.empty() &&
+                   std::abs(boxes[0].w - BW) < 1.0f &&
+                   std::abs(boxes[0].h - BH) < 1.0f);
+    check(sizeOk, "Test 6a: Large box — active_boxes returns original bw/bh");
+
+    // 6b: 50 프레임 연속 생존 (SCORE_LOST 이상의 NCC가 어딘가에서 발견되어야 함)
+    bool survived = true;
+    for (int f = 0; f < 50 && survived; ++f) {
+        mgr.update_all(frame.data(), W, H, W * 4);
+        if (mgr.active_boxes().empty()) { survived = false; break; }
+    }
+    check(survived, "Test 6b: Large box — center-crop tracker survives 50 frames");
+}
+
 int main()
 {
     printf("=== VisualTrackerManager Unit Tests ===\n\n");
@@ -211,6 +249,7 @@ int main()
     test_disappear();
     test_new_tracker_at_different_position();
     test_clear();
+    test_large_box_center_crop();
 
     printf("\n%d/%d passed\n", g_passed, g_passed + g_failed);
     return (g_failed == 0) ? 0 : 1;

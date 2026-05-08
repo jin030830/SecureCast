@@ -1111,6 +1111,16 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
         gs_texture_t* ocrTex = delayedSlot->getTexture();
         if (read_texture_bgra_to_cpu(filter, ocrTex, w, h, bgraPixels, stride)) {
             filter->trackerMgr.update_all(bgraPixels.data(), (int)w, (int)h, stride);
+
+            // 주기적 tracker 상태 로그 — OBS 로그에서 "[SC-tracker]" grep으로 튜닝 가능
+            // active: 현재 블러 박스 수
+            // 임계값 튜닝: SCORE_OK/LOST/REFRESH, FRAMES_LOST, SEARCH_NEAR/FAR (visual-tracker.h)
+            if (++filter->trackerLogCounter >= 300) {
+                filter->trackerLogCounter = 0;
+                blog(LOG_INFO, "[SC-tracker] active=%zu",
+                     filter->trackerMgr.active_boxes().size());
+            }
+
             submit_ocr_frame(filter, std::move(bgraPixels), (int)w, (int)h, stride);
         } else {
             filter->ocrWorkerIdle.store(true, std::memory_order_release);

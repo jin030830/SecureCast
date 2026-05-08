@@ -25,11 +25,17 @@ struct VtOcrBox {
 
 class VisualTrackerManager {
 public:
-    static constexpr float SCORE_OK    = 0.70f; // 이 점수 이상이면 정상 추적
-    static constexpr float SCORE_LOST  = 0.40f; // 이 점수 미만이면 실패 카운트
-    static constexpr int   FRAMES_LOST = 3;     // 연속 실패 이 횟수 초과 시 제거
-    static constexpr int   SEARCH_NEAR = 30;    // lastScore >= SCORE_OK 일 때 반경
-    static constexpr int   SEARCH_FAR  = 60;    // lastScore <  SCORE_OK 일 때 반경
+    static constexpr float SCORE_OK      = 0.70f; // 이 점수 이상이면 정상 추적
+    static constexpr float SCORE_LOST    = 0.40f; // 이 점수 미만이면 실패 카운트
+    static constexpr float SCORE_REFRESH = 0.85f; // 이 점수 이상이면 템플릿 갱신 (드리프트 방지)
+    static constexpr int   FRAMES_LOST   = 3;     // 연속 실패 이 횟수 초과 시 제거
+    static constexpr int   SEARCH_NEAR   = 30;    // lastScore >= SCORE_OK 일 때 반경
+    static constexpr int   SEARCH_FAR    = 60;    // lastScore <  SCORE_OK 일 때 반경
+
+    // 템플릿 크기 상한 (픽셀): 대형 박스에서 NCC 연산량 폭증 방지.
+    // 박스가 이 크기를 초과하면 중앙 MAX_TMPL_W × MAX_TMPL_H 영역만 추출한다.
+    static constexpr int MAX_TMPL_W = 160;
+    static constexpr int MAX_TMPL_H = 80;
 
     // 매 렌더 프레임마다 호출 — 모든 트래커의 NCC 검색 + 소멸 판정
     void update_all(const uint8_t* bgra, int width, int height, int stride);
