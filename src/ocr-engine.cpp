@@ -300,13 +300,14 @@ std::vector<SecureCastOcrBox> SecureCastOcrEngine::apply_tracker(
         }
         if (bt == -1) break;
 
-        // EMA 업데이트: 0.7 × old + 0.3 × new
+        // EMA 업데이트: 0.5 × old + 0.5 × new
+        // 0.7 → 0.5: 화면 콘텐츠가 이동할 때 잔상 위치에서 빠르게 추종.
         auto& tr = trackers_[bt];
         const auto& det = dets[bd];
-        tr.box.x = 0.7f * tr.box.x + 0.3f * det.x;
-        tr.box.y = 0.7f * tr.box.y + 0.3f * det.y;
-        tr.box.w = 0.7f * tr.box.w + 0.3f * det.w;
-        tr.box.h = 0.7f * tr.box.h + 0.3f * det.h;
+        tr.box.x = 0.5f * tr.box.x + 0.5f * det.x;
+        tr.box.y = 0.5f * tr.box.y + 0.5f * det.y;
+        tr.box.w = 0.5f * tr.box.w + 0.5f * det.w;
+        tr.box.h = 0.5f * tr.box.h + 0.5f * det.h;
         tr.box.type = det.type; // 타입 갱신 (예: RRN → PHONE 전환)
         tr.missingFrames = 0;
         matchedT[bt] = true;

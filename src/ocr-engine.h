@@ -103,8 +103,14 @@ private:
     };
     std::vector<LineDHashCache> lastLineDhashes_;
     int consecutiveSkips_ = 0;
-    // 이 값 이상 연속 L1 히트 시 주기적 full OCR (새 텍스트 발견용)
+    // 이 값 이상 연속 L1 히트 시 주기적 full OCR (새 텍스트 발견용).
     // 29→10: 트래커 소멸 후 빈 lastBoxes_가 L1에 캐싱되는 구간을 464ms→160ms로 단축.
+    //
+    // 튜닝 방법 (실측 필요):
+    //   1. OBS 로그에서 "[SC-L1 skip]" 라인을 grep해 평균 연속 스킵 횟수 측정.
+    //   2. 빠른 텍스트 전환 시나리오 (슬라이드 전환, 자막 변경 등) 녹화 후 확인.
+    //   3. 스킵 횟수 >> 10 이면 올릴 것(CPU 절감), << 10 이면 낮출 것(응답속도 ↑).
+    //   4Hz OCR 기준: 값=10 → 2.5s 캐싱, 값=5 → 1.25s 캐싱.
     static constexpr int kMaxConsecutiveSkips = 10;
 
     // 8×8 구역 dHash: 9×8 샘플 격자 → 인접 밝기 비교 → 64비트
