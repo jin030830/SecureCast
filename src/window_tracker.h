@@ -8,8 +8,8 @@
 //   에 넘겨 해당 영역만 가려버리는 데 사용된다.
 //
 // 어디서 사용:
-//   - securecast-filter.cpp::securecast_video_tick → sc_tracker_tick 호출
-//   - sc_tracker_tick 내부에서 sc_scan_blacklisted_windows 호출 (150ms마다 1회)
+//   - securecast-filter.cpp::securecast_video_tick
+//     trackerAccumulator를 누산하여 0.15초마다 sc_scan_blacklisted_windows 직접 호출
 //
 // 왜 별도 파일:
 //   Win32 API (EnumWindows / DwmGetWindowAttribute / OpenProcess) 의존이

@@ -91,7 +91,12 @@ target_sources(
     src/plugin-main.cpp           # OBS 진입점 / 모듈 등록
     src/securecast-filter.cpp     # 필터 lifecycle 콜백 + dispatch table
     src/securecast-filter.h       # 공유 타입 (SecureCastFilter, BlurRect 등)
+    src/securecast-types.h        # 순환 참조 방지용 공용 타입
     src/plugin-support.h          # PLUGIN_NAME / obs_log 선언 (정의는 .c.in)
+    src/pixel-hash.cpp            # Role C: FNV-1a 픽셀 해시 캐시
+    src/pixel-hash.h
+    src/pipeline-health.cpp       # [NEW] 파이프라인 상태 모니터
+    src/pipeline-health.h
 )
 
 if(WIN32)
@@ -102,11 +107,13 @@ if(WIN32)
       src/window_tracker.h
       src/win_event_listener.cpp  # Role A: SetWinEventHook push 감지
       src/win_event_listener.h
+      src/gpu-readback.cpp        # Role C: GPU-CPU 비동기 Readback
+      src/gpu-readback.h
   )
 endif()
 
+
 # OBS 표준 매크로: 출력 파일명을 "${_name}.dll" 로 강제, install 타겟 자동 생성.
-# (CMake 기본은 lib 접두사가 붙는데 OBS는 그걸 안 좋아함)
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
 
 # 빌드 후 OBS 플러그인 경로에 자동 배포.
@@ -129,3 +136,5 @@ if(WIN32)
     VERBATIM
   )
 endif()
+# [핵심 해결] downsample.effect 등 필수 리소스를 OBS가 인식하는 표준 데이터 폴더로 복사
+install(DIRECTORY data/ DESTINATION "data/obs-plugins/${CMAKE_PROJECT_NAME}")
