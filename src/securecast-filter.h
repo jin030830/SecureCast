@@ -28,6 +28,7 @@
 
 #ifdef _WIN32
 #include "gpu-readback.h"
+#include "overlay-window.h"
 #endif
 #include "pixel-hash.h"
 #include "pipeline-health.h"
@@ -38,6 +39,10 @@
 // ----------------------------------------------------
 #include <obs.h>
 #include <obs-module.h>
+
+// ----------------------------------------------------
+// Helpers & Macros
+// ----------------------------------------------------
 
 // ----------------------------------------------------
 // Global Configurations (Config)
@@ -178,7 +183,7 @@ struct SecureCastFilter {
 
     // UI 및 운영 토글 상태
     bool          isActive     = true;                  // 필터 활성화 여부
-    // bool       isGameMode   = false;                 // [v2] 게임 모드 — 현재 스코프 외
+    // bool        isGameMode  = false;                 // [v2] 게임 모드 — 현재 스코프 외
     SecurityState currentState = SecurityState::SAFE;   // 현재 보안 등급 (SAFE/PARTIAL/RISK)
 
     // ----- [Role C 담당: 렌더링 파이프라인 및 GPU Readback] -----
@@ -189,8 +194,9 @@ struct SecureCastFilter {
 
 #ifdef _WIN32
     GpuReadback      readback;           // GPU 텍스처를 CPU 메모리로 지연 없이 복사하는 다중 슬롯 텍스처 풀
+    OverlayWindow    overlay;            // [Role D] 스트리머 전용 보안 상태 HUD (OBS 캡처에서 제외됨)
 #endif
-    PixelHashCache       fullScreenHash;  // FNV-1a 기반으로 화면 변화(Smart Grid)를 감지하여 AI 동작을 제어하는 객체
+    PixelHashCache       fullScreenHash;   // FNV-1a 기반으로 화면 변화(Smart Grid)를 감지하여 AI 동작을 제어하는 객체
     // [C-3 수정] fullScreenBuffer 제거 — 실제 해시 입력은 readbackBuffer.data()(슬롯 0)에서 가져옴
 
     std::vector<uint8_t> readbackBuffer;  // Readback을 통해 수확한 픽셀 데이터를 저장하는 CPU 버퍼 (Slot 0 + Slot 1)
@@ -198,15 +204,15 @@ struct SecureCastFilter {
     PipelineHealth       health;           // GPU 스톨 또는 쿼리 실패 감지 시 자가 치유(Reset)를 담당하는 헬스 매니저
 
     // [C2-3 수정] 함수-scope static → 멤버 변수로 이동 (다중 필터 인스턴스 간 공유 방지)
-    int  logUnchangedFrames = 0;
-    int  logStallCount      = 0;
-    int  logEnqueueCount    = 0;
-    int  logScanThrottle    = 0;
+    int  logUnchangedFrames = 0;  // 미변화 상태 로그 주기 카운터 (120프레임마다 1회)
+    int  logStallCount      = 0;  // 파이프라인 포화 경고 로그 주기 카운터 (30프레임마다 1회)
+    int  logEnqueueCount    = 0;  // enqueue 성공 로그 주기 카운터 (300프레임마다 1회)
+    int  logScanThrottle    = 0;  // [F8 Fix] 스캔 로그 스로틀 멤버 이전 (다중 인스턴스 격리)
 
     // ----- [Role A 담당: 윈도우 추적 및 블랙리스트] -----
     float         trackerAccumulator = 0.0f; // 윈도우 스캔 틱 조절(0.15초 단위)용 시간 누산기
     std::mutex    blacklistMutex;            // video_tick(비디오)과 video_render(렌더) 간의 동시 접근을 막는 뮤텍스
-    MaskPayload   blacklistMask{};           // [우선순위 1] Role A가 추적한 블랙리스트 앱 좌표
+    MaskPayload   blacklistMask{};           // [우선순위 1] Role A가 추적한 블랙리스트 앱 좌표 (AI 처리 전에 최상단에 덮어씌움)
 
     // ----- [Role D 담당: UI 설정값] -----
     mutable std::mutex settingsMutex;        // GUI 스레드(update) ↔ Render 스레드 간 설정값 보호
