@@ -593,6 +593,11 @@ static void ocr_worker_loop(SecureCastFilter* filter)
     if (!filter)
         return;
 
+#ifdef _WIN32
+    // OCR은 RecognizeAsync가 CPU를 점유할 수 있으므로 렌더 스레드보다 낮은 우선순위로 실행.
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
+
     const bool ocrReady = filter->ocrEngine ? filter->ocrEngine->init() : false;
     if (ocrReady) {
         blog(LOG_INFO, "[securecast][ocr] OCR worker initialized.");
@@ -675,6 +680,63 @@ static void start_ocr_worker(SecureCastFilter* filter)
     filter->ocrWorkerThread = std::thread([filter]() {
         ocr_worker_loop(filter);
     });
+}
+
+// ================================================================
+// [P1] Visual Tracker Thread — 30Hz NCC 추적
+// ================================================================
+
+static void tracker_thread_loop(SecureCastFilter* filter)
+{
+#ifdef _WIN32
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
+
+    while (filter->trackerThreadRunning_.load(std::memory_order_acquire)) {
+        std::vector<uint8_t> pixels;
+        int w = 0, h = 0, stride = 0;
+
+        {
+            std::unique_lock<std::mutex> lock(filter->trackerInputMutex_);
+            filter->trackerInputCv_.wait(lock, [filter]() {
+                return !filter->trackerThreadRunning_.load(std::memory_order_acquire) ||
+                       filter->trackerInputReady_;
+            });
+            if (!filter->trackerThreadRunning_.load(std::memory_order_acquire))
+                break;
+
+            pixels.swap(filter->trackerInputPixels_);
+            w      = filter->trackerInputW_;
+            h      = filter->trackerInputH_;
+            stride = filter->trackerInputStride_;
+            filter->trackerInputReady_ = false;
+        }
+
+        if (!pixels.empty() && w > 0 && h > 0 && stride > 0)
+            filter->trackerMgr.update_all(pixels.data(), w, h, stride);
+    }
+}
+
+static void start_tracker_thread(SecureCastFilter* filter)
+{
+    if (!filter || filter->trackerThreadRunning_.load(std::memory_order_acquire))
+        return;
+    filter->trackerThreadRunning_.store(true, std::memory_order_release);
+    filter->trackerThread_ = std::thread([filter]() {
+        tracker_thread_loop(filter);
+    });
+    blog(LOG_INFO, "[SC-tracker] Tracker thread started (30Hz NCC).");
+}
+
+static void stop_tracker_thread(SecureCastFilter* filter)
+{
+    if (!filter || !filter->trackerThreadRunning_.load(std::memory_order_acquire))
+        return;
+    filter->trackerThreadRunning_.store(false, std::memory_order_release);
+    filter->trackerInputCv_.notify_all();
+    if (filter->trackerThread_.joinable())
+        filter->trackerThread_.join();
+    blog(LOG_INFO, "[SC-tracker] Tracker thread stopped.");
 }
 
 static void stop_ocr_worker(SecureCastFilter* filter)
@@ -808,6 +870,7 @@ static void securecast_destroy(void* data)
 #endif
 
     // AI 워커 먼저 중지 (콜백이 ring buffer에 접근하지 않도록)
+    stop_tracker_thread(filter); // tracker thread 먼저 중지 (trackerMgr 공유)
     stop_ocr_worker(filter);
     filter->trackerMgr.clear(); // OCR worker 종료 후 tracker 정리
     filter->mockWorker.stop();
@@ -875,18 +938,20 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
             obs_source_skip_video_filter(filter->context);
             return;
         }
-        // 첫 초기화 시 AI 워커도 실제 해상도로 시작
+        // 첫 초기화 시 AI 워커 + Tracker 스레드 시작
         filter->mockWorker.start(w, h, [filter](const MaskPayload& payload) {
             filter->maskChannel.publish(payload);
         });
         start_ocr_worker(filter);
-        blog(LOG_INFO, "[securecast][ocr] Async OCR worker started.");
+        start_tracker_thread(filter);
+        blog(LOG_INFO, "[securecast][ocr] Async OCR worker + 30Hz tracker thread started.");
     } else if (filter->ringBuffer.getWidth() != w || filter->ringBuffer.getHeight() != h) {
         // [P1 수정] 소스 해상도가 바뀌면 텍스처를 재생성해야 화면 깨짐 및 크래시 방지
         blog(LOG_INFO, "Resolution changed (%dx%d -> %dx%d). Reinitializing ring buffer.",
                 filter->ringBuffer.getWidth(), filter->ringBuffer.getHeight(), w, h);
 
-        // 1. AI 워커 중지
+        // 1. 워커 중지
+        stop_tracker_thread(filter);
         filter->mockWorker.stop();
 
         // 2. 링 버퍼 재구성
@@ -902,12 +967,14 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
         while (filter->maskChannel.consume(dummy)) {}
         filter->lastMask = MaskPayload{};
         filter->trackerMgr.clear(); // 해상도 변경 시 기존 박스 좌표 무효화
+        filter->trackerFrameSkip_ = 0;
 
-        // 4. 새 해상도로 AI 워커 재시작
+        // 4. 새 해상도로 워커 재시작
         filter->mockWorker.start(w, h, [filter](const MaskPayload& payload) {
             filter->maskChannel.publish(payload);
         });
         start_ocr_worker(filter);
+        start_tracker_thread(filter);
         blog(LOG_INFO, "[securecast][ocr] Async OCR worker restarted after resize.");
 
 #ifdef _WIN32
@@ -1098,32 +1165,48 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
         return;
     }
 
-    // --- Step 5a: OCR 프레임 제출 + Visual Tracker NCC 갱신 ---
-    // ocrWorkerIdle 게이트로 readback 빈도를 ~4fps로 제한.
-    // update_all()은 동일 픽셀로 NCC 추적 → register_or_update() 전에 호출해
-    // 이전 사이클 박스를 현재 프레임 기준으로 먼저 정렬한다.
-    if (filter->ocrWorkerIdle.load(std::memory_order_acquire)) {
-        filter->ocrWorkerIdle.store(false, std::memory_order_release);
+    // --- Step 5a: 30Hz Tracker readback + OCR 제출 ---
+    // Tracker: 2프레임마다 GPU readback → tracker thread에 swap 전달 (30Hz NCC)
+    // OCR:     tracker readback과 동일 프레임 중 ocrWorkerIdle일 때만 제출 (~4fps)
+    // update_all()은 tracker thread에서 실행 — 렌더 스레드 블로킹 없음.
+    ++filter->trackerFrameSkip_;
+    if (filter->trackerFrameSkip_ >= 2) {
+        filter->trackerFrameSkip_ = 0;
+
+        const bool ocrIdle = filter->ocrWorkerIdle.load(std::memory_order_acquire);
+        if (ocrIdle)
+            filter->ocrWorkerIdle.store(false, std::memory_order_release);
 
         std::vector<uint8_t> bgraPixels;
         int stride = 0;
-
         gs_texture_t* ocrTex = delayedSlot->getTexture();
-        if (read_texture_bgra_to_cpu(filter, ocrTex, w, h, bgraPixels, stride)) {
-            filter->trackerMgr.update_all(bgraPixels.data(), (int)w, (int)h, stride);
 
-            // 주기적 tracker 상태 로그 — OBS 로그에서 "[SC-tracker]" grep으로 튜닝 가능
-            // active: 현재 블러 박스 수
-            // 임계값 튜닝: SCORE_OK/LOST/REFRESH, FRAMES_LOST, SEARCH_NEAR/FAR (visual-tracker.h)
-            if (++filter->trackerLogCounter >= 300) {
-                filter->trackerLogCounter = 0;
-                blog(LOG_INFO, "[SC-tracker] active=%zu",
-                     filter->trackerMgr.active_boxes().size());
+        if (read_texture_bgra_to_cpu(filter, ocrTex, w, h, bgraPixels, stride)) {
+            // OCR 제출: ocrIdle일 때만. pixels copy → OCR thread 소유.
+            if (ocrIdle) {
+                std::vector<uint8_t> ocrPixels(bgraPixels); // 8MB copy @~4fps
+                submit_ocr_frame(filter, std::move(ocrPixels), (int)w, (int)h, stride);
+
+                if (++filter->trackerLogCounter >= 150) {
+                    filter->trackerLogCounter = 0;
+                    blog(LOG_INFO, "[SC-tracker] active=%zu",
+                         filter->trackerMgr.active_boxes().size());
+                }
             }
 
-            submit_ocr_frame(filter, std::move(bgraPixels), (int)w, (int)h, stride);
+            // Tracker thread에 swap 전달 (O(1), 항상 30Hz)
+            {
+                std::lock_guard<std::mutex> lock(filter->trackerInputMutex_);
+                filter->trackerInputPixels_.swap(bgraPixels);
+                filter->trackerInputW_      = (int)w;
+                filter->trackerInputH_      = (int)h;
+                filter->trackerInputStride_ = stride;
+                filter->trackerInputReady_  = true;
+            }
+            filter->trackerInputCv_.notify_one();
         } else {
-            filter->ocrWorkerIdle.store(true, std::memory_order_release);
+            if (ocrIdle)
+                filter->ocrWorkerIdle.store(true, std::memory_order_release);
         }
     }
 

@@ -315,8 +315,22 @@ struct SecureCastFilter {
     // 직전 OCR 사이클의 박스 수. 변경 시에만 LOG_INFO, 매 사이클은 LOG_DEBUG.
     int lastLoggedOcrCount = -1;
 
-    // [SC-tracker] 주기 로그 카운터 (300 readback ≈ 75초마다 1회)
+    // [SC-tracker] 주기 로그 카운터 (150 readback ≈ 5초마다 1회 @ 30Hz)
     int trackerLogCounter = 0;
+
+    // ----- [P1] 30Hz Visual Tracker Thread -----
+    // NCC 연산(CPU-only)을 렌더 스레드에서 분리. GPU readback은 렌더 스레드,
+    // update_all()은 이 스레드가 담당. register_or_update()는 OCR 워커가 호출.
+    std::thread             trackerThread_;
+    std::mutex              trackerInputMutex_;
+    std::condition_variable trackerInputCv_;
+    std::vector<uint8_t>   trackerInputPixels_;  // swap으로 넘겨받는 최신 픽셀
+    int                    trackerInputW_      = 0;
+    int                    trackerInputH_      = 0;
+    int                    trackerInputStride_ = 0;
+    bool                   trackerInputReady_  = false;
+    std::atomic<bool>      trackerThreadRunning_{false};
+    int                    trackerFrameSkip_   = 0; // 30Hz gate: 2프레임마다 readback
 
     // ── OCR 박스 누적 + TTL 관리 ─────────────────────────────────
     // lastMask.rects[i]의 잔여 수명. 매 OCR 사이클마다 1씩 감소.
