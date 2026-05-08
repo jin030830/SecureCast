@@ -215,6 +215,12 @@ private:
 // 모든 Role이 협업하며 참조하는 메인 필터 인스턴스 구조체
 // ----------------------------------------------------
 struct SecureCastFilter {
+    SecureCastFilter();
+    ~SecureCastFilter();
+
+    SecureCastFilter(const SecureCastFilter&) = delete;
+    SecureCastFilter& operator=(const SecureCastFilter&) = delete;
+
     obs_source_t* context = nullptr; // OBS 필터 컨텍스트 포인터
 
     // UI 및 운영 토글 상태

@@ -420,6 +420,262 @@ bool AtomicMaskChannel::consume(MaskPayload& out)
 }
 
 // ================================================================
+// [Role B/C] GPU texture -> CPU BGRA pixels 재사용 readback
+// ================================================================
+
+static void destroy_ocr_stage_surface(SecureCastFilter* filter)
+{
+    if (!filter || !filter->ocrStageSurface)
+        return;
+
+    gs_stagesurface_destroy(filter->ocrStageSurface);
+    filter->ocrStageSurface = nullptr;
+    filter->ocrStageWidth = 0;
+    filter->ocrStageHeight = 0;
+}
+
+static bool ensure_ocr_stage_surface(SecureCastFilter* filter, uint32_t width, uint32_t height)
+{
+    if (!filter || width == 0 || height == 0)
+        return false;
+
+    if (filter->ocrStageSurface &&
+        filter->ocrStageWidth == width &&
+        filter->ocrStageHeight == height) {
+        return true;
+    }
+
+    destroy_ocr_stage_surface(filter);
+
+    filter->ocrStageSurface = gs_stagesurface_create(width, height, GS_BGRA);
+    if (!filter->ocrStageSurface) {
+        blog(LOG_ERROR, "[securecast][ocr] Failed to create staging surface.");
+        return false;
+    }
+
+    filter->ocrStageWidth = width;
+    filter->ocrStageHeight = height;
+    return true;
+}
+
+static bool read_texture_bgra_to_cpu(
+    SecureCastFilter* filter,
+    gs_texture_t* texture,
+    uint32_t width,
+    uint32_t height,
+    std::vector<uint8_t>& outPixels,
+    int& outStride)
+{
+    if (!filter || !texture || width == 0 || height == 0)
+        return false;
+
+    if (!ensure_ocr_stage_surface(filter, width, height))
+        return false;
+
+    gs_stagesurf_t* stage = filter->ocrStageSurface;
+    gs_stage_texture(stage, texture);
+
+    uint8_t* mappedData = nullptr;
+    uint32_t mappedStride = 0;
+
+    if (!gs_stagesurface_map(stage, &mappedData, &mappedStride)) {
+        blog(LOG_WARNING, "[securecast][ocr] Failed to map staging surface.");
+        return false;
+    }
+
+    const uint32_t tightStride = width * 4;
+    outPixels.resize((size_t)tightStride * height);
+
+    for (uint32_t y = 0; y < height; y++) {
+        memcpy(outPixels.data() + (size_t)y * tightStride,
+               mappedData + (size_t)y * mappedStride,
+               tightStride);
+    }
+
+    gs_stagesurface_unmap(stage);
+
+    outStride = (int)tightStride;
+    return true;
+}
+
+// ================================================================
+// [Role B] OCR worker 보조 함수
+// ================================================================
+
+static MaskPayload build_mask_payload_from_ocr_boxes(
+    const std::vector<SecureCastOcrBox>& boxes,
+    int frameWidth,
+    int frameHeight)
+{
+    MaskPayload payload{};
+    payload.rectCount = 0;
+
+    const int maxRects = (int)(sizeof(payload.rects) / sizeof(payload.rects[0]));
+
+    for (const auto& box : boxes) {
+        if (payload.rectCount >= maxRects)
+            break;
+
+        int x      = static_cast<int>(box.x);
+        int y      = static_cast<int>(box.y);
+        int width  = static_cast<int>(box.w);
+        int height = static_cast<int>(box.h);
+
+        if (x < 0) x = 0;
+        if (y < 0) y = 0;
+
+        if (x >= frameWidth || y >= frameHeight)
+            continue;
+
+        if (x + width > frameWidth)
+            width = frameWidth - x;
+
+        if (y + height > frameHeight)
+            height = frameHeight - y;
+
+        if (width <= 0 || height <= 0)
+            continue;
+
+        BlurRect& r = payload.rects[payload.rectCount++];
+        r.x      = x;
+        r.y      = y;
+        r.width  = width;
+        r.height = height;
+        r.type   = 1;
+    }
+
+    return payload;
+}
+
+static void clear_pending_ocr_frame(SecureCastFilter* filter)
+{
+    if (!filter)
+        return;
+
+    std::lock_guard<std::mutex> lock(filter->ocrWorkerMutex);
+    filter->ocrFramePending = false;
+    filter->ocrPendingPixels.clear();
+    filter->ocrPendingWidth = 0;
+    filter->ocrPendingHeight = 0;
+    filter->ocrPendingStride = 0;
+}
+
+static void submit_ocr_frame(
+    SecureCastFilter* filter,
+    std::vector<uint8_t>&& pixels,
+    int width,
+    int height,
+    int stride)
+{
+    if (!filter || pixels.empty() || width <= 0 || height <= 0 || stride <= 0)
+        return;
+
+    if (!filter->ocrWorkerRunning.load(std::memory_order_acquire))
+        return;
+
+    {
+        std::lock_guard<std::mutex> lock(filter->ocrWorkerMutex);
+        filter->ocrPendingPixels = std::move(pixels);
+        filter->ocrPendingWidth = width;
+        filter->ocrPendingHeight = height;
+        filter->ocrPendingStride = stride;
+        filter->ocrFramePending = true;
+    }
+
+    filter->ocrWorkerCv.notify_one();
+}
+
+static void ocr_worker_loop(SecureCastFilter* filter)
+{
+    if (!filter)
+        return;
+
+    const bool ocrReady = filter->ocrEngine ? filter->ocrEngine->init() : false;
+    if (ocrReady) {
+        blog(LOG_INFO, "[securecast][ocr] OCR worker initialized.");
+    } else {
+        blog(LOG_WARNING, "[securecast][ocr] OCR worker initialization failed.");
+    }
+
+    while (true) {
+        std::vector<uint8_t> pixels;
+        int width = 0;
+        int height = 0;
+        int stride = 0;
+
+        {
+            std::unique_lock<std::mutex> lock(filter->ocrWorkerMutex);
+            filter->ocrWorkerCv.wait(lock, [filter]() {
+                return !filter->ocrWorkerRunning.load(std::memory_order_acquire) ||
+                       filter->ocrFramePending;
+            });
+
+            if (!filter->ocrWorkerRunning.load(std::memory_order_acquire) &&
+                !filter->ocrFramePending) {
+                break;
+            }
+
+            pixels.swap(filter->ocrPendingPixels);
+            width = filter->ocrPendingWidth;
+            height = filter->ocrPendingHeight;
+            stride = filter->ocrPendingStride;
+
+            filter->ocrPendingWidth = 0;
+            filter->ocrPendingHeight = 0;
+            filter->ocrPendingStride = 0;
+            filter->ocrFramePending = false;
+        }
+
+        if (!ocrReady || pixels.empty() || width <= 0 || height <= 0 || stride <= 0)
+            continue;
+
+        auto ocrBoxes = filter->ocrEngine->analyze_bgra_frame(
+            pixels.data(), width, height, stride);
+
+        MaskPayload payload = build_mask_payload_from_ocr_boxes(ocrBoxes, width, height);
+
+        filter->maskChannel.publish(payload);
+
+        blog(LOG_INFO, "[securecast][ocr] OCR boxes: %d", payload.rectCount);
+    }
+
+    blog(LOG_INFO, "[securecast][ocr] OCR worker stopped.");
+}
+
+static void start_ocr_worker(SecureCastFilter* filter)
+{
+    if (!filter)
+        return;
+
+    bool expected = false;
+    if (!filter->ocrWorkerRunning.compare_exchange_strong(expected, true,
+                                                          std::memory_order_acq_rel)) {
+        return;
+    }
+
+    filter->ocrWorkerThread = std::thread([filter]() {
+        ocr_worker_loop(filter);
+    });
+}
+
+static void stop_ocr_worker(SecureCastFilter* filter)
+{
+    if (!filter)
+        return;
+
+    bool wasRunning = filter->ocrWorkerRunning.exchange(false, std::memory_order_acq_rel);
+    if (!wasRunning)
+        return;
+
+    filter->ocrWorkerCv.notify_all();
+
+    if (filter->ocrWorkerThread.joinable())
+        filter->ocrWorkerThread.join();
+
+    clear_pending_ocr_frame(filter);
+}
+
+// ================================================================
 // Filter Lifecycle Callbacks
 // ================================================================
 
