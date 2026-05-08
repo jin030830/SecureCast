@@ -1106,21 +1106,29 @@ std::vector<SecureCastOcrBox> SecureCastOcrEngine::detect_pii(
                 }
             }
 
-            // (e) ACCOUNT: "계좌"/"예금주" 라벨이 동일 라인 또는 인접 라인에 있을 때만 탐지
+            // (e) ACCOUNT: 라벨이 동일 라인 또는 ±2 라인 이내에 있을 때만 탐지.
+            // OCR 오인식 변형(게좌/계자/계조)도 허용.
             if (type == nullptr &&
                 RE2::PartialMatch(normalizedLine, PATTERN_ACCOUNT)) {
-                bool hasAccountLabel = false;
                 auto hasLabel = [](const std::string& t) {
-                    return t.find("\xEA\xB3\x84\xEC\xA2\x8C") != std::string::npos || // 계좌
-                           t.find("\xEC\x98\x88\xEA\xB8\x88\xEC\xA3\xBC") != std::string::npos; // 예금주
+                    // 정상 라벨
+                    if (t.find("\xEA\xB3\x84\xEC\xA2\x8C") != std::string::npos) return true; // 계좌
+                    if (t.find("\xEC\x98\x88\xEA\xB8\x88\xEC\xA3\xBC") != std::string::npos) return true; // 예금주
+                    if (t.find("\xEC\x9E\x85\xEA\xB8\x88") != std::string::npos) return true; // 입금
+                    if (t.find("\xEC\x86\xA1\xEA\xB8\x88") != std::string::npos) return true; // 송금
+                    if (t.find("\xEC\x9D\x80\xED\x96\x89") != std::string::npos) return true; // 은행
+                    if (t.find("Account") != std::string::npos) return true;
+                    if (t.find("ACCT")    != std::string::npos) return true;
+                    // OCR 오인식 변형
+                    if (t.find("\xEA\xB2\x8C\xEC\xA2\x8C") != std::string::npos) return true; // 게좌
+                    if (t.find("\xEA\xB3\x84\xEC\x9E\x90") != std::string::npos) return true; // 계자
+                    if (t.find("\xEA\xB3\x84\xEC\xA1\xB0") != std::string::npos) return true; // 계조
+                    return false;
                 };
-                if (hasLabel(rawText)) {
-                    hasAccountLabel = true;
-                } else if (i > 0 && hasLabel(lines[i-1].text)) {
-                    hasAccountLabel = true;
-                } else if (i + 1 < static_cast<int>(lines.size()) &&
-                           hasLabel(lines[i+1].text)) {
-                    hasAccountLabel = true;
+                bool hasAccountLabel = hasLabel(rawText);
+                for (int d = 1; d <= 2 && !hasAccountLabel; ++d) {
+                    if (i - d >= 0 && hasLabel(lines[i - d].text)) hasAccountLabel = true;
+                    if (i + d < static_cast<int>(lines.size()) && hasLabel(lines[i + d].text)) hasAccountLabel = true;
                 }
                 if (hasAccountLabel)
                     type = "ACCOUNT";
