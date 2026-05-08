@@ -32,6 +32,12 @@
 #include "pipeline-health.h"
 #include "securecast-types.h"
 
+// ocr-engine.h는 이 헤더에서 직접 include하지 않는다.
+// WinRT/OCR 관련 의존성이 다른 translation unit으로 전파되는 것을 막기 위해
+// SecureCastOcrEngine은 forward declaration + unique_ptr로 보관한다.
+class SecureCastOcrEngine;
+
+
 // ----------------------------------------------------
 // OBS Headers
 // ----------------------------------------------------
@@ -209,6 +215,12 @@ private:
 // 모든 Role이 협업하며 참조하는 메인 필터 인스턴스 구조체
 // ----------------------------------------------------
 struct SecureCastFilter {
+    SecureCastFilter();
+    ~SecureCastFilter();
+
+    SecureCastFilter(const SecureCastFilter&) = delete;
+    SecureCastFilter& operator=(const SecureCastFilter&) = delete;
+
     obs_source_t* context = nullptr; // OBS 필터 컨텍스트 포인터
 
     // UI 및 운영 토글 상태
@@ -264,6 +276,32 @@ struct SecureCastFilter {
     std::atomic<bool> panicMode{false};
     obs_hotkey_id     panicHotkeyId = OBS_INVALID_HOTKEY_ID;
 
-    // ----- TODO: Role B 담당 필드 -----
-    // void* ocrEngine = nullptr;           // Windows.Media.Ocr 엔진 포인터
+    // ----- [Role B] OCR 엔진 -----
+    // OCR 엔진은 render thread가 아니라 OCR worker thread 내부에서 init()한다.
+    // forward declaration을 위해 unique_ptr로 보관하여 ocr-engine.h 의존성을 분리한다.
+    std::unique_ptr<SecureCastOcrEngine> ocrEngine;
+
+    // ----- [Role B/C] OCR용 GPU readback 재사용 리소스 -----
+    // 매 OCR마다 gs_stagesurface_create/destroy를 반복하지 않기 위해 보관한다.
+    gs_stagesurf_t* ocrStageSurface = nullptr;
+    uint32_t        ocrStageWidth   = 0;
+    uint32_t        ocrStageHeight  = 0;
+
+    // ----- [Role B] Async OCR worker 상태 -----
+    // OCR은 RecognizeAsync(...).get()으로 블로킹될 수 있으므로 video_render에서 직접 실행하지 않는다.
+    std::thread             ocrWorkerThread;
+    std::mutex              ocrWorkerMutex;
+    std::condition_variable ocrWorkerCv;
+    std::atomic<bool>       ocrWorkerRunning{false};
+
+    // OCR 입력 프레임은 최신 1장만 유지한다. OCR이 render보다 느릴 때 큐 누적을 막기 위함이다.
+    bool                 ocrFramePending = false;
+    std::vector<uint8_t> ocrPendingPixels;
+    int                  ocrPendingWidth  = 0;
+    int                  ocrPendingHeight = 0;
+    int                  ocrPendingStride = 0;
+
+    // filter 인스턴스별 OCR throttle counter.
+    // render 함수 내부 static counter를 쓰면 여러 filter 인스턴스가 값을 공유하므로 사용하지 않는다.
+    uint32_t ocrFrameCounter = 0;
 };
