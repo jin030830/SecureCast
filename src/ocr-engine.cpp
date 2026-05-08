@@ -215,15 +215,21 @@ std::vector<SecureCastOcrBox> SecureCastOcrEngine::analyze_bgra_frame(
 
     // ── Full OCR ──────────────────────────────────────────────────
     auto lines = recognize_text(pixels, width, height, stride);
-    auto boxes = detect_pii(lines);
+    const auto rawBoxes = detect_pii(lines); // OCR 원본 결과 (tracker 보정 전)
 
     // 트래커 적용: EMA 좌표 보정 + missingFrames 기반 stability 필터
-    boxes = apply_tracker(boxes);
+    auto boxes = apply_tracker(rawBoxes);
 
-    // 캐시 전체 갱신
-    lastRoiDhash_ =
-        compute_roi_dhash(pixels, stride, width, height, boxes);
-    hasLastRoiDhash_ = true;
+    // L1 캐시 갱신:
+    //   OCR miss지만 tracker 생존 중 → L1 갱신 안 함.
+    //   다음 프레임도 full OCR 강제해 missingFrames를 빠르게 소진.
+    //   (트래커가 죽은 빈 위치를 L1이 stable로 캐싱하면 잔상이 수 초 지속됨)
+    if (!rawBoxes.empty() || boxes.empty()) {
+        lastRoiDhash_ = compute_roi_dhash(pixels, stride, width, height, boxes);
+        hasLastRoiDhash_ = true;
+    } else {
+        hasLastRoiDhash_ = false; // OCR miss + tracker 생존 → L1 무효화
+    }
     impl_->lastFrameWidth  = width;
     impl_->lastFrameHeight = height;
     lastBoxes_ = boxes;
@@ -314,7 +320,11 @@ std::vector<SecureCastOcrBox> SecureCastOcrEngine::apply_tracker(
         matchedD[bd] = true;
     }
 
-    // 매칭 안 된 detection → 신규 트래커로 추가
+    // 매칭 안 된 detection → 신규 트래커로 추가.
+    // 추가 전에 unmatched 수를 세어 kill 임계값 결정에 사용.
+    int unmatchedDets = 0;
+    for (int d = 0; d < D; ++d)
+        if (!matchedD[d]) ++unmatchedDets;
     for (int d = 0; d < D; ++d)
         if (!matchedD[d])
             trackers_.push_back({dets[d], 0});
@@ -324,11 +334,13 @@ std::vector<SecureCastOcrBox> SecureCastOcrEngine::apply_tracker(
         if (!matchedT[t])
             ++trackers_[t].missingFrames;
 
-    // missingFrames >= 12 → 제거 (12 OCR cycle ≈ 3-5s depending on OCR speed)
-    // 임계값을 높여 OCR이 간헐적으로 miss해도 트래커가 박스를 유지하게 한다.
-    // 이로써 L1 캐시가 비어있는 lastBoxes_를 반환하는 구간이 대폭 줄어든다.
+    // Smart kill:
+    //   새 탐지가 있는데 기존 트래커가 매칭 못 됨 → 텍스트가 다른 위치로 이동한 것
+    //   → 2 miss(~0.5s@4Hz)만에 제거해 잔상 제거.
+    //   새 탐지가 없음 → OCR 간헐적 miss → 6 miss(~1.5s@4Hz)까지 유지해 깜빡임 방지.
+    const int killThreshold = (unmatchedDets > 0) ? 2 : 6;
     for (int t = (int)trackers_.size() - 1; t >= 0; --t)
-        if (trackers_[t].missingFrames >= 12)
+        if (trackers_[t].missingFrames >= killThreshold)
             trackers_.erase(trackers_.begin() + t);
 
     // 현재 트래커 상태(EMA 좌표)를 반환
