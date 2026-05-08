@@ -1,0 +1,31 @@
+uniform float4x4 ViewProj;
+uniform texture2d image;
+uniform float4 uv_bounds;  // {left, top, right, bottom} 정규화 좌표
+
+sampler_state pointSampler {
+    Filter   = Point;
+    AddressU = Clamp;
+    AddressV = Clamp;
+};
+
+struct VertData {
+    float4 pos : POSITION;
+    float2 uv  : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v) {
+    v.pos = mul(float4(v.pos.xyz, 1.0), ViewProj);
+    v.uv  = uv_bounds.xy + v.uv * (uv_bounds.zw - uv_bounds.xy);
+    return v;
+}
+
+float4 PSDefault(VertData v) : TARGET {
+    return image.Sample(pointSampler, v.uv);
+}
+
+technique Draw {
+    pass {
+        vertex_shader = VSDefault(v);
+        pixel_shader  = PSDefault(v);
+    }
+}
