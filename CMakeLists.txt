@@ -251,3 +251,17 @@ if(WIN32)
 endif()
 # [핵심 해결] downsample.effect 등 필수 리소스를 OBS가 인식하는 표준 데이터 폴더로 복사
 install(DIRECTORY data/ DESTINATION "data/obs-plugins/${CMAKE_PROJECT_NAME}")
+
+# =============================================================================
+# 단위 테스트 (BUILD_TESTING=ON 일 때만 빌드)
+#
+# 활성화 방법:
+#   cmake --preset windows-x64 -DBUILD_TESTING=ON
+#   cmake --build --preset windows-x64
+#   ctest --preset windows-x64 --output-on-failure
+# =============================================================================
+option(BUILD_TESTING "Build unit tests" OFF)
+if(BUILD_TESTING)
+  enable_testing()
+  add_subdirectory(test)
+endif()

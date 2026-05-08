@@ -894,14 +894,16 @@ std::vector<SecureCastOcrBox> SecureCastOcrEngine::detect_pii(
     // === 정규식 패턴 정의: 초기화 시 1회 컴파일 ===
 
     // 1) 주민등록번호: 6자리-7자리, 뒷자리 첫 글자 1~8 (외국인 포함)
+    // \s?[-–]\s?: OCR이 "850101 - 1234566" 처럼 구분자 앞뒤 공백을 추가하는 경우 허용.
     static const re2::RE2 PATTERN_RRN(
-        R"(\b(\d{6})[-–]\s?([1-8]\d{6})\b)"
+        R"(\b(\d{6})\s?[-–]\s?([1-8]\d{6})\b)"
     );
 
     // 2) 전화번호: 휴대폰(010/011/016~019) + 지역번호(02/03x/04x/05x/06x) + +82 정규화
-    //    \b word boundary로 긴 숫자열 일부 매칭 방지
+    // +82 대안: \b 를 제거 — RE2에서 \b 는 ASCII word-char 기준이므로 `+` 앞에서 미작동.
+    //           01X 대안은 \b 를 유지 (긴 숫자열 부분 매칭 방지).
     static const re2::RE2 PATTERN_PHONE(
-        R"(\b(?:\+82[-\s]?1[016-9]|01[016-9])[-\s]?\d{3,4}[-\s]?\d{4}\b|\b0(?:2[-\s]?\d{3,4}|[3-9]\d[-\s]?\d{3,4}|[3-9]\d{2}[-\s]?\d{3,4})[-\s]?\d{4}\b)"
+        R"((?:\+82[-\s]?1[016-9]|\b01[016-9])[-\s]?\d{3,4}[-\s]?\d{4}\b|\b0(?:2[-\s]?\d{3,4}|[3-9]\d[-\s]?\d{3,4}|[3-9]\d{2}[-\s]?\d{3,4})[-\s]?\d{4}\b)"
     );
 
     // 3) 이메일
@@ -931,9 +933,10 @@ std::vector<SecureCastOcrBox> SecureCastOcrEngine::detect_pii(
 
     // A-7) 이름 + 호칭 직접 패턴 (높은 신뢰도)
     // "김철수님", "이민준씨" 등 — 성씨 시작 2~4자 + 님/씨
-    // 블랙리스트로 "고객님"(고객+님), "선생님" 등 호칭 구분
+    // 블랙리스트로 "고객님"(고객+님), "선생님" 등 호칭 구분.
+    // \b 제거: RE2의 \b 는 ASCII word-char 기준이라 한글 뒤에서 미작동.
     static const re2::RE2 PATTERN_NAME_HONORIFIC(
-        R"(([가-힣]{2,4})\s*(?:님|씨)\b)"
+        R"(([가-힣]{2,4})\s*(?:님|씨))"
     );
 
     std::vector<SecureCastOcrBox> boxes;
@@ -1067,8 +1070,14 @@ std::vector<SecureCastOcrBox> SecureCastOcrEngine::detect_pii(
                 // 인접 줄 라벨이면 현재 라인 전체를 검사한다.
                 std::string candidateText = rawText;
                 if (sameLineLabel) {
+                    // has_name_label 에 포함된 라벨 전부 — 탈루 시 후보 텍스트가 라벨 포함 채로
+                    // hangulCount 범위를 초과해 NONE 으로 빠지는 문제 방지.
                     static const char* const LABEL_STRS[] = {
-                        "이름", "성명", "성함", "고객명", "사용자명", "name", "Name", "NAME"
+                        "이름", "성명", "성함", "고객명", "사용자명",
+                        "예금주", "수취인", "발신인", "수신인",
+                        "보호자", "담당자", "신청인", "회원명", "환자명",
+                        "Full Name", "First Name", "Last Name",
+                        "name", "Name", "NAME"
                     };
                     for (const char* lbl : LABEL_STRS) {
                         const auto pos = rawText.find(lbl);

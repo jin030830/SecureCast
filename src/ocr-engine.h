@@ -39,6 +39,16 @@ public:
     // 주의: render thread에서 호출하지 말고 OCR worker thread에서 호출하는 것이 안전하다.
     bool init();
 
+#ifdef SC_ENABLE_TESTS
+    // detect_pii를 단위 테스트에서 직접 호출하기 위한 진입점.
+    // 프로덕션 빌드에는 포함되지 않는다.
+    std::vector<SecureCastOcrBox> detect_pii_for_test(
+        const std::vector<SecureCastOcrLine>& lines)
+    {
+        return detect_pii(lines);
+    }
+#endif
+
     // === OCR 사용 가능 여부 ===
     bool available() const;
 
