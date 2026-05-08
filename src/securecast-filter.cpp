@@ -888,6 +888,7 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
             gs_draw_sprite(nullptr, 0, GM_SZ, GM_SZ);
             gs_matrix_pop();
         }
+    }
 
     // Phase 4: Health Check & Reset
     if (filter->health.shouldReset()) {

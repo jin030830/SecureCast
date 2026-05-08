@@ -238,7 +238,9 @@ struct SecureCastFilter {
 
     // ----- [Role A 담당: 윈도우 추적 및 블랙리스트] -----
     float         trackerAccumulator = 0.0f; // 윈도우 스캔 틱 조절(0.15초 단위)용 시간 누산기
-    // gs_effect_t* blurEffect = nullptr;  // 컴파일된 HLSL 셰이더
+    gs_effect_t*  blurEffect = nullptr;      // 컴파일된 HLSL 셰이더
+    std::mutex    blacklistMutex;            // video_tick(비디오)과 video_render(렌더) 간의 동시 접근을 막는 뮤텍스
+    MaskPayload   blacklistMask{};           // [우선순위 1] Role A가 추적한 블랙리스트 앱 좌표 (AI 처리 전에 최상단에 덮어씌움)
 #ifdef _WIN32
     WinEventListener  winListener;
     TrackedWindowList windowList{};          // 현재 추적 중인 창 목록
