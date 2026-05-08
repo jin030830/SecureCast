@@ -2,13 +2,13 @@
 // window_tracker.cpp — Role A 1주차 골격: 블랙리스트 앱 좌표 스캐너
 //
 // 동작 흐름:
-//   sc_tracker_tick (video_tick에서 매 프레임 호출)
-//     └─ throttle (0.15초 미만이면 즉시 리턴)
+//   securecast_video_tick (매 프레임, 60fps)
+//     └─ trackerAccumulator 누산 (0.15초 미만이면 즉시 리턴) [C-1: 인라인 직접 처리]
 //        └─ sc_scan_blacklisted_windows
 //             └─ EnumWindows(enum_proc) — 모든 최상위 창 순회
 //                  └─ enum_proc: 보이는 창 → DWM 좌표 → PID → exe명 → 블랙리스트 매칭
 //                       └─ 매칭되면 TrackedWindowList에 슬롯 추가
-//        └─ 결과를 obs_log로 출력 (현재는 디버깅용, 후속 단계에서 마스킹 좌표로 연결)
+//        └─ 결과를 blacklistMask에 저장 (mutex 보호)
 //
 // Win32 API 선택 이유:
 //   - DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS): GetWindowRect는 창
@@ -30,11 +30,10 @@
 
 namespace {
 
-// 너무 작은 창은 시각적으로 노출 가능성이 낮고, 트레이 아이콘 같은 노이즈가 많다.
 constexpr int MIN_WINDOW_DIMENSION = 100;
 
-// EnumWindows 1회의 비용을 60fps 매 tick 떠안기엔 부담. 사람의 창 이동 인지
-// 시간보다 짧으면 충분하므로 0.15초 (≈6.7Hz) 로 둔다.
+// 기본 스캔 주기 참조값 (일반 모드). 실제 스캔 주기는 sc_tracker_tick의 interval 인자로 전달된다.
+// 게임 모드에서는 호출자(securecast-filter.cpp)가 SCAN_INTERVAL_GAME(0.5초)을 전달한다.
 constexpr float SCAN_INTERVAL_SEC = 0.15f;
 
 // 보호 대상 앱 목록. 향후 OBS Properties UI에서 사용자가 편집할 수 있게 확장 예정.
@@ -86,6 +85,51 @@ bool is_blacklisted(const wchar_t *exe_name)
 			return true;
 	}
 	return false;
+}
+
+// Win+Tab(Task View)나 Alt+Tab(앱 전환기)인지 클래스명으로 판별.
+// 이 창이 앞에 있을 때는 뒤에 있는 민감 앱을 추적 해제하지 않는다.
+// 이유: Task View/Alt+Tab은 전환 UI이므로, 그 뒤의 민감 앱은 "선택 중인 상태"일 수 있고
+//       전환 애니메이션(~500ms) 동안도 마스킹을 유지해야 즉시 가려진다.
+bool is_task_switcher_window(HWND hwnd)
+{
+	wchar_t cls[128] = {};
+	GetClassNameW(hwnd, cls, 128);
+	// Win+Tab Task View (Windows 10 / 11)
+	if (wcsstr(cls, L"MultitaskingView") != nullptr)
+		return true;
+	// Alt+Tab 앱 전환기 (버전마다 클래스명 다름)
+	if (iequals(cls, L"TaskSwitcherWnd") || iequals(cls, L"XamlExplorerHostIslandWindow"))
+		return true;
+	return false;
+}
+
+// 창이 다른 앱에 완전히 가려져 있는지 확인 (뒤로 보내기 감지).
+// 중앙 1점이 아니라 5점(중앙 + 4코너 25% 안쪽)을 샘플링해,
+// 하나라도 hwnd가 최상위이면 true 반환.
+// 완전히 다른 앱에 덮여야(5점 모두 다른 창) 추적 해제.
+bool is_window_top_at_center(HWND hwnd, const RECT &rect)
+{
+	const LONG w4 = (rect.right  - rect.left) / 4;
+	const LONG h4 = (rect.bottom - rect.top)  / 4;
+	const POINT samples[5] = {
+		{ (rect.left + rect.right) / 2,  (rect.top + rect.bottom) / 2 }, // center
+		{ rect.left  + w4,               rect.top  + h4               }, // top-left
+		{ rect.right - w4,               rect.top  + h4               }, // top-right
+		{ rect.left  + w4,               rect.bottom - h4             }, // bottom-left
+		{ rect.right - w4,               rect.bottom - h4             }, // bottom-right
+	};
+	for (const POINT &pt : samples) {
+		HWND topAt = WindowFromPoint(pt);
+		if (!topAt)
+			return true;
+		HWND topRoot = GetAncestor(topAt, GA_ROOT);
+		if (topRoot == hwnd)
+			return true;
+		if (is_task_switcher_window(topRoot))
+			return true;
+	}
+	return false; // 5개 샘플점 모두 다른 앱에 가려짐 → 뒤로 보내기로 간주
 }
 
 // EnumWindows의 콜백. 시스템의 모든 최상위 윈도우에 대해 한 번씩 호출됨.
@@ -143,6 +187,11 @@ BOOL CALLBACK enum_proc(HWND hwnd, LPARAM lparam)
 	if (!is_blacklisted(exe_name))
 		return TRUE;
 
+	// Z-order: 창 중앙이 다른 앱에 가려져 있으면 (뒤로 보내기 상태) 추적 대상 제외.
+	// 카톡이 OBS 뒤로 가도 IsWindowVisible=true라 이 체크 없이는 계속 추적된다.
+	if (!is_window_top_at_center(hwnd, rect))
+		return TRUE;
+
 	// 매칭 성공 → out 슬롯에 정보 복사.
 	auto &slot = out->items[out->count++];
 	slot.hwnd = hwnd;
@@ -158,6 +207,35 @@ BOOL CALLBACK enum_proc(HWND hwnd, LPARAM lparam)
 
 } // namespace
 
+extern "C" void sc_update_tracked_bounds(TrackedWindowList *list)
+{
+	if (!list || list->count == 0)
+		return;
+
+	// 역순으로 순회해야 swap-and-pop 시 인덱스가 안 틀린다.
+	for (int i = list->count - 1; i >= 0; --i) {
+		HWND hwnd = list->items[i].hwnd;
+
+		// 창이 닫혔거나 최소화됐으면 슬롯 제거 (마지막 원소와 swap-and-pop).
+		if (!IsWindowVisible(hwnd)) {
+			list->items[i] = list->items[--list->count];
+			continue;
+		}
+
+		RECT rect{};
+		if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS,
+		                                    &rect, sizeof(rect))))
+			list->items[i].bounds = rect;
+
+		// 다른 앱 창이 앞으로 와서 이 창을 가리면 즉시 추적 해제.
+		// 뒤로 보내기는 IsWindowVisible=true를 유지하므로 위의 체크만으로는 감지 불가.
+		if (!is_window_top_at_center(hwnd, list->items[i].bounds)) {
+			list->items[i] = list->items[--list->count];
+			continue;
+		}
+	}
+}
+
 // 호출자는 OBS의 video_tick / video_render 같은 렌더 스레드 컨텍스트에서만 호출할 것.
 // (DWM/Win32 윈도우 핸들 조회는 caller 스레드의 메시지 큐에 의존)
 extern "C" void sc_scan_blacklisted_windows(TrackedWindowList *out)
@@ -170,23 +248,26 @@ extern "C" void sc_scan_blacklisted_windows(TrackedWindowList *out)
 
 // 60fps tick에서 매번 호출되어도 실제 무거운 EnumWindows는 0.15초마다 1회만 실행.
 // 매칭된 창은 일단 obs_log로만 출력 — 후속 단계에서 BlurRect로 변환 후 셰이더에 전달.
-extern "C" void sc_tracker_tick(float seconds, float *accumulator)
+extern "C" void sc_tracker_tick(float seconds, float *accumulator, TrackedWindowList *out, float interval)
 {
 	if (!accumulator)
 		return;
 
 	*accumulator += seconds;
-	if (*accumulator < SCAN_INTERVAL_SEC)
+	if (*accumulator < interval)
 		return;
 	*accumulator = 0.0f;
 
 	TrackedWindowList list{};
 	sc_scan_blacklisted_windows(&list);
 
+	// 스캔 결과를 호출자에게 전달 (창이 0개여도 업데이트 — 닫힌 창 반영).
+	if (out)
+		*out = list;
+
 	if (list.count == 0)
 		return;
 
-	// 디버그 출력. 운영 단계에서는 빈도 줄이거나 LOG_DEBUG로 강등 예정.
 	for (int i = 0; i < list.count; ++i) {
 		const auto &w = list.items[i];
 		obs_log(LOG_INFO, "[tracker] %ls @ (%ld,%ld)-(%ld,%ld) %ldx%ld", w.exe_name,

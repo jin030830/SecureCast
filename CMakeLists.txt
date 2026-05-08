@@ -186,8 +186,13 @@ target_sources(
   PRIVATE
     src/plugin-main.cpp           # OBS 진입점 / 모듈 등록
     src/securecast-filter.cpp     # 필터 lifecycle 콜백 + dispatch table
-    src/securecast-filter.h       # 공유 타입 정의
-    src/plugin-support.h          # PLUGIN_NAME / obs_log 선언
+    src/securecast-filter.h       # 공유 타입 (SecureCastFilter, BlurRect 등)
+    src/securecast-types.h        # 순환 참조 방지용 공용 타입
+    src/plugin-support.h          # PLUGIN_NAME / obs_log 선언 (정의는 .c.in)
+    src/pixel-hash.cpp            # Role C: FNV-1a 픽셀 해시 캐시
+    src/pixel-hash.h
+    src/pipeline-health.cpp       # [NEW] 파이프라인 상태 모니터
+    src/pipeline-health.h
     src/ocr-engine.cpp            # Role B: OCR + RE2 기반 PII 탐지
     src/ocr-engine.h              # Role B: OCR 엔진 인터페이스
 )
@@ -198,10 +203,36 @@ if(WIN32)
     PRIVATE
       src/window_tracker.cpp      # Role A: 블랙리스트 앱 좌표 스캐너
       src/window_tracker.h
+      src/win_event_listener.cpp  # Role A: SetWinEventHook push 감지
+      src/win_event_listener.h
+      src/gpu-readback.cpp        # Role C: GPU-CPU 비동기 Readback
+      src/gpu-readback.h
   )
 endif()
 
-# OBS 표준 매크로.
-# 출력 파일명을 "${_name}.dll"로 강제하고 install 타겟을 자동 생성한다.
-# CMake 기본 lib 접두사는 OBS 플러그인에는 맞지 않는다.
+
+# OBS 표준 매크로: 출력 파일명을 "${_name}.dll" 로 강제, install 타겟 자동 생성.
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
+
+# 빌드 후 OBS 플러그인 경로에 자동 배포.
+# CMAKE_INSTALL_PREFIX = C:/ProgramData/obs-studio/plugins (defaults.cmake에서 설정)
+if(WIN32)
+  add_custom_command(
+    TARGET ${CMAKE_PROJECT_NAME}
+    POST_BUILD
+    COMMAND "${CMAKE_COMMAND}" -E make_directory
+      "${CMAKE_INSTALL_PREFIX}/${CMAKE_PROJECT_NAME}/bin/64bit"
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+      "$<TARGET_FILE:${CMAKE_PROJECT_NAME}>"
+      "${CMAKE_INSTALL_PREFIX}/${CMAKE_PROJECT_NAME}/bin/64bit/"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory
+      "${CMAKE_INSTALL_PREFIX}/${CMAKE_PROJECT_NAME}/data"
+    COMMAND "${CMAKE_COMMAND}" -E copy_directory
+      "${CMAKE_CURRENT_SOURCE_DIR}/data"
+      "${CMAKE_INSTALL_PREFIX}/${CMAKE_PROJECT_NAME}/data"
+    COMMENT "Deploy ${CMAKE_PROJECT_NAME} to OBS plugins: ${CMAKE_INSTALL_PREFIX}"
+    VERBATIM
+  )
+endif()
+# [핵심 해결] downsample.effect 등 필수 리소스를 OBS가 인식하는 표준 데이터 폴더로 복사
+install(DIRECTORY data/ DESTINATION "data/obs-plugins/${CMAKE_PROJECT_NAME}")

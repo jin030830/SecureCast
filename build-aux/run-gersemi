@@ -1,0 +1,51 @@
+#!/usr/bin/env zsh
+
+# CI-compatible run-gersemi wrapper
+# Handles --check, --fail-never, --fail-error, --fail-fast
+
+fail_on_error=0
+check_only=0
+files=()
+
+while (( $# )); do
+    case "$1" in
+        -c|--check) check_only=1 ;;
+        --fail-never) fail_on_error=0 ;;
+        --fail-error|--fail-fast) fail_on_error=1 ;;
+        *) files+=("$1") ;;
+    esac
+    shift
+done
+
+# If no files specified, find all relevant files
+if (( ${#files} == 0 )); then
+    files=(CMakeLists.txt (cmake)/**/*.(cmake)(.N) src/**/CMakeLists.txt(.N))
+fi
+
+if (( ${#files} == 0 )); then
+    exit 0
+fi
+
+if ! (( ${+commands[gersemi]} )); then
+    echo "Warning: gersemi not found. Skipping CMake formatting check."
+    exit 0
+fi
+
+status=0
+
+if (( check_only )); then
+    for file in "${files[@]}"; do
+        if ! gersemi -c "${file}" > /dev/null 2>&1; then
+            echo "CMake formatting error in: ${file}"
+            status=1
+        fi
+    done
+else
+    gersemi -i "${files[@]}"
+fi
+
+if (( status && fail_on_error )); then
+    exit 1
+fi
+
+exit 0

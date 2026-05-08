@@ -27,6 +27,13 @@
 #include <thread>
 #include <vector>
 
+#ifdef _WIN32
+#include "gpu-readback.h"
+#endif
+#include "pixel-hash.h"
+#include "pipeline-health.h"
+#include "securecast-types.h"
+
 // ocr-engine.h는 이 헤더에서 직접 include하지 않는다.
 // WinRT/OCR 관련 의존성이 다른 translation unit으로 전파되는 것을 막기 위해
 // SecureCastOcrEngine은 forward declaration + unique_ptr로 보관한다.
@@ -39,6 +46,18 @@ class SecureCastOcrEngine;
 #include <obs-module.h>
 
 // ----------------------------------------------------
+// Platform Headers
+// ----------------------------------------------------
+#ifdef _WIN32
+#include "win_event_listener.h"
+#include "window_tracker.h"
+#endif
+
+// ----------------------------------------------------
+// Helpers & Macros
+// ----------------------------------------------------
+
+// ----------------------------------------------------
 // Global Configurations (Config)
 // ----------------------------------------------------
 // 컴파일 타임 상수. 런타임에 바꿀 일이 없으므로 constexpr로 둔다.
@@ -46,33 +65,23 @@ constexpr int SC_MAX_BLUR_RECTS = 32;       // 한 프레임에 동시에 마스
 constexpr int SC_RING_BUFFER_SLOTS = 5;     // Bounded Exposure: AI 검증을 위해 N프레임만큼 송출 지연 슬롯 수
 
 // ----------------------------------------------------
-// Shared Types (Types)
+// Shared Types (Types) - Moved to securecast-types.h
 // ----------------------------------------------------
 
-// UI 인디케이터 상태(초록/노랑/빨강).
-// video_render에서 오버레이 표시할 때, video_tick의 위험 판단 결과를 반영한다.
-enum class SecurityState {
-    SAFE,       // 노출 위험 없음 (초록)
-    PARTIAL,    // 위험 감지 후 마스킹 동작 중 (노랑)
-    RISK        // 심각한 유출 위험 또는 프레임 오버플로우 (빨강)
-};
-
-// 화면 내 개별적인 블러/블랙아웃 처리 영역.
-// Role A의 window_tracker / Role B의 OCR 결과가 이 구조체로 모이고,
-// 렌더 단계에서 이 좌표를 받아 픽셀 처리한다.
-struct BlurRect {
-    int x;
-    int y;
-    int width;
-    int height;
-    int type; // 0: Blur, 1: Blackout
-};
-
-// AI/OCR Thread에서 만든 마스킹 결과 → Render Thread로 넘기는 전달 페이로드.
+// AI Thread에서 만든 마스킹 결과 → Render Thread로 넘기는 락프리 버퍼 팩(전달 페이로드)
 struct MaskPayload {
     BlurRect rects[SC_MAX_BLUR_RECTS];
     int rectCount;
 };
+
+#ifdef _WIN32
+// 창이 사라진 후 ring buffer에 남은 N프레임 동안 마스킹을 유지하는 잔영 항목.
+struct LingeringWindow {
+    TrackedWindow window;         // 마지막으로 알려진 창 정보 (bounds 포함)
+    int           ticksRemaining; // SC_RING_BUFFER_SLOTS에서 매 tick 카운트다운
+};
+constexpr int SC_MAX_LINGERING = SC_MAX_TRACKED_WINDOWS;
+#endif
 
 // ----------------------------------------------------
 // [Role C] N-Frame Ring Buffer
@@ -92,6 +101,11 @@ public:
     struct Slot {
         gs_texrender_t* texrender = nullptr; // OBS 안전 렌더 타겟 관리자
         uint64_t        timestamp = 0;
+#ifdef _WIN32
+        // 이 프레임이 캡처된 시점의 창 좌표 스냅샷.
+        // 렌더 시 delayedSlot->windowSnapshot을 사용해야 프레임 내용과 마스크 위치가 동기화됨.
+        TrackedWindowList windowSnapshot{};
+#endif
 
         // gs_texrender에서 결과 텍스처를 꺼내는 헬퍼
         gs_texture_t* getTexture() const {
@@ -107,12 +121,18 @@ public:
     bool initialize(uint32_t width, uint32_t height);
     void destroy();
 
-    // gs_texrender_begin/end를 사용하여 안전하게 프레임을 캡처한다.
-    // filterContext를 함께 넘겨 obs_filter_get_target()을 사용할 수 있게 한다.
-    // parent source를 직접 렌더링하면 필터 재귀 호출 위험이 있으므로 피한다.
-    void pushFrame(obs_source_t* source, uint64_t timestamp, obs_source_t* filterContext);
+    // gs_texrender_begin/end를 사용하여 안전하게 프레임을 캡처.
+    // wlist: 이 프레임 캡처 시점의 창 좌표 스냅샷 (null 허용).
+#ifdef _WIN32
+    void pushFrame(uint64_t timestamp, obs_source_t* filter_context, const TrackedWindowList* wlist);
+#else
+    void pushFrame(uint64_t timestamp, obs_source_t* filter_context);
+#endif
 
     const Slot* peekDelayedSlot() const;
+    // framesBack=SC_RING_BUFFER_SLOTS이면 peekDelayedSlot()과 동일.
+    // framesBack=SC_RING_BUFFER_SLOTS-1이면 한 프레임 더 최신 슬롯 (빠른 이동 합집합용).
+    const Slot* peekSlotAtOffset(int framesBack) const;
 
     bool isInitialized() const { return m_initialized; }
     uint32_t getWidth()  const { return m_width;  }
@@ -144,14 +164,17 @@ public:
     // 워커 스레드 시작. frameWidth/Height로 가짜 중앙 좌표를 계산한다.
     void start(uint32_t frameWidth, uint32_t frameHeight, ResultCallback callback);
     void stop();
+    void setPaused(bool paused);
 
     bool isRunning() const { return m_running.load(); }
+    bool isPaused()  const { return m_paused.load();  }
 
 private:
     void workerLoop();
 
     std::thread             m_thread;
     std::atomic<bool>       m_running{false};
+    std::atomic<bool>       m_paused{false};
     std::mutex              m_mutex;
     std::condition_variable m_cv;
 
@@ -186,31 +209,90 @@ private:
 
 // ----------------------------------------------------
 // Core Filter Context
-// 모든 Role이 참조하는 필터 인스턴스
+// ----------------------------------------------------
+// 모든 Role이 협업하며 참조하는 메인 필터 인스턴스 구조체
 // ----------------------------------------------------
 struct SecureCastFilter {
+    // [PR #11] unique_ptr<SecureCastOcrEngine> 불완전 타입 지원을 위한 명시 선언
     SecureCastFilter();
     ~SecureCastFilter();
-
     SecureCastFilter(const SecureCastFilter&) = delete;
     SecureCastFilter& operator=(const SecureCastFilter&) = delete;
 
-    obs_source_t* context = nullptr;
+    obs_source_t* context = nullptr; // OBS 필터 컨텍스트 포인터
 
     // UI 및 운영 토글 상태
     bool          isActive     = true;
     bool          isGameMode   = false;
     SecurityState currentState = SecurityState::SAFE;
 
-    // ----- [Role C] 담당 필드 -----
-    FrameRingBuffer   ringBuffer;   // N-Frame 지연 버퍼
-    MockAIWorker      mockWorker;   // 가짜 AI 워커 스레드. 현재 실제 OCR 경로에서는 start하지 않는다.
-    AtomicMaskChannel maskChannel;  // OCR Worker → Render Thread 결과 채널
-    MaskPayload       lastMask{};   // 마지막으로 적용된 마스킹 결과. 없으면 rectCount == 0
+    // ----- [Role C] 렌더링 파이프라인 및 GPU Readback -----
+    FrameRingBuffer   ringBuffer;
+    MockAIWorker      mockWorker;
+    AtomicMaskChannel maskChannel;
+    MaskPayload       lastMask{};
 
-    // ----- [Role A] 담당 필드 -----
-    float trackerAccumulator = 0.0f; // window_tracker tick throttle 누산기
-    // gs_effect_t* blurEffect = nullptr;  // 컴파일된 HLSL 셰이더
+#ifdef _WIN32
+    GpuReadback       readback;
+#endif
+    PixelHashCache    fullScreenHash;
+    std::vector<uint8_t> readbackBuffer;
+    uint64_t          frameCounter = 0;
+    PipelineHealth    health;
+
+    int  logUnchangedFrames = 0;
+    int  logStallCount      = 0;
+    int  logEnqueueCount    = 0;
+    int  logScanThrottle    = 0;
+
+    // ----- [Role A] HLSL 마스킹 셰이더 및 윈도우 추적 -----
+    gs_effect_t*  blurEffect = nullptr;
+    float         trackerAccumulator = 0.0f;
+    std::mutex    blacklistMutex;
+    MaskPayload   blacklistMask{};
+#ifdef _WIN32
+    WinEventListener  winListener;
+    TrackedWindowList windowList{};
+    TrackedWindowList captureWindowList{};
+    TrackedWindowList prevWindowList{};
+    TrackedWindowList recentlySeenList{};
+    LingeringWindow   lingeringWindows[SC_MAX_LINGERING]{};
+    int               lingeringCount = 0;
+
+    float    cpuSampleAccumulator = 0.0f;
+    float    cpuUsage             = 0.0f;
+    float    gameModeEntryTimer   = 0.0f;
+    float    gameModeExitTimer    = 0.0f;
+    FILETIME prevIdleTime         = {};
+    FILETIME prevKernelTime       = {};
+    FILETIME prevUserTime         = {};
+#endif
+
+    // ----- [Panic Button] Ctrl+Shift+F12 -----
+    std::atomic<bool> panicMode{false};
+    obs_hotkey_id     panicHotkeyId = OBS_INVALID_HOTKEY_ID;
+
+    // ----- [Role B] OCR 엔진 (forward declaration + unique_ptr) -----
+    std::unique_ptr<SecureCastOcrEngine> ocrEngine;
+
+    // ----- [Role B] OCR용 stage surface -----
+    // TODO: 추후 readbackBuffer(Slot 1)로 대체 권장 (GpuReadback과 중복 GPU 복사)
+    gs_stagesurf_t* ocrStageSurface = nullptr;
+    uint32_t        ocrStageWidth   = 0;
+    uint32_t        ocrStageHeight  = 0;
+
+    // ----- [Role B] Async OCR worker 상태 -----
+    std::thread             ocrWorkerThread;
+    std::mutex              ocrWorkerMutex;
+    std::condition_variable ocrWorkerCv;
+    std::atomic<bool>       ocrWorkerRunning{false};
+
+    bool                 ocrFramePending = false;
+    std::vector<uint8_t> ocrPendingPixels;
+    int                  ocrPendingWidth  = 0;
+    int                  ocrPendingHeight = 0;
+    int                  ocrPendingStride = 0;
+    uint32_t             ocrFrameCounter  = 0;
 
     // ----- [Role B] OCR 엔진 -----
     // OCR 엔진은 render thread가 아니라 OCR worker thread 내부에서 init()한다.
