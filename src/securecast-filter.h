@@ -314,5 +314,5 @@ struct SecureCastFilter {
     int ocrBoxTtl[SC_MAX_BLUR_RECTS]{};
     static constexpr int SC_OCR_BOX_TTL = 6;    // 6 사이클 연속 미매칭 시 cycle TTL 만료
     int emptyResultStreak = 0;                   // 연속 빈 OCR 결과 횟수
-    static constexpr int SC_EMPTY_HYSTERESIS = 3; // 이 값 이상 연속 빈 결과여야 lastMask 해제
+    static constexpr int SC_EMPTY_HYSTERESIS = 1; // 빈 결과 즉시 반영 (잔상 최소화)
 };

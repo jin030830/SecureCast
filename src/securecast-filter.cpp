@@ -544,9 +544,7 @@ static MaskPayload build_mask_payload_from_ocr_boxes(
         r.width    = width;
         r.height   = height;
         r.type     = 1;
-        r.expireTs = nowMs + 2500; // 2500ms 보장
-        // 800ms → 2500ms: 트래커 소멸 후 full OCR 재시도(~460ms) + 인식 실패 2-3회 여유를
-        // 모두 포괄해 OCR이 간헐적으로 miss해도 mask가 깜빡이지 않도록 한다.
+        r.expireTs = nowMs + 200; // 200ms: OCR 다음 사이클까지만 유지 (잔상 최소화)
     }
 
     return payload;
@@ -982,42 +980,11 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
         if (filter->maskChannel.consume(newMask)) {
             if (newMask.rectCount > 0) {
                 filter->emptyResultStreak = 0;
-                // Step 1: 기존 박스 cycle TTL 감소
+                // OCR 결과를 그대로 lastMask로 교체 — 이번 OCR 사이클의 진실
+                // 공간 매칭 제거: "가까운 박스 유지" 로직이 이전 위치 잔상의 원인이었음
+                filter->lastMask = newMask;
                 for (int i = 0; i < filter->lastMask.rectCount; ++i)
-                    filter->ocrBoxTtl[i]--;
-                // Step 2: 공간 매칭 — 가까운 박스는 위치·expireTs 갱신 + cycle TTL 리셋, 새 박스는 추가
-                for (int ni = 0; ni < newMask.rectCount; ++ni) {
-                    const BlurRect& nr = newMask.rects[ni];
-                    int ncx = nr.x + nr.width / 2;
-                    int ncy = nr.y + nr.height / 2;
-                    bool matched = false;
-                    for (int ei = 0; ei < filter->lastMask.rectCount; ++ei) {
-                        BlurRect& er = filter->lastMask.rects[ei];
-                        int ecx = er.x + er.width / 2;
-                        int ecy = er.y + er.height / 2;
-                        if (abs(ncx - ecx) < 100 && abs(ncy - ecy) < 60) {
-                            er = nr; // 위치 + expireTs 갱신
-                            filter->ocrBoxTtl[ei] = SecureCastFilter::SC_OCR_BOX_TTL;
-                            matched = true;
-                            break;
-                        }
-                    }
-                    if (!matched && filter->lastMask.rectCount < SC_MAX_BLUR_RECTS) {
-                        int idx = filter->lastMask.rectCount++;
-                        filter->lastMask.rects[idx] = nr;
-                        filter->ocrBoxTtl[idx] = SecureCastFilter::SC_OCR_BOX_TTL;
-                    }
-                }
-                // Step 3: expireTs 만료된 박스 제거 (cycle TTL은 공간 매칭 추적용, 제거 기준 아님)
-                int wr = 0;
-                for (int rd = 0; rd < filter->lastMask.rectCount; ++rd) {
-                    if (filter->lastMask.rects[rd].expireTs > nowMs) {
-                        filter->lastMask.rects[wr] = filter->lastMask.rects[rd];
-                        filter->ocrBoxTtl[wr] = filter->ocrBoxTtl[rd];
-                        ++wr;
-                    }
-                }
-                filter->lastMask.rectCount = wr;
+                    filter->ocrBoxTtl[i] = SecureCastFilter::SC_OCR_BOX_TTL;
             } else {
                 // (c)로 빈 결과는 publish되지 않지만 방어용 hysteresis
                 if (++filter->emptyResultStreak >= SecureCastFilter::SC_EMPTY_HYSTERESIS) {
