@@ -922,6 +922,19 @@ static bool valid_email(const std::string& e) {
     return true;
 }
 
+// OCR 분할 주소 결합용: 두 라인이 시각적으로 연속한지 판단.
+// y 거리가 현재 줄 높이의 2.5배 이내 & 중심 x 거리가 너비의 80% 이내.
+static bool lines_visually_adjacent(const SecureCastOcrLine& a,
+                                    const SecureCastOcrLine& b)
+{
+    const float lineH = (a.h > 0.0f) ? a.h : 20.0f;
+    if (b.y - a.y > 2.5f * lineH) return false;
+    const float maxW = (a.w > b.w) ? a.w : b.w;
+    const float dx   = (a.x + a.w * 0.5f) - (b.x + b.w * 0.5f);
+    if ((dx < 0.0f ? -dx : dx) > maxW * 0.8f) return false;
+    return true;
+}
+
 } // namespace
 
 // === STEP 2-0: OCR 오류 보정 ===
@@ -1026,10 +1039,36 @@ std::vector<SecureCastOcrBox> SecureCastOcrEngine::detect_pii(
             }
         }
 
-        // === STEP 2-2-A: 주소 탐지 ===
+        // === STEP 2-2-A: 주소 탐지 (단일 라인) ===
         // 예: 주소:서울시, 서울시 강남구, 역삼동, 테헤란로 등
         if (type == nullptr && looks_like_korean_address_text(rawText)) {
             type = "ADDRESS";
+        }
+
+        // === STEP 2-2-A2: 주소 탐지 (멀티라인 결합) ===
+        // OCR이 "서울" / "강남구 역삼로 123" 처럼 줄을 쪼갠 경우:
+        // 인접한 다음 줄과 합쳐서 재검사 → 두 줄 모두 박스 추가 후 i+1 스킵.
+        // 단, line i에 지역어 또는 주소 라벨이 없으면 스킵 (이름+숫자 오탐 방지).
+        if (type == nullptr && i + 1 < static_cast<int>(lines.size())) {
+            if (contains_any(rawText, {
+                    "주소", "주소지", "거주지", "소재지", "사는곳", "배송지",
+                    "서울", "부산", "대구", "인천", "광주", "대전", "울산", "세종",
+                    "경기", "강원", "충북", "충남", "충청", "전북", "전남", "전라",
+                    "경북", "경남", "경상", "제주"
+                }) &&
+                lines_visually_adjacent(lines[i], lines[i + 1])) {
+                const std::string combined = rawText + " " + lines[i + 1].text;
+                if (looks_like_korean_address_text(combined)) {
+                    boxes.push_back(SecureCastOcrBox{
+                        "ADDRESS", line.x, line.y, line.w, line.h});
+                    boxes.push_back(SecureCastOcrBox{
+                        "ADDRESS",
+                        lines[i + 1].x, lines[i + 1].y,
+                        lines[i + 1].w, lines[i + 1].h});
+                    ++i;
+                    continue;
+                }
+            }
         }
 
         // === STEP 2-3: 숫자형 개인정보 탐지 ===
