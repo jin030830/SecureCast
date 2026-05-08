@@ -207,6 +207,8 @@ if(WIN32)
       src/win_event_listener.h
       src/gpu-readback.cpp        # Role C: GPU-CPU 비동기 Readback
       src/gpu-readback.h
+      src/overlay-window.cpp      # Role D: 스트리머 전용 보안 상태 HUD (캡처 제외)
+      src/overlay-window.h
   )
 endif()
 

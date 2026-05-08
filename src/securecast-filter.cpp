@@ -710,7 +710,7 @@ static void* securecast_create(obs_data_t* settings, obs_source_t* context)
     SecureCastFilter* filter = new SecureCastFilter();
     filter->context      = context;
     filter->isActive     = true;
-    filter->isGameMode   = false;
+    // filter->isGameMode = false;  // [v2] 게임 모드 — 현재 스코프 외
     filter->currentState = SecurityState::SAFE;
     filter->trackerAccumulator = 0.0f;  // window_tracker tick throttle 누산기
 
@@ -723,6 +723,12 @@ static void* securecast_create(obs_data_t* settings, obs_source_t* context)
     obs_leave_graphics();
 
     // [C-3 수정] fullScreenBuffer 미사용 멤버 제거. 실제 해시 입력은 readbackBuffer.data()(슬롯 0)에서 가져옴.
+
+#ifdef _WIN32
+    // [Role D] 스트리머 전용 오버레이 HUD 시작 (OBS 캡처에서 자동 제외)
+    if (!filter->overlay.create())
+        blog(LOG_WARNING, "[SecureCast][D] OverlayWindow 생성 실패 — HUD 없이 계속.");
+#endif
 
     blog(LOG_INFO, "Filter created (Role C: 2-Stage Gate Pipeline Active).");
 
@@ -781,6 +787,8 @@ static void securecast_destroy(void* data)
     }
 
 #ifdef _WIN32
+    // [Role D] 오버레이 HUD 먼저 종료 (메시지 루프 스레드 join)
+    filter->overlay.destroy();
     filter->winListener.stop();
 #endif
 
@@ -826,9 +834,14 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
     (void)effect;
 
     SecureCastFilter* filter = static_cast<SecureCastFilter*>(data);
-    if (!filter->isActive) {
-        obs_source_skip_video_filter(filter->context);
-        return;
+
+    // [Role D] isActive는 GUI 스레드(update)에서도 쓸 수 있으므로 settingsMutex로 보호
+    {
+        std::lock_guard<std::mutex> lock(filter->settingsMutex);
+        if (!filter->isActive) {
+            obs_source_skip_video_filter(filter->context);
+            return;
+        }
     }
 
     // 상위 소스의 실제 해상도 가져오기
@@ -978,13 +991,23 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
         blacklistSnapshot = filter->blacklistMask;
     }
 
-    if (filter->health.isCritical()) {
-        filter->currentState = SecurityState::RISK;
-    } else if (ocrSnapshot.rectCount > 0 || blacklistSnapshot.rectCount > 0) {
-        filter->currentState = SecurityState::PARTIAL;
-    } else {
-        filter->currentState = SecurityState::SAFE;
+    // [Role D] currentState 갱신 — settingsMutex로 보호 (GUI 스레드와 data race 방지)
+    SecurityState newState;
+    {
+        std::lock_guard<std::mutex> lock(filter->settingsMutex);
+        if (filter->health.isCritical()) {
+            filter->currentState = SecurityState::RISK;
+        } else if (ocrSnapshot.rectCount > 0 || blacklistSnapshot.rectCount > 0) {
+            filter->currentState = SecurityState::PARTIAL;
+        } else {
+            filter->currentState = SecurityState::SAFE;
+        }
+        newState = filter->currentState;
     }
+#ifdef _WIN32
+    // [Role D] 오버레이 HUD에 상태 동기화 (PostMessage → thread-safe, non-blocking)
+    filter->overlay.setState(newState);
+#endif
 
 #ifdef _WIN32
     // ---------------------------------------------------------
@@ -1040,6 +1063,7 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
                     */
                     // [Role B 연계 포인트]
                     // filter->aiWorker.feedFrame(result);
+                    (void)finalBox;
                 }
             } else {
                 // [C2-3 수정] static → 멤버 변수 사용 (다중 인스턴스 공유 방지)
@@ -1158,6 +1182,57 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
         }
     }
 
+    // [Role D] 블랙리스트 마스크를 불투명 검정으로 최우선 덮어씌우기 (blur shader 위에 덮어씀)
+    if (blacklistSnapshot.rectCount > 0) {
+        gs_effect_t* solid = obs_get_base_effect(OBS_EFFECT_SOLID);
+        gs_effect_set_color(gs_effect_get_param_by_name(solid, "color"), 0xFF000000);
+        gs_matrix_push();
+        while (gs_effect_loop(solid, "Solid")) {
+            for (int i = 0; i < blacklistSnapshot.rectCount; i++) {
+                const BlurRect& r = blacklistSnapshot.rects[i];
+                gs_matrix_identity();
+                gs_matrix_translate3f((float)r.x, (float)r.y, 0.0f);
+                gs_draw_sprite(nullptr, 0, (uint32_t)r.width, (uint32_t)r.height);
+            }
+        }
+        gs_matrix_pop();
+    }
+
+    // --- [Role D] 보안 상태 테두리 오버레이 ---
+    // gs_effect_set_color()는 OBS ARGB 포맷: 상위 바이트부터 A·R·G·B 순서
+    //   SAFE    0xFF00FF00 : A=FF R=00 G=FF B=00 → 초록
+    //   PARTIAL 0xFFFFFF00 : A=FF R=FF G=FF B=00 → 노랑
+    //   RISK    0xFFFF0000 : A=FF R=FF G=00 B=00 → 빨강
+    {
+        uint32_t borderColor = 0xFF00FF00; // SAFE: 초록
+        if (newState == SecurityState::PARTIAL)
+            borderColor = 0xFFFFFF00;      // PARTIAL: 노랑
+        else if (newState == SecurityState::RISK)
+            borderColor = 0xFFFF0000;      // RISK: 빨강
+
+        const int BORDER = 6;
+        gs_effect_t* solid = obs_get_base_effect(OBS_EFFECT_SOLID);
+        gs_eparam_t* colorParam = gs_effect_get_param_by_name(solid, "color");
+        gs_effect_set_color(colorParam, borderColor);
+
+        gs_matrix_push();
+        while (gs_effect_loop(solid, "Solid")) {
+            gs_matrix_identity();
+            gs_matrix_translate3f(0.0f, 0.0f, 0.0f);
+            gs_draw_sprite(nullptr, 0, w, (uint32_t)BORDER);
+            gs_matrix_identity();
+            gs_matrix_translate3f(0.0f, (float)(h - BORDER), 0.0f);
+            gs_draw_sprite(nullptr, 0, w, (uint32_t)BORDER);
+            gs_matrix_identity();
+            gs_matrix_translate3f(0.0f, 0.0f, 0.0f);
+            gs_draw_sprite(nullptr, 0, (uint32_t)BORDER, h);
+            gs_matrix_identity();
+            gs_matrix_translate3f((float)(w - BORDER), 0.0f, 0.0f);
+            gs_draw_sprite(nullptr, 0, (uint32_t)BORDER, h);
+        }
+        gs_matrix_pop();
+    }
+
 #ifdef _WIN32
     // 게임 모드 활성 시: 우상단에 빨간 네모 박스 표시 (임시 인디케이터)
     if (filter->isGameMode) {
@@ -1189,6 +1264,7 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
     }
 #endif
 }
+
 // ---------------------------------------------------------
 // Tick (Slow-Path) — 매 프레임 호출되지만 윈도우 추적은 0.15초마다
 // ---------------------------------------------------------
@@ -1202,8 +1278,13 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
 static void securecast_video_tick(void* data, float seconds)
 {
     SecureCastFilter* filter = (SecureCastFilter*)data;
-    if (!filter || !filter->isActive)
-        return;
+
+    // [Role D] isActive는 GUI 스레드(update)에서도 쓸 수 있으므로 settingsMutex로 보호
+    {
+        std::lock_guard<std::mutex> lock(filter->settingsMutex);
+        if (!filter || !filter->isActive)
+            return;
+    }
 
 #ifdef _WIN32
     // ── CPU 샘플링 & 게임 모드 상태머신 (1초 주기) ──────────────────────
@@ -1285,6 +1366,24 @@ static void securecast_video_tick(void* data, float seconds)
     const float scanInterval = filter->isGameMode ? SCAN_INTERVAL_GAME : SCAN_INTERVAL_NORMAL;
     sc_tracker_tick(seconds, &filter->trackerAccumulator, &filter->windowList, scanInterval);
 
+    // [Role D] windowList 스캔 결과를 blacklistMask에 반영 (video_render에서 최우선 차단에 사용)
+    {
+        std::lock_guard<std::mutex> lock(filter->blacklistMutex);
+        filter->blacklistMask.rectCount = (filter->windowList.count > SC_MAX_BLUR_RECTS)
+                                              ? SC_MAX_BLUR_RECTS : filter->windowList.count;
+        for (int i = 0; i < filter->blacklistMask.rectCount; ++i) {
+            filter->blacklistMask.rects[i] = {
+                (int)filter->windowList.items[i].bounds.left,
+                (int)filter->windowList.items[i].bounds.top,
+                (int)(filter->windowList.items[i].bounds.right  - filter->windowList.items[i].bounds.left),
+                (int)(filter->windowList.items[i].bounds.bottom - filter->windowList.items[i].bounds.top),
+                0
+            };
+        }
+        if (filter->windowList.count > 0 && filter->logScanThrottle++ % 10 == 0)
+            blog(LOG_INFO, "[SecureCast] %d blacklisted windows in blacklistMask.", filter->windowList.count);
+    }
+
     // recentlySeenList 유지: windowList 항목을 upsert, 완전히 닫힌 HWND 제거.
     // recentlySeenList는 앱이 다시 등장했을 때 quick restore의 소스가 된다.
     for (int wi = 0; wi < filter->windowList.count; ++wi) {
@@ -1364,7 +1463,59 @@ static void securecast_video_tick(void* data, float seconds)
     }
 #endif
 }
-  
+
+// ================================================================
+// [Role D] Properties UI
+// ================================================================
+
+#define SC_SETTING_BLACKLIST      "sc_blacklist"
+#define SC_SETTING_BLUR_INTENSITY "sc_blur_intensity"
+// #define SC_SETTING_GAME_MODE   "sc_game_mode"  // [v2] 게임 모드 — 현재 스코프 외
+#define SC_SETTING_SENSITIVITY    "sc_sensitivity"
+
+static void securecast_get_defaults(obs_data_t* settings)
+{
+    obs_data_set_default_string(settings, SC_SETTING_BLACKLIST,      "");
+    obs_data_set_default_double(settings, SC_SETTING_BLUR_INTENSITY, 5.0);
+    // obs_data_set_default_bool(settings, SC_SETTING_GAME_MODE, false);  // [v2]
+    obs_data_set_default_double(settings, SC_SETTING_SENSITIVITY,    0.5);
+}
+
+static obs_properties_t* securecast_get_properties(void* data)
+{
+    (void)data;
+    obs_properties_t* props = obs_properties_create();
+
+    obs_properties_add_text(props, SC_SETTING_BLACKLIST,
+        "Blacklist Apps (one per line)", OBS_TEXT_MULTILINE);
+
+    obs_properties_add_float_slider(props, SC_SETTING_BLUR_INTENSITY,
+        "Blur Intensity", 1.0, 10.0, 0.5);
+
+    // obs_properties_add_bool(props, SC_SETTING_GAME_MODE, "Game Mode");  // [v2]
+
+    obs_properties_add_float_slider(props, SC_SETTING_SENSITIVITY,
+        "Detection Sensitivity", 0.0, 1.0, 0.05);
+
+    return props;
+}
+
+// GUI 스레드에서 호출되므로 settingsMutex로 보호 (Render Thread와 data race 방지)
+static void securecast_update(void* data, obs_data_t* settings)
+{
+    SecureCastFilter* filter = static_cast<SecureCastFilter*>(data);
+
+    std::lock_guard<std::mutex> lock(filter->settingsMutex);
+
+    filter->blacklistApps = obs_data_get_string(settings, SC_SETTING_BLACKLIST);
+    filter->blurIntensity = (float)obs_data_get_double(settings, SC_SETTING_BLUR_INTENSITY);
+    // filter->isGameMode = obs_data_get_bool(settings, SC_SETTING_GAME_MODE);  // [v2]
+    filter->sensitivity   = (float)obs_data_get_double(settings, SC_SETTING_SENSITIVITY);
+
+    blog(LOG_INFO, "[SecureCast][D] Settings updated — blur=%.1f sensitivity=%.2f",
+         filter->blurIntensity, filter->sensitivity);
+}
+
 // ================================================================
 // Source Info Dispatch Table
 // ---------------------------------------------------------
@@ -1383,10 +1534,13 @@ struct obs_source_info securecast_filter_info = []() {
     info.id           = "securecast_filter";
     info.type         = OBS_SOURCE_TYPE_FILTER;
     info.output_flags = OBS_SOURCE_VIDEO;
-    info.get_name = securecast_get_name;
-    info.create = securecast_create;
-    info.destroy = securecast_destroy;
-    info.video_tick = securecast_video_tick;
-    info.video_render = securecast_video_render;
+    info.get_name       = securecast_get_name;
+    info.create         = securecast_create;
+    info.destroy        = securecast_destroy;
+    info.video_tick     = securecast_video_tick;
+    info.video_render   = securecast_video_render;
+    info.get_properties = securecast_get_properties;
+    info.get_defaults   = securecast_get_defaults;
+    info.update         = securecast_update;
     return info;
 }();
