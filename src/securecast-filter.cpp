@@ -637,11 +637,50 @@ static void ocr_worker_loop(SecureCastFilter* filter)
         if (!ocrReady || pixels.empty() || width <= 0 || height <= 0 || stride <= 0)
             continue;
 
-        auto ocrBoxes = filter->ocrEngine->analyze_bgra_frame(
-            pixels.data(), width, height, stride);
+        // P2-F: 2× box-average 다운스케일 (960×540 for 1080p).
+        // OCR 픽셀 처리량 1/4, recognize_text 팩킹 비용 1/4 절감.
+        // 최소 640×360 미만이면 스킵 (너무 작으면 OCR 정확도 하락).
+        // register_or_update는 원본 full-res pixels + 스케일업 좌표로 호출.
+        const int dstW = width / 2;
+        const int dstH = height / 2;
+        const bool doScale = (dstW >= 640 && dstH >= 360);
+        std::vector<uint8_t> downscaled;
+        float coordScale = 1.0f;
+        if (doScale) {
+            downscaled.resize((size_t)dstW * dstH * 4);
+            for (int dy = 0; dy < dstH; ++dy) {
+                for (int dx = 0; dx < dstW; ++dx) {
+                    const uint8_t* p0 = pixels.data() + (ptrdiff_t)(2*dy    ) * stride + (2*dx    ) * 4;
+                    const uint8_t* p1 = pixels.data() + (ptrdiff_t)(2*dy    ) * stride + (2*dx + 1) * 4;
+                    const uint8_t* p2 = pixels.data() + (ptrdiff_t)(2*dy + 1) * stride + (2*dx    ) * 4;
+                    const uint8_t* p3 = pixels.data() + (ptrdiff_t)(2*dy + 1) * stride + (2*dx + 1) * 4;
+                    uint8_t* dst = downscaled.data() + (ptrdiff_t)dy * dstW * 4 + dx * 4;
+                    dst[0] = (uint8_t)(((int)p0[0] + p1[0] + p2[0] + p3[0]) >> 2);
+                    dst[1] = (uint8_t)(((int)p0[1] + p1[1] + p2[1] + p3[1]) >> 2);
+                    dst[2] = (uint8_t)(((int)p0[2] + p1[2] + p2[2] + p3[2]) >> 2);
+                    dst[3] = 255;
+                }
+            }
+            coordScale = 2.0f;
+        }
+
+        const uint8_t* ocrPx      = doScale ? downscaled.data() : pixels.data();
+        const int      ocrW2      = doScale ? dstW : width;
+        const int      ocrH2      = doScale ? dstH : height;
+        const int      ocrStride2 = doScale ? dstW * 4 : stride;
+
+        auto ocrBoxes = filter->ocrEngine->analyze_bgra_frame(ocrPx, ocrW2, ocrH2, ocrStride2);
+
+        // 다운스케일 시 좌표를 원본 해상도로 복원
+        if (doScale) {
+            for (auto& b : ocrBoxes) {
+                b.x *= coordScale; b.y *= coordScale;
+                b.w *= coordScale; b.h *= coordScale;
+            }
+        }
 
         // Visual Tracker: OCR 결과로 트래커 등록/갱신.
-        // 같은 pixels를 사용하므로 OCR 박스와 템플릿이 동일 프레임 기준으로 정렬됨.
+        // 템플릿 추출은 full-res pixels 기준이므로 원본 좌표를 그대로 사용.
         {
             std::vector<VtOcrBox> vtBoxes;
             vtBoxes.reserve(ocrBoxes.size());
