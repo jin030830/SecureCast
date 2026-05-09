@@ -503,53 +503,6 @@ static bool read_texture_bgra_to_cpu(
 // [Role B] OCR worker 보조 함수
 // ================================================================
 
-static MaskPayload build_mask_payload_from_ocr_boxes(
-    const std::vector<SecureCastOcrBox>& boxes,
-    int frameWidth,
-    int frameHeight)
-{
-    MaskPayload payload{};
-    payload.rectCount = 0;
-
-    const int maxRects = (int)(sizeof(payload.rects) / sizeof(payload.rects[0]));
-    const uint64_t nowMs = os_gettime_ns() / 1000000;
-
-    for (const auto& box : boxes) {
-        if (payload.rectCount >= maxRects)
-            break;
-
-        int x      = static_cast<int>(box.x);
-        int y      = static_cast<int>(box.y);
-        int width  = static_cast<int>(box.w);
-        int height = static_cast<int>(box.h);
-
-        if (x < 0) x = 0;
-        if (y < 0) y = 0;
-
-        if (x >= frameWidth || y >= frameHeight)
-            continue;
-
-        if (x + width > frameWidth)
-            width = frameWidth - x;
-
-        if (y + height > frameHeight)
-            height = frameHeight - y;
-
-        if (width <= 0 || height <= 0)
-            continue;
-
-        BlurRect& r = payload.rects[payload.rectCount++];
-        r.x        = x;
-        r.y        = y;
-        r.width    = width;
-        r.height   = height;
-        r.type     = 1;
-        r.expireTs = nowMs + 200; // 200ms: OCR 다음 사이클까지만 유지 (잔상 최소화)
-    }
-
-    return payload;
-}
-
 static void clear_pending_ocr_frame(SecureCastFilter* filter)
 {
     if (!filter)
@@ -674,8 +627,10 @@ static void ocr_worker_loop(SecureCastFilter* filter)
         // 다운스케일 시 좌표를 원본 해상도로 복원
         if (doScale) {
             for (auto& b : ocrBoxes) {
-                b.x *= coordScale; b.y *= coordScale;
-                b.w *= coordScale; b.h *= coordScale;
+                b.x = std::round(b.x * coordScale);
+                b.y = std::round(b.y * coordScale);
+                b.w = std::round(b.w * coordScale);
+                b.h = std::round(b.h * coordScale);
             }
         }
 
@@ -732,8 +687,8 @@ static void tracker_thread_loop(SecureCastFilter* filter)
 #endif
 
     while (filter->trackerThreadRunning_.load(std::memory_order_acquire)) {
-        std::vector<uint8_t> pixels;
-        int w = 0, h = 0, stride = 0;
+        std::vector<uint8_t> gray;
+        int w = 0, h = 0;
 
         {
             std::unique_lock<std::mutex> lock(filter->trackerInputMutex_);
@@ -744,15 +699,15 @@ static void tracker_thread_loop(SecureCastFilter* filter)
             if (!filter->trackerThreadRunning_.load(std::memory_order_acquire))
                 break;
 
-            pixels.swap(filter->trackerInputPixels_);
-            w      = filter->trackerInputW_;
-            h      = filter->trackerInputH_;
-            stride = filter->trackerInputStride_;
+            // P0-4: gray 버퍼 수신 (BGRA→gray 변환은 렌더 스레드에서 완료)
+            gray.swap(filter->trackerInputGray_);
+            w = filter->trackerInputW_;
+            h = filter->trackerInputH_;
             filter->trackerInputReady_ = false;
         }
 
-        if (!pixels.empty() && w > 0 && h > 0 && stride > 0)
-            filter->trackerMgr.update_all(pixels.data(), w, h, stride);
+        if (!gray.empty() && w > 0 && h > 0)
+            filter->trackerMgr.update_all_gray(gray.data(), w, h);
     }
 }
 
@@ -1233,14 +1188,19 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
                 }
             }
 
-            // Tracker thread에 swap 전달 (O(1), 항상 30Hz)
+            // P0-4: BGRA→gray 변환을 렌더 스레드에서 한 번만 수행
+            // (tracker thread 내부의 bgra_to_gray 호출 제거 → 5ms 절감)
+            std::vector<uint8_t> grayPixels;
+            VisualTrackerManager::bgra_to_gray(bgraPixels.data(), (int)w, (int)h,
+                                               stride, grayPixels);
+
+            // Tracker thread에 gray swap 전달 (O(1), 항상 30Hz)
             {
                 std::lock_guard<std::mutex> lock(filter->trackerInputMutex_);
-                filter->trackerInputPixels_.swap(bgraPixels);
-                filter->trackerInputW_      = (int)w;
-                filter->trackerInputH_      = (int)h;
-                filter->trackerInputStride_ = stride;
-                filter->trackerInputReady_  = true;
+                filter->trackerInputGray_.swap(grayPixels);
+                filter->trackerInputW_     = (int)w;
+                filter->trackerInputH_     = (int)h;
+                filter->trackerInputReady_ = true;
             }
             filter->trackerInputCv_.notify_one();
         } else {

@@ -122,24 +122,6 @@ private:
         const uint8_t* px, int width, int height, int stride,
         int cx, int cy, int cw, int ch);
 
-    // ========================================================
-    // IoU 기반 박스 트래커 — OCR 깜빡임 제거 + EMA 좌표 보정
-    //
-    // 매 OCR 사이클마다:
-    //   1) 신규 박스 N개 × 기존 트래커 M개 IoU 행렬 계산
-    //   2) IoU >= 0.3 greedy 매칭 → 좌표 EMA 업데이트 (0.7×old + 0.3×new)
-    //   3) 매칭 안 된 신규 박스 → 신규 트래커 추가
-    //   4) 매칭 안 된 기존 트래커 → missingFrames++; >= 12면 제거
-    // ========================================================
-    struct TrackedBox {
-        SecureCastOcrBox box;
-        int missingFrames = 0;
-    };
-    std::vector<TrackedBox> trackers_;
-    static float iou(const SecureCastOcrBox& a, const SecureCastOcrBox& b);
-    std::vector<SecureCastOcrBox> apply_tracker(
-        const std::vector<SecureCastOcrBox>& detections);
-
     // === Windows.Media.Ocr — 텍스트와 좌표 추출 ===
     std::vector<SecureCastOcrLine> recognize_text(
         const uint8_t *pixels,

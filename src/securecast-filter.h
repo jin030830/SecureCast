@@ -320,24 +320,16 @@ struct SecureCastFilter {
 
     // ----- [P1] 30Hz Visual Tracker Thread -----
     // NCC 연산(CPU-only)을 렌더 스레드에서 분리. GPU readback은 렌더 스레드,
-    // update_all()은 이 스레드가 담당. register_or_update()는 OCR 워커가 호출.
+    // update_all_gray()는 이 스레드가 담당. register_or_update()는 OCR 워커가 호출.
     std::thread             trackerThread_;
     std::mutex              trackerInputMutex_;
     std::condition_variable trackerInputCv_;
-    std::vector<uint8_t>   trackerInputPixels_;  // swap으로 넘겨받는 최신 픽셀
+    // P0-4: BGRA→gray 변환을 렌더 스레드에서 한 번만 수행; gray 버퍼를 swap으로 전달
+    std::vector<uint8_t>   trackerInputGray_;   // grayscale (stride = trackerInputW_)
     int                    trackerInputW_      = 0;
     int                    trackerInputH_      = 0;
-    int                    trackerInputStride_ = 0;
     bool                   trackerInputReady_  = false;
     std::atomic<bool>      trackerThreadRunning_{false};
     int                    trackerFrameSkip_   = 0; // 30Hz gate: 2프레임마다 readback
 
-    // ── OCR 박스 누적 + TTL 관리 ─────────────────────────────────
-    // lastMask.rects[i]의 잔여 수명. 매 OCR 사이클마다 1씩 감소.
-    // OCR이 같은 위치의 박스를 다시 감지하면 TTL이 SC_OCR_BOX_TTL로 리셋된다.
-    // TTL이 0이 된 박스만 제거하므로, OCR이 한두 번 놓쳐도 마스크가 유지된다.
-    int ocrBoxTtl[SC_MAX_BLUR_RECTS]{};
-    static constexpr int SC_OCR_BOX_TTL = 6;    // 6 사이클 연속 미매칭 시 cycle TTL 만료
-    int emptyResultStreak = 0;                   // 연속 빈 OCR 결과 횟수
-    static constexpr int SC_EMPTY_HYSTERESIS = 1; // 빈 결과 즉시 반영 (잔상 최소화)
 };

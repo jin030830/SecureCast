@@ -92,7 +92,6 @@ bool SecureCastOcrEngine::init()
         consecutiveSkips_ = 0;
         lastBoxes_.clear();
         lastLineDhashes_.clear();
-        trackers_.clear();
         impl_->lastFrameWidth = -1;
         impl_->lastFrameHeight = -1;
 
@@ -147,9 +146,8 @@ std::vector<SecureCastOcrBox> SecureCastOcrEngine::analyze_bgra_frame(
         impl_->lastFrameWidth == width &&
         impl_->lastFrameHeight == height;
 
-    // 해상도 변경 시 모든 트래킹 상태 초기화
+    // 해상도 변경 시 모든 캐시 상태 초기화
     if (!sameRes) {
-        trackers_.clear();
         lastLineDhashes_.clear();
         hasLastRoiDhash_ = false;
         consecutiveSkips_ = 0;
@@ -204,9 +202,7 @@ std::vector<SecureCastOcrBox> SecureCastOcrEngine::analyze_bgra_frame(
         }
 
         if (anyChanged) {
-            merged = apply_tracker(merged); // EMA 보정 + stability 필터
-            lastRoiDhash_ =
-                compute_roi_dhash(pixels, stride, width, height, merged);
+            lastRoiDhash_ = compute_roi_dhash(pixels, stride, width, height, merged);
             lastBoxes_ = merged;
             return merged; // L2 hit (partial)
         }
@@ -215,21 +211,11 @@ std::vector<SecureCastOcrBox> SecureCastOcrEngine::analyze_bgra_frame(
 
     // ── Full OCR ──────────────────────────────────────────────────
     auto lines = recognize_text(pixels, width, height, stride);
-    const auto rawBoxes = detect_pii(lines); // OCR 원본 결과 (tracker 보정 전)
+    auto boxes = detect_pii(lines);
 
-    // 트래커 적용: EMA 좌표 보정 + missingFrames 기반 stability 필터
-    auto boxes = apply_tracker(rawBoxes);
-
-    // L1 캐시 갱신:
-    //   OCR miss지만 tracker 생존 중 → L1 갱신 안 함.
-    //   다음 프레임도 full OCR 강제해 missingFrames를 빠르게 소진.
-    //   (트래커가 죽은 빈 위치를 L1이 stable로 캐싱하면 잔상이 수 초 지속됨)
-    if (!rawBoxes.empty() || boxes.empty()) {
-        lastRoiDhash_ = compute_roi_dhash(pixels, stride, width, height, boxes);
-        hasLastRoiDhash_ = true;
-    } else {
-        hasLastRoiDhash_ = false; // OCR miss + tracker 생존 → L1 무효화
-    }
+    // L1 캐시 갱신 (VisualTracker가 좌표 추적 담당, OCR은 탐지/확인만 수행)
+    lastRoiDhash_ = compute_roi_dhash(pixels, stride, width, height, boxes);
+    hasLastRoiDhash_ = true;
     impl_->lastFrameWidth  = width;
     impl_->lastFrameHeight = height;
     lastBoxes_ = boxes;
@@ -259,96 +245,6 @@ std::vector<SecureCastOcrBox> SecureCastOcrEngine::analyze_bgra_frame(
     }
 
     return boxes;
-}
-
-// ============================================================
-// IoU 기반 박스 트래커
-// ============================================================
-
-float SecureCastOcrEngine::iou(const SecureCastOcrBox& a, const SecureCastOcrBox& b) {
-    float ix1 = std::max(a.x, b.x);
-    float iy1 = std::max(a.y, b.y);
-    float ix2 = std::min(a.x + a.w, b.x + b.w);
-    float iy2 = std::min(a.y + a.h, b.y + b.h);
-    float iw = std::max(0.f, ix2 - ix1);
-    float ih = std::max(0.f, iy2 - iy1);
-    float inter = iw * ih;
-    if (inter <= 0.f) return 0.f;
-    float uni = a.w * a.h + b.w * b.h - inter;
-    return (uni > 0.f) ? inter / uni : 0.f;
-}
-
-std::vector<SecureCastOcrBox> SecureCastOcrEngine::apply_tracker(
-    const std::vector<SecureCastOcrBox>& dets)
-{
-    const int T = (int)trackers_.size();
-    const int D = (int)dets.size();
-
-    // IoU 행렬 (T × D)
-    std::vector<float> iouMat(static_cast<size_t>(T) * D, 0.f);
-    for (int t = 0; t < T; ++t)
-        for (int d = 0; d < D; ++d)
-            iouMat[t * D + d] = iou(trackers_[t].box, dets[d]);
-
-    std::vector<bool> matchedT(T, false), matchedD(D, false);
-
-    // Greedy 매칭: 가장 높은 IoU 쌍부터 처리
-    for (;;) {
-        float best = 0.3f; // IoU 최소 임계값
-        int bt = -1, bd = -1;
-        for (int t = 0; t < T; ++t) {
-            if (matchedT[t]) continue;
-            for (int d = 0; d < D; ++d) {
-                if (!matchedD[d] && iouMat[t * D + d] > best) {
-                    best = iouMat[t * D + d]; bt = t; bd = d;
-                }
-            }
-        }
-        if (bt == -1) break;
-
-        // EMA 업데이트: 0.5 × old + 0.5 × new
-        // 0.7 → 0.5: 화면 콘텐츠가 이동할 때 잔상 위치에서 빠르게 추종.
-        auto& tr = trackers_[bt];
-        const auto& det = dets[bd];
-        tr.box.x = 0.5f * tr.box.x + 0.5f * det.x;
-        tr.box.y = 0.5f * tr.box.y + 0.5f * det.y;
-        tr.box.w = 0.5f * tr.box.w + 0.5f * det.w;
-        tr.box.h = 0.5f * tr.box.h + 0.5f * det.h;
-        tr.box.type = det.type; // 타입 갱신 (예: RRN → PHONE 전환)
-        tr.missingFrames = 0;
-        matchedT[bt] = true;
-        matchedD[bd] = true;
-    }
-
-    // 매칭 안 된 detection → 신규 트래커로 추가.
-    // 추가 전에 unmatched 수를 세어 kill 임계값 결정에 사용.
-    int unmatchedDets = 0;
-    for (int d = 0; d < D; ++d)
-        if (!matchedD[d]) ++unmatchedDets;
-    for (int d = 0; d < D; ++d)
-        if (!matchedD[d])
-            trackers_.push_back({dets[d], 0});
-
-    // 매칭 안 된 기존 트래커 → missingFrames 증가
-    for (int t = 0; t < T; ++t)
-        if (!matchedT[t])
-            ++trackers_[t].missingFrames;
-
-    // Smart kill:
-    //   새 탐지가 있는데 기존 트래커가 매칭 못 됨 → 텍스트가 다른 위치로 이동한 것
-    //   → 2 miss(~0.5s@4Hz)만에 제거해 잔상 제거.
-    //   새 탐지가 없음 → OCR 간헐적 miss → 6 miss(~1.5s@4Hz)까지 유지해 깜빡임 방지.
-    const int killThreshold = (unmatchedDets > 0) ? 2 : 6;
-    for (int t = (int)trackers_.size() - 1; t >= 0; --t)
-        if (trackers_[t].missingFrames >= killThreshold)
-            trackers_.erase(trackers_.begin() + t);
-
-    // 현재 트래커 상태(EMA 좌표)를 반환
-    std::vector<SecureCastOcrBox> result;
-    result.reserve(trackers_.size());
-    for (const auto& tr : trackers_)
-        result.push_back(tr.box);
-    return result;
 }
 
 // ============================================================
