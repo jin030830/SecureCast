@@ -211,7 +211,8 @@ std::vector<SecureCastOcrBox> SecureCastOcrEngine::analyze_bgra_frame(
 
     // ── Full OCR ──────────────────────────────────────────────────
     auto lines = recognize_text(pixels, width, height, stride);
-    auto boxes = detect_pii(lines);
+    // P3: 높이 < 20px 라인을 2× 업스케일 재OCR 후 detect_pii (최대 3개 라인)
+    auto boxes = detect_pii(multipass_small_text(lines, pixels, width, height, stride));
 
     // L1 캐시 갱신 (VisualTracker가 좌표 추적 담당, OCR은 탐지/확인만 수행)
     lastRoiDhash_ = compute_roi_dhash(pixels, stride, width, height, boxes);
@@ -920,6 +921,49 @@ std::vector<SecureCastOcrBox> SecureCastOcrEngine::detect_pii(
             }
         }
 
+        // P2-(a): OCR 라인 분할 이메일 조립
+        // OCR이 "user" / "@gmail.com" 처럼 @ 앞뒤를 다른 줄로 쪼개는 경우 결합 후 재검사.
+        if (type == nullptr) {
+            if (!rawText.empty() && rawText[0] == '@' && i > 0) {
+                // 현재 라인이 @-파트 → 직전 라인과 결합
+                const std::string combined = lines[i-1].text + rawText;
+                std::string emailMatch;
+                if (RE2::PartialMatch(combined, PATTERN_EMAIL, &emailMatch) &&
+                    valid_email(emailMatch))
+                    type = "EMAIL";
+            }
+            if (type == nullptr && i + 1 < static_cast<int>(lines.size())) {
+                const std::string& nextText = lines[i+1].text;
+                // 다음 라인이 @-파트 → 현재 라인과 결합
+                if (!nextText.empty() && nextText[0] == '@') {
+                    const std::string combined = rawText + nextText;
+                    std::string emailMatch;
+                    if (RE2::PartialMatch(combined, PATTERN_EMAIL, &emailMatch) &&
+                        valid_email(emailMatch))
+                        type = "EMAIL";
+                }
+            }
+        }
+
+        // P2-(b): 이메일 라벨 + @ 포함 → EMAIL (OCR 부분 인식 보완)
+        // valid_email을 통과하지 못하는 부분 이메일(TLD 잘림 등)이라도
+        // 인접 라인에 이메일 라벨이 있으면 마스킹한다.
+        if (type == nullptr && rawText.find('@') != std::string::npos) {
+            static const auto has_email_label = [](const std::string& t) -> bool {
+                return contains_any(t, {
+                    "이메일", "메일", "Email", "EMAIL", "E-mail", "e-mail",
+                    "메일주소", "이메일주소", "수신자", "보낸이"
+                });
+            };
+            bool labelFound = has_email_label(rawText);
+            for (int d = 1; d <= 2 && !labelFound; ++d) {
+                if (i - d >= 0) labelFound = has_email_label(lines[i-d].text);
+                if (!labelFound && i + d < static_cast<int>(lines.size()))
+                    labelFound = has_email_label(lines[i+d].text);
+            }
+            if (labelFound) type = "EMAIL";
+        }
+
         // === STEP 2-2-H: 이름 + 호칭 직접 탐지 (A-7) ===
         // "김철수님", "이민준씨" 처럼 호칭이 명시된 경우 고신뢰도 NAME 확정.
         // 성씨 시작 + 블랙리스트 통과 조건으로 "고객님", "선생님" 등 일반 호칭 배제.
@@ -1128,3 +1172,59 @@ std::vector<SecureCastOcrBox> SecureCastOcrEngine::detect_pii(
     return boxes;
 }
 
+// ============================================================
+// P3: 소형 글씨 다중 패스 OCR
+// 높이 < SMALL_H px 라인을 최대 MAX_PASSES개 2× nearest-neighbor 업스케일 후
+// 재OCR하여 detect_pii 입력 라인을 개선한다.
+// L2 캐시 갱신용 원본 lines는 호출부에서 따로 유지한다.
+// ============================================================
+std::vector<SecureCastOcrLine> SecureCastOcrEngine::multipass_small_text(
+    const std::vector<SecureCastOcrLine>& lines,
+    const uint8_t* pixels, int width, int height, int stride)
+{
+    static constexpr float SMALL_H    = 20.0f; // 이 높이 미만 라인을 재OCR
+    static constexpr int   MAX_PASSES = 3;     // 사이클당 재OCR 최대 횟수
+    static constexpr int   PAD        = 4;     // crop 여백 (px)
+
+    auto result = lines;
+    int passes = 0;
+
+    for (int i = 0; i < static_cast<int>(result.size()) && passes < MAX_PASSES; ++i) {
+        if (result[i].h >= SMALL_H) continue;
+
+        const auto& l  = result[i];
+        const int   cx = std::max(0, (int)l.x - PAD);
+        const int   cy = std::max(0, (int)l.y - PAD);
+        const int   cr = std::min((int)(l.x + l.w) + PAD, width);
+        const int   cb = std::min((int)(l.y + l.h) + PAD, height);
+        const int   cw = cr - cx, ch = cb - cy;
+        if (cw <= 0 || ch <= 0) continue;
+
+        // 2× nearest-neighbor 업스케일 (속도 우선; OCR 목적으로 충분)
+        const int upW = cw * 2, upH = ch * 2;
+        std::vector<uint8_t> up((size_t)upW * upH * 4);
+        for (int uy = 0; uy < upH; ++uy) {
+            for (int ux = 0; ux < upW; ++ux) {
+                const uint8_t* s = pixels + (ptrdiff_t)(cy + uy/2) * stride + (cx + ux/2) * 4;
+                uint8_t*       d = up.data() + (ptrdiff_t)uy * upW * 4 + ux * 4;
+                d[0]=s[0]; d[1]=s[1]; d[2]=s[2]; d[3]=s[3];
+            }
+        }
+
+        auto reLines = recognize_text(up.data(), upW, upH, upW * 4);
+        ++passes;
+        if (reLines.empty()) continue;
+
+        // 좌표 역변환: /2 + crop 오프셋
+        for (auto& rl : reLines) {
+            rl.x = cx + rl.x * 0.5f;
+            rl.y = cy + rl.y * 0.5f;
+            rl.w *= 0.5f;
+            rl.h *= 0.5f;
+        }
+
+        result[i] = reLines[0]; // 첫 번째 재OCR 라인으로 대체
+    }
+
+    return result;
+}

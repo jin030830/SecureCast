@@ -677,13 +677,13 @@ static void ocr_worker_loop(SecureCastFilter* filter)
         if (!ocrReady || pixels.empty() || width <= 0 || height <= 0 || stride <= 0)
             continue;
 
-        // P2-F: 2× box-average 다운스케일 (960×540 for 1080p).
-        // OCR 픽셀 처리량 1/4, recognize_text 팩킹 비용 1/4 절감.
-        // 최소 640×360 미만이면 스킵 (너무 작으면 OCR 정확도 하락).
-        // register_or_update는 원본 full-res pixels + 스케일업 좌표로 호출.
+        // P0: 1440p 이상(≥2560×1440) 소스만 2× 다운스케일.
+        // 기존 P2-F는 1080p도 절반으로 줄여 11~14px 본문이 5~7px로 떨어졌고
+        // Windows.Media.Ocr 정확도 한계(<8px) 아래로 내려가는 게 Chrome 이메일
+        // 미탐의 직접 원인이었다. 1080p 이하에서는 풀해상도 OCR로 복원한다.
         const int dstW = width / 2;
         const int dstH = height / 2;
-        const bool doScale = (dstW >= 640 && dstH >= 360);
+        const bool doScale = (width >= 2560 && height >= 1440) && (dstW >= 640 && dstH >= 360);
         std::vector<uint8_t> downscaled;
         float coordScale = 1.0f;
         if (doScale) {
@@ -709,15 +709,54 @@ static void ocr_worker_loop(SecureCastFilter* filter)
         const int      ocrH2      = doScale ? dstH : height;
         const int      ocrStride2 = doScale ? dstW * 4 : stride;
 
-        auto ocrBoxes = filter->ocrEngine->analyze_bgra_frame(ocrPx, ocrW2, ocrH2, ocrStride2);
+        // P1-a: 1080p 이하 소스는 1.5× bilinear 업스케일 후 OCR.
+        // 11px → 16.5px: Windows.Media.Ocr 신뢰 구간(14px+)으로 진입.
+        std::vector<uint8_t> upscaled;
+        float upScale = 1.0f;
+        if (!doScale && ocrW2 >= 640 && ocrH2 >= 360 && ocrW2 <= 1920 && ocrH2 <= 1080) {
+            const int upW = ocrW2 * 3 / 2;
+            const int upH = ocrH2 * 3 / 2;
+            upscaled.resize((size_t)upW * upH * 4);
+            for (int dy = 0; dy < upH; ++dy) {
+                const float sy  = (dy + 0.5f) * (float)ocrH2 / upH - 0.5f;
+                const int   sy0 = std::max(0, std::min((int)sy, ocrH2 - 1));
+                const int   sy1 = std::min(sy0 + 1, ocrH2 - 1);
+                const float fy  = sy - (float)sy0;
+                for (int dx = 0; dx < upW; ++dx) {
+                    const float sx  = (dx + 0.5f) * (float)ocrW2 / upW - 0.5f;
+                    const int   sx0 = std::max(0, std::min((int)sx, ocrW2 - 1));
+                    const int   sx1 = std::min(sx0 + 1, ocrW2 - 1);
+                    const float fx  = sx - (float)sx0;
+                    const uint8_t* p00 = ocrPx + (ptrdiff_t)sy0 * ocrStride2 + sx0 * 4;
+                    const uint8_t* p01 = ocrPx + (ptrdiff_t)sy0 * ocrStride2 + sx1 * 4;
+                    const uint8_t* p10 = ocrPx + (ptrdiff_t)sy1 * ocrStride2 + sx0 * 4;
+                    const uint8_t* p11 = ocrPx + (ptrdiff_t)sy1 * ocrStride2 + sx1 * 4;
+                    uint8_t* dst = upscaled.data() + (ptrdiff_t)dy * upW * 4 + dx * 4;
+                    for (int c = 0; c < 4; ++c) {
+                        float v = (1.0f - fy) * ((1.0f - fx) * p00[c] + fx * p01[c]) +
+                                  fy          * ((1.0f - fx) * p10[c] + fx * p11[c]);
+                        dst[c] = (v < 0.0f) ? 0 : (v > 255.0f) ? 255 : (uint8_t)(int)v;
+                    }
+                }
+            }
+            upScale = (float)upW / (float)ocrW2; // ≈ 1.5
+        }
 
-        // 다운스케일 시 좌표를 원본 해상도로 복원
-        if (doScale) {
+        const uint8_t* finalPx     = upscaled.empty() ? ocrPx      : upscaled.data();
+        const int      finalW      = upscaled.empty() ? ocrW2      : ocrW2 * 3 / 2;
+        const int      finalH      = upscaled.empty() ? ocrH2      : ocrH2 * 3 / 2;
+        const int      finalStride = upscaled.empty() ? ocrStride2 : (ocrW2 * 3 / 2) * 4;
+
+        auto ocrBoxes = filter->ocrEngine->analyze_bgra_frame(finalPx, finalW, finalH, finalStride);
+
+        // 좌표를 원본 해상도로 복원 (다운스케일 ×coordScale, 업스케일 ÷upScale)
+        const float finalCoordScale = coordScale / upScale;
+        if (finalCoordScale != 1.0f) {
             for (auto& b : ocrBoxes) {
-                b.x = std::round(b.x * coordScale);
-                b.y = std::round(b.y * coordScale);
-                b.w = std::round(b.w * coordScale);
-                b.h = std::round(b.h * coordScale);
+                b.x = std::round(b.x * finalCoordScale);
+                b.y = std::round(b.y * finalCoordScale);
+                b.w = std::round(b.w * finalCoordScale);
+                b.h = std::round(b.h * finalCoordScale);
             }
         }
 

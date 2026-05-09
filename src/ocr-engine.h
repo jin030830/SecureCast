@@ -133,6 +133,13 @@ private:
         const std::vector<SecureCastOcrLine>& lines
     );
 
+    // P3: 소형 글씨 다중 패스 OCR
+    // lines에서 높이 < 20px인 라인을 최대 MAX_PASSES개까지 2× 업스케일 재OCR.
+    // detect_pii에 넘기기 전에 호출한다. L2 캐시 갱신에는 원본 lines를 사용한다.
+    std::vector<SecureCastOcrLine> multipass_small_text(
+        const std::vector<SecureCastOcrLine>& lines,
+        const uint8_t* pixels, int width, int height, int stride);
+
     // === OCR 오류 보정: O/o → 0, I/l → 1 ===
     std::string normalize_numeric_candidate(
         const std::string& text
