@@ -634,15 +634,16 @@ static void ocr_worker_loop(SecureCastFilter* filter)
             }
         }
 
-        // Visual Tracker: OCR 결과로 트래커 등록/갱신.
-        // 템플릿 추출은 full-res pixels 기준이므로 원본 좌표를 그대로 사용.
+        // P0-B: OCR 결과를 채널에 게시. render thread가 최신 readback 픽셀로
+        // register_or_update를 호출하여 템플릿-NCC 프레임 불일치를 방지한다.
         {
             std::vector<VtOcrBox> vtBoxes;
             vtBoxes.reserve(ocrBoxes.size());
             for (const auto& b : ocrBoxes)
                 vtBoxes.push_back({b.type, b.x, b.y, b.w, b.h});
-            filter->trackerMgr.register_or_update(
-                vtBoxes, pixels.data(), width, height, stride);
+            std::lock_guard<std::mutex> lock(filter->ocrBoxResultMutex_);
+            filter->ocrBoxResult_ = std::move(vtBoxes);
+            filter->ocrBoxResultReady_ = true;
         }
 
         const int boxCount = static_cast<int>(ocrBoxes.size());
@@ -1040,7 +1041,7 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
 #endif
 
     // --- Step 3: maskChannel drain (OCR 좌표는 Visual Tracker가 직접 관리) ---
-    // OCR worker_loop에서 trackerMgr.register_or_update()를 직접 호출하므로
+    // P0-B: OCR worker → ocrBoxResult_ 채널 → render thread → register_or_update 경로로 변경.
     // maskChannel은 더 이상 OCR 박스 전달에 사용하지 않는다.
     // lastMask는 health.shouldReset() 경로의 풀스크린 비상 블랙아웃 전용으로만 남긴다.
     {
@@ -1176,6 +1177,24 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
         gs_texture_t* ocrTex = delayedSlot->getTexture();
 
         if (read_texture_bgra_to_cpu(filter, ocrTex, w, h, bgraPixels, stride)) {
+            // P0-B: OCR 결과 채널 소비 — render readback 픽셀과 동일 프레임으로 register_or_update
+            {
+                std::vector<VtOcrBox> pendingBoxes;
+                bool hasOcrResult = false;
+                {
+                    std::lock_guard<std::mutex> lock(filter->ocrBoxResultMutex_);
+                    if (filter->ocrBoxResultReady_) {
+                        pendingBoxes = std::move(filter->ocrBoxResult_);
+                        filter->ocrBoxResultReady_ = false;
+                        hasOcrResult = true;
+                    }
+                }
+                if (hasOcrResult && !pendingBoxes.empty()) {
+                    filter->trackerMgr.register_or_update(
+                        pendingBoxes, bgraPixels.data(), (int)w, (int)h, stride);
+                }
+            }
+
             // OCR 제출: ocrIdle일 때만. pixels copy → OCR thread 소유.
             if (ocrIdle) {
                 std::vector<uint8_t> ocrPixels(bgraPixels); // 8MB copy @~4fps

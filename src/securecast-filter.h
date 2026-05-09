@@ -62,7 +62,7 @@ class SecureCastOcrEngine;
 // ----------------------------------------------------
 // 컴파일 타임 상수. 런타임에 바꿀 일이 없으므로 constexpr로 둔다.
 constexpr int SC_MAX_BLUR_RECTS = 32;       // 한 프레임에 동시에 마스킹 가능한 최대 영역 수
-constexpr int SC_RING_BUFFER_SLOTS = 5;     // Bounded Exposure: AI 검증을 위해 N프레임만큼 송출 지연 슬롯 수 (고정 3~5)
+constexpr int SC_RING_BUFFER_SLOTS = 3;     // Bounded Exposure: AI 검증을 위해 N프레임만큼 송출 지연 슬롯 수 (P0-D: 5→3, 50ms 기저 지연 단축)
 
 // ----------------------------------------------------
 // Shared Types (Types) - Moved to securecast-types.h
@@ -279,10 +279,19 @@ struct SecureCastFilter {
 
     // ----- [Role B] Visual Tracker -----
     // OCR("what": ~250ms) 과 Tracker("where": render rate) 분리.
-    // register_or_update() → OCR 완료 시 호출 (OCR worker thread)
-    // update_all()         → OCR readback 타이밍마다 호출 (render thread, ~4fps)
+    // register_or_update() → render thread에서 OCR 결과 소비 시 호출
+    // update_all_gray()    → tracker thread에서 30Hz로 호출
     // active_boxes()       → 매 render 프레임 블러 좌표 조회
     VisualTrackerManager trackerMgr;
+
+    // ----- [P0-B] OCR 결과 채널: OCR worker → render thread -----
+    // OCR worker가 자신의 픽셀로 register_or_update를 직접 호출하면
+    // NCC가 render 프레임에서 탬플릿을 찾지 못해 즉시 소멸한다.
+    // OCR 결과를 여기에 저장하고, render thread가 최신 readback 픽셀과 함께
+    // register_or_update를 호출하도록 변경한다.
+    std::mutex            ocrBoxResultMutex_;
+    std::vector<VtOcrBox> ocrBoxResult_;
+    bool                  ocrBoxResultReady_ = false;
 
     // ----- [Role B] OCR 엔진 -----
     // OCR 엔진은 render thread가 아니라 OCR worker thread 내부에서 init()한다.

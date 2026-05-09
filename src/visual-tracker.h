@@ -31,7 +31,7 @@ public:
     static constexpr float SCORE_REFRESH = 0.85f; // 이 점수 이상이면 템플릿 갱신 (드리프트 방지)
     static constexpr int   FRAMES_LOST   = 2;     // 연속 실패 이 횟수 초과 시 제거 (67ms@30Hz)
     static constexpr int   SEARCH_NEAR   = 30;    // lastScore >= SCORE_OK 일 때 반경
-    static constexpr int   SEARCH_FAR    = 60;    // lastScore <  SCORE_OK 일 때 반경
+    static constexpr int   SEARCH_FAR    = 250;   // lastScore <  SCORE_OK 일 때 반경 (P0-A: 60→250, 빠른 이동 대응)
 
     // P0-2: ghost-kill 상한
     static constexpr int   MAX_TRACKERS  = 8;   // 동시 트래커 최대 수 (초과 시 신규 등록 거부)

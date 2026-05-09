@@ -278,27 +278,15 @@ uint64_t SecureCastOcrEngine::compute_dhash_region(
     return hash; // 8행 × 8비트 = 64비트
 }
 
-// ROI 합산 dHash: 박스 있으면 각 박스 영역 dHash를 FNV로 혼합,
-// 박스 없으면 전체 프레임 coarse dHash (새 텍스트 발견용)
+// P0-C: 항상 전체 프레임 dHash 사용.
+// 기존 ROI-only dHash는 박스 밖에서 새 PII가 나타났을 때 변화를 감지하지 못해
+// 최대 kMaxConsecutiveSkips 사이클(≈500ms) 동안 탐지 지연이 발생했다.
 uint64_t SecureCastOcrEngine::compute_roi_dhash(
     const uint8_t* px, int stride, int width, int height,
     const std::vector<SecureCastOcrBox>& boxes) const
 {
-    if (boxes.empty())
-        return compute_dhash_region(px, stride, 0, 0, width, height);
-
-    constexpr uint64_t kFnvPrime = 1099511628211ULL;
-    uint64_t combined = 14695981039346656037ULL;
-    for (const auto& b : boxes) {
-        int bx = std::max(0, (int)b.x);
-        int by = std::max(0, (int)b.y);
-        int bw = std::min((int)b.w, width  - bx);
-        int bh = std::min((int)b.h, height - by);
-        if (bw <= 0 || bh <= 0) continue;
-        combined ^= compute_dhash_region(px, stride, bx, by, bw, bh);
-        combined *= kFnvPrime;
-    }
-    return combined;
+    (void)boxes;
+    return compute_dhash_region(px, stride, 0, 0, width, height);
 }
 
 int SecureCastOcrEngine::hamming_distance(uint64_t a, uint64_t b) {

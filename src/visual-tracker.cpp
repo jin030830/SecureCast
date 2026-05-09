@@ -270,8 +270,8 @@ void VisualTrackerManager::update_one_pyramid(
     int   bestX     = (int)(predX + (tr.bw - tr.tw) * 0.5f);
     int   bestY     = (int)(predY + (tr.bh - tr.th) * 0.5f);
 
-    for (int dy = -4; dy <= 4; ++dy) {
-        for (int dx = -4; dx <= 4; ++dx) {
+    for (int dy = -6; dy <= 6; ++dy) {
+        for (int dx = -6; dx <= 6; ++dx) {
             const float sc = ncc_at(gray, gw, gw, gh, tr.tmpl, tr.tw, tr.th,
                                     refineX + dx, refineY + dy);
             if (sc > bestScore) { bestScore = sc; bestX = refineX + dx; bestY = refineY + dy; }
