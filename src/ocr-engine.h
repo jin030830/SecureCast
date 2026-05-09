@@ -103,11 +103,9 @@ private:
     };
     std::vector<LineDHashCache> lastLineDhashes_;
     int consecutiveSkips_ = 0;
-    // 이 값 이상 연속 L1 히트 시 주기적 full OCR (새 텍스트 발견용).
-    // 10→2: 최대 탐지 지연 2.5s → 500ms 단축.
-    //   Visual Tracker가 30Hz로 실행되므로 OCR은 재확인 역할만 하면 충분.
-    //   값=2 → OCR 3회 중 1회는 full scan (새 PII 즉시 포착).
-    static constexpr int kMaxConsecutiveSkips = 2;
+    // 연속 L1 히트 허용 횟수: 0 = 스킵 없이 항상 full OCR.
+    // 새 PII가 화면에 나타나도 즉시 탐지 (ghost 누적 방지보다 초탐지 속도 우선).
+    static constexpr int kMaxConsecutiveSkips = 0;
 
     // 8×8 구역 dHash: 9×8 샘플 격자 → 인접 밝기 비교 → 64비트
     uint64_t compute_dhash_region(const uint8_t* px, int stride,

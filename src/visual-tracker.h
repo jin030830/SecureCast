@@ -29,13 +29,13 @@ public:
     static constexpr float SCORE_OK      = 0.70f; // 이 점수 이상이면 정상 추적
     static constexpr float SCORE_LOST    = 0.55f; // P0-2: 0.40→0.55, ghost 억제
     static constexpr float SCORE_REFRESH = 0.85f; // 이 점수 이상이면 템플릿 갱신 (드리프트 방지)
-    static constexpr int   FRAMES_LOST   = 2;     // 연속 실패 이 횟수 초과 시 제거 (67ms@30Hz)
+    static constexpr int   FRAMES_LOST   = 3;     // 연속 실패 이 횟수 초과 시 제거 (100ms@30Hz)
     static constexpr int   SEARCH_NEAR   = 30;    // lastScore >= SCORE_OK 일 때 반경
     static constexpr int   SEARCH_FAR    = 250;   // lastScore <  SCORE_OK 일 때 반경 (P0-A: 60→250, 빠른 이동 대응)
 
     // P0-2: ghost-kill 상한
     static constexpr int   MAX_TRACKERS  = 8;   // 동시 트래커 최대 수 (초과 시 신규 등록 거부)
-    static constexpr int   HARD_EXPIRY   = 90;  // OCR 미확인 시 최대 수명 (90 cycles ≈ 3s @ 30Hz)
+    static constexpr int   HARD_EXPIRY   = 30;  // OCR 미확인 시 최대 수명 (30 cycles ≈ 1s @ 30Hz)
 
     // 템플릿 크기 상한 (픽셀): 대형 박스에서 NCC 연산량 폭증 방지.
     // 박스가 이 크기를 초과하면 중앙 MAX_TMPL_W × MAX_TMPL_H 영역만 추출한다.

@@ -295,15 +295,6 @@ struct SecureCastFilter {
     uint32_t        trackerGrayW_      = 0;
     uint32_t        trackerGrayH_      = 0;
 
-    // ----- [P0-B] OCR 결과 채널: OCR worker → render thread -----
-    // OCR worker가 자신의 픽셀로 register_or_update를 직접 호출하면
-    // NCC가 render 프레임에서 탬플릿을 찾지 못해 즉시 소멸한다.
-    // OCR 결과를 여기에 저장하고, render thread가 최신 readback 픽셀과 함께
-    // register_or_update를 호출하도록 변경한다.
-    std::mutex            ocrBoxResultMutex_;
-    std::vector<VtOcrBox> ocrBoxResult_;
-    bool                  ocrBoxResultReady_ = false;
-
     // ----- [Role B] OCR 엔진 -----
     // OCR 엔진은 render thread가 아니라 OCR worker thread 내부에서 init()한다.
     // forward declaration을 위해 unique_ptr로 보관하여 ocr-engine.h 의존성을 분리한다.
