@@ -714,8 +714,8 @@ static void ocr_worker_loop(SecureCastFilter* filter)
         std::vector<uint8_t> upscaled;
         float upScale = 1.0f;
         if (!doScale && ocrW2 >= 640 && ocrH2 >= 360 && ocrW2 <= 1920 && ocrH2 <= 1080) {
-            const int upW = ocrW2 * 3 / 2;
-            const int upH = ocrH2 * 3 / 2;
+            const int upW = ocrW2 * 2;
+            const int upH = ocrH2 * 2;
             upscaled.resize((size_t)upW * upH * 4);
             for (int dy = 0; dy < upH; ++dy) {
                 const float sy  = (dy + 0.5f) * (float)ocrH2 / upH - 0.5f;
@@ -739,13 +739,13 @@ static void ocr_worker_loop(SecureCastFilter* filter)
                     }
                 }
             }
-            upScale = (float)upW / (float)ocrW2; // ≈ 1.5
+            upScale = (float)upW / (float)ocrW2; // ≈ 2.0
         }
 
         const uint8_t* finalPx     = upscaled.empty() ? ocrPx      : upscaled.data();
-        const int      finalW      = upscaled.empty() ? ocrW2      : ocrW2 * 3 / 2;
-        const int      finalH      = upscaled.empty() ? ocrH2      : ocrH2 * 3 / 2;
-        const int      finalStride = upscaled.empty() ? ocrStride2 : (ocrW2 * 3 / 2) * 4;
+        const int      finalW      = upscaled.empty() ? ocrW2      : ocrW2 * 2;
+        const int      finalH      = upscaled.empty() ? ocrH2      : ocrH2 * 2;
+        const int      finalStride = upscaled.empty() ? ocrStride2 : (ocrW2 * 2) * 4;
 
         auto ocrBoxes = filter->ocrEngine->analyze_bgra_frame(finalPx, finalW, finalH, finalStride);
 

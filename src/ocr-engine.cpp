@@ -842,11 +842,11 @@ std::string SecureCastOcrEngine::normalize_numeric_candidate(const std::string& 
     std::string out = text;
 
     for (char& c : out) {
-        if (c == 'O' || c == 'o') {
-            c = '0';
-        } else if (c == 'I' || c == 'l') {
-            c = '1';
-        }
+        if      (c == 'O' || c == 'o') c = '0';
+        else if (c == 'I' || c == 'l') c = '1';
+        else if (c == 'Z' || c == 'z') c = '2';
+        else if (c == 'S')             c = '5';
+        else if (c == 'B')             c = '8';
     }
 
     return out;
@@ -861,7 +861,7 @@ std::vector<SecureCastOcrBox> SecureCastOcrEngine::detect_pii(
     // 1) 주민등록번호: 6자리-7자리, 뒷자리 첫 글자 1~8 (외국인 포함)
     // \s?[-–]\s?: OCR이 "850101 - 1234566" 처럼 구분자 앞뒤 공백을 추가하는 경우 허용.
     static const re2::RE2 PATTERN_RRN(
-        R"(\b(\d{6})\s?[-–]\s?([1-8]\d{6})\b)"
+        R"(\b(\d{6})\s?[-–]?\s?([1-8]\d{6})\b)"
     );
 
     // 2) 전화번호: 휴대폰(010/011/016~019) + 지역번호(02/03x/04x/05x/06x) + +82 정규화
@@ -893,7 +893,7 @@ std::vector<SecureCastOcrBox> SecureCastOcrEngine::detect_pii(
 
     // 7) OCR 보정이 필요한 숫자 cluster 추출
     static const re2::RE2 PATTERN_NUMERIC_CLUSTER(
-        R"([0-9OoIl](?:[0-9OoIl\-\s\.–+]*[0-9OoIl])?)"
+        R"([0-9OoIlSBZz](?:[0-9OoIlSBZz\-\s\.–+]*[0-9OoIlSBZz])?)"
     );
 
     // A-7) 이름 + 호칭 직접 패턴 (높은 신뢰도)
@@ -1183,7 +1183,7 @@ std::vector<SecureCastOcrLine> SecureCastOcrEngine::multipass_small_text(
     const uint8_t* pixels, int width, int height, int stride)
 {
     static constexpr float SMALL_H    = 20.0f; // 이 높이 미만 라인을 재OCR
-    static constexpr int   MAX_PASSES = 3;     // 사이클당 재OCR 최대 횟수
+    static constexpr int   MAX_PASSES = 32;    // 사이클당 재OCR 최대 횟수 (3→32: 작은 라인 다수 처리)
     static constexpr int   PAD        = 4;     // crop 여백 (px)
 
     auto result = lines;
