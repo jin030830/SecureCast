@@ -4,10 +4,18 @@
 #include <cmath>
 #include <cstring>
 
-// SSSE3 intrinsics (x64 MSVC: always available via <intrin.h>)
+// SIMD intrinsics
+// x64 MSVC: <intrin.h>가 SSSE3·AVX2·FMA를 모두 포함.
+// FMA + AVX2는 Haswell(2013) 이상에서 지원. 런타임에 명시적으로 호출하므로
+// /arch 컴파일러 플래그 없이도 인트린직 자체는 사용 가능.
 #if defined(_MSC_VER) && defined(_M_X64)
 #include <intrin.h>
 #define SC_HAS_SSSE3 1
+#define SC_HAS_AVX2  1
+#elif defined(__AVX2__)
+#include <immintrin.h>
+#define SC_HAS_SSSE3 1
+#define SC_HAS_AVX2  1
 #elif defined(__SSSE3__)
 #include <tmmintrin.h>
 #define SC_HAS_SSSE3 1
@@ -154,6 +162,129 @@ float VisualTrackerManager::box_iou(const VtOcrBox& a, const Tracker& b)
     return (u > 0.0f) ? inter / u : 0.0f;
 }
 
+// ──────────────────────────────────────────────────────────────
+// Tier 3: precompute_tmpl_stats
+//
+// tmpl(uint8) → tmpl_float(centered float) + tmpl_dT + tmpl_sumCt
+// tmpl이 변경될 때마다 호출해야 AVX2 NCC가 정확하게 동작한다.
+// ──────────────────────────────────────────────────────────────
+void VisualTrackerManager::precompute_tmpl_stats(Tracker& tr)
+{
+    const int n = tr.tw * tr.th;
+    if (n <= 0 || (int)tr.tmpl.size() < n) {
+        tr.tmpl_float.clear();
+        tr.tmpl_dT    = 0.0f;
+        tr.tmpl_sumCt = 0.0f;
+        return;
+    }
+
+    float tmean = 0.0f;
+    for (int i = 0; i < n; ++i) tmean += tr.tmpl[i];
+    tmean /= static_cast<float>(n);
+
+    tr.tmpl_float.resize(n);
+    float dT = 0.0f, sumCt = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        const float ct = static_cast<float>(tr.tmpl[i]) - tmean;
+        tr.tmpl_float[i] = ct;
+        dT    += ct * ct;
+        sumCt += ct;
+    }
+    tr.tmpl_dT    = dT;
+    tr.tmpl_sumCt = sumCt;
+}
+
+// ──────────────────────────────────────────────────────────────
+// Tier 3: AVX2 NCC
+//
+// 계산식:
+//   S1  = Σ iv_i          (이미지 값 합)
+//   S12 = Σ ct_i × iv_i   (ct_i = tmpl_float[i] = tmpl[i] - tmean)
+//   S2  = Σ iv_i²         (이미지 제곱합)
+//   imean   = S1 / N
+//   num     = S12 - imean × sumCt    (= Σ ct_i × (iv_i - imean))
+//   dI      = S2  - S1 × imean       (= Σ(iv_i - imean)²)
+//   NCC     = num / sqrt(tmpl_dT × dI)
+//
+// AVX2 경로: 8 float/cycle (FMA 사용). SSSE3-only 또는 스칼라 폴백 포함.
+// ──────────────────────────────────────────────────────────────
+
+#ifdef SC_HAS_AVX2
+static inline float hsum256_ps(__m256 v)
+{
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    lo = _mm_add_ps(lo, hi);
+    lo = _mm_hadd_ps(lo, lo);
+    lo = _mm_hadd_ps(lo, lo);
+    return _mm_cvtss_f32(lo);
+}
+#endif
+
+float VisualTrackerManager::ncc_at_simd(
+    const uint8_t* gray, int gstride, int gw, int gh,
+    const Tracker& tr, int sx, int sy) const
+{
+    const int tw = tr.tw, th = tr.th;
+    if (sx < 0 || sy < 0 || sx + tw > gw || sy + th > gh) return -1.0f;
+    if (tr.tmpl_float.empty() || tw <= 0 || th <= 0)
+        return ncc_at(gray, gstride, gw, gh, tr.tmpl, tw, th, sx, sy);
+
+    const int n = tw * th;
+    const float* ct = tr.tmpl_float.data();
+
+    float S1 = 0.0f, S12 = 0.0f, S2 = 0.0f;
+
+#ifdef SC_HAS_AVX2
+    __m256 vS1  = _mm256_setzero_ps();
+    __m256 vS12 = _mm256_setzero_ps();
+    __m256 vS2  = _mm256_setzero_ps();
+
+    for (int r = 0; r < th; ++r) {
+        const float*   ct_row = ct + r * tw;
+        const uint8_t* iv_row = gray + static_cast<ptrdiff_t>(sy + r) * gstride + sx;
+        int c = 0;
+        for (; c + 8 <= tw; c += 8) {
+            __m128i iv8  = _mm_loadl_epi64((const __m128i*)(iv_row + c));
+            __m256i iv32 = _mm256_cvtepu8_epi32(iv8);
+            __m256  iv_f = _mm256_cvtepi32_ps(iv32);
+            __m256  ct_v = _mm256_loadu_ps(ct_row + c);
+            vS1  = _mm256_add_ps(vS1, iv_f);
+            vS12 = _mm256_fmadd_ps(ct_v, iv_f, vS12);
+            vS2  = _mm256_fmadd_ps(iv_f, iv_f, vS2);
+        }
+        for (; c < tw; ++c) {
+            const float iv_f = static_cast<float>(iv_row[c]);
+            S1  += iv_f;
+            S12 += ct_row[c] * iv_f;
+            S2  += iv_f * iv_f;
+        }
+    }
+    S1  += hsum256_ps(vS1);
+    S12 += hsum256_ps(vS12);
+    S2  += hsum256_ps(vS2);
+#else
+    // 스칼라 폴백 (AVX2 미지원 환경)
+    for (int r = 0; r < th; ++r) {
+        const float*   ct_row = ct + r * tw;
+        const uint8_t* iv_row = gray + static_cast<ptrdiff_t>(sy + r) * gstride + sx;
+        for (int c = 0; c < tw; ++c) {
+            const float iv_f = static_cast<float>(iv_row[c]);
+            S1  += iv_f;
+            S12 += ct_row[c] * iv_f;
+            S2  += iv_f * iv_f;
+        }
+    }
+#endif
+
+    const float imean = S1 / static_cast<float>(n);
+    const float num   = S12 - imean * tr.tmpl_sumCt;
+    const float dI    = S2  - S1 * imean;
+    const float denom = std::sqrt(tr.tmpl_dT * dI);
+    if (denom < 1e-5f) return 0.0f;
+    return num / denom;
+}
+
 // ──────────────────────────────────────────────
 // NCC at a single search position (float arithmetic)
 // ──────────────────────────────────────────────
@@ -209,10 +340,22 @@ float VisualTrackerManager::ncc_at(
 //   - 실패 시: 속도 0.5× 감쇠
 // ──────────────────────────────────────────────────────────────
 
+// ──────────────────────────────────────────────────────────────
+// Tier 3: 2-Level 피라미드 매칭
+//
+// Level 0 (1/4 해상도 coarse):
+//   - 템플릿 4×4 avg 다운샘플 (on-the-fly, 160×80→40×20=800 ops)
+//   - 예측 위치 중심, SEARCH_FAR/4 반경, stride-2 탐색
+//   - 탐색 공간: 최대 62² = 3844 위치 (기존 half 15876 대비 4×↓)
+//
+// Level 1 (원해상도 fine):
+//   - quarter best ×4 위치 주변 ±6px AVX2 NCC (13×13=169 위치)
+//   - quarter stride-2 = 8px 간격 → ±6px fine이 항상 커버
+// ──────────────────────────────────────────────────────────────
 void VisualTrackerManager::update_one_pyramid(
     Tracker& tr,
-    const uint8_t* gray, int gw, int gh,
-    const uint8_t* halfGray, int hw, int hh)
+    const uint8_t* gray,        int gw, int gh,
+    const uint8_t* quarterGray, int qw, int qh)
 {
     if (tr.tmpl.empty() || tr.tw <= 0 || tr.th <= 0) return;
 
@@ -225,46 +368,52 @@ void VisualTrackerManager::update_one_pyramid(
     const int velBonus   = std::min((int)(std::abs(tr.vx) + std::abs(tr.vy)), SEARCH_FAR);
     const int radius     = std::min(baseRadius + velBonus, SEARCH_FAR);
 
-    // ----- Level 0: coarse (1/2 해상도) -----
-    // 템플릿 1/2 다운샘플 (매 프레임 on-the-fly; 160×80→80×40 ≈ 3200 ops, 무시 가능)
-    const int htw = std::max(tr.tw / 2, 1);
-    const int hth = std::max(tr.th / 2, 1);
-    std::vector<uint8_t> htmpl(static_cast<size_t>(htw * hth));
-    for (int r = 0; r < hth; ++r) {
-        for (int c = 0; c < htw; ++c) {
-            const int r2 = r * 2, c2 = c * 2;
-            int sum = tr.tmpl[r2 * tr.tw + c2]; int cnt = 1;
-            if (c2 + 1 < tr.tw) { sum += tr.tmpl[r2 * tr.tw + c2 + 1]; ++cnt; }
-            if (r2 + 1 < tr.th) { sum += tr.tmpl[(r2+1) * tr.tw + c2]; ++cnt; }
-            if (c2 + 1 < tr.tw && r2 + 1 < tr.th) { sum += tr.tmpl[(r2+1)*tr.tw+c2+1]; ++cnt; }
-            htmpl[r * htw + c] = (uint8_t)(sum / cnt);
+    // ----- Level 0: coarse (1/4 해상도) -----
+    // 템플릿 4×4 avg 다운샘플 (on-the-fly; 160×80→40×20 = 800 ops)
+    const int qtw = std::max(tr.tw / 4, 1);
+    const int qth = std::max(tr.th / 4, 1);
+    std::vector<uint8_t> qtmpl(static_cast<size_t>(qtw * qth));
+    for (int r = 0; r < qth; ++r) {
+        for (int c = 0; c < qtw; ++c) {
+            int sum = 0, cnt = 0;
+            for (int dr = 0; dr < 4; ++dr) {
+                const int sr = r * 4 + dr;
+                if (sr >= tr.th) break;
+                for (int dc = 0; dc < 4; ++dc) {
+                    const int sc2 = c * 4 + dc;
+                    if (sc2 >= tr.tw) break;
+                    sum += tr.tmpl[sr * tr.tw + sc2];
+                    ++cnt;
+                }
+            }
+            qtmpl[r * qtw + c] = (uint8_t)(cnt > 0 ? sum / cnt : 0);
         }
     }
 
-    // 예측 중심 (1/2 스케일), 탐색 반경 (1/2 스케일)
-    const int hcx    = (int)((predX + tr.bw * 0.5f) * 0.5f);
-    const int hcy    = (int)((predY + tr.bh * 0.5f) * 0.5f);
-    const int hr     = (radius + 1) / 2;
+    // 예측 중심 (1/4 스케일), 탐색 반경 (1/4 스케일)
+    const int qcx  = (int)((predX + tr.bw * 0.5f) * 0.25f);
+    const int qcy  = (int)((predY + tr.bh * 0.5f) * 0.25f);
+    const int qr   = (radius + 3) / 4;
+    const int qsx0 = qcx - qr - qtw / 2;
+    const int qsy0 = qcy - qr - qth / 2;
+    const int qsx1 = qcx + qr - qtw / 2;
+    const int qsy1 = qcy + qr - qth / 2;
 
-    const int hsx0 = hcx - hr - htw / 2;
-    const int hsy0 = hcy - hr - hth / 2;
-    const int hsx1 = hcx + hr - htw / 2;
-    const int hsy1 = hcy + hr - hth / 2;
+    float bestQScore = -1.0f;
+    int   bestQX     = qcx - qtw / 2;
+    int   bestQY     = qcy - qth / 2;
 
-    float bestCoarseScore = -1.0f;
-    int   bestHX = hcx - htw / 2;
-    int   bestHY = hcy - hth / 2;
-
-    for (int sy = hsy0; sy <= hsy1; sy += 2) {
-        for (int sx = hsx0; sx <= hsx1; sx += 2) {
-            const float sc = ncc_at(halfGray, hw, hw, hh, htmpl, htw, hth, sx, sy);
-            if (sc > bestCoarseScore) { bestCoarseScore = sc; bestHX = sx; bestHY = sy; }
+    for (int sy = qsy0; sy <= qsy1; sy += 2) {
+        for (int sx = qsx0; sx <= qsx1; sx += 2) {
+            const float sc = ncc_at(quarterGray, qw, qw, qh, qtmpl, qtw, qth, sx, sy);
+            if (sc > bestQScore) { bestQScore = sc; bestQX = sx; bestQY = sy; }
         }
     }
 
-    // ----- Level 1: fine (원해상도, coarse 주변 ±2px) -----
-    const int refineX = bestHX * 2;
-    const int refineY = bestHY * 2;
+    // ----- Level 1: fine (원해상도, quarter best ×4 주변 ±6px) -----
+    // quarter stride-2 → 8px step at full scale; ±6px fine이 항상 커버
+    const int refineX = bestQX * 4;
+    const int refineY = bestQY * 4;
 
     float bestScore = -1.0f;
     int   bestX     = (int)(predX + (tr.bw - tr.tw) * 0.5f);
@@ -272,8 +421,8 @@ void VisualTrackerManager::update_one_pyramid(
 
     for (int dy = -6; dy <= 6; ++dy) {
         for (int dx = -6; dx <= 6; ++dx) {
-            const float sc = ncc_at(gray, gw, gw, gh, tr.tmpl, tr.tw, tr.th,
-                                    refineX + dx, refineY + dy);
+            const float sc = ncc_at_simd(gray, gw, gw, gh, tr,
+                                         refineX + dx, refineY + dy);
             if (sc > bestScore) { bestScore = sc; bestX = refineX + dx; bestY = refineY + dy; }
         }
     }
@@ -281,14 +430,12 @@ void VisualTrackerManager::update_one_pyramid(
     tr.lastScore = bestScore;
     if (bestScore >= SCORE_LOST) {
         // bestX/Y: template top-left → box top-left
-        const float newX = (float)bestX - (tr.bw - (float)tr.tw) * 0.5f;
-        const float newY = (float)bestY - (tr.bh - (float)tr.th) * 0.5f;
+        const float newX = static_cast<float>(bestX) - (tr.bw - static_cast<float>(tr.tw)) * 0.5f;
+        const float newY = static_cast<float>(bestY) - (tr.bh - static_cast<float>(tr.th)) * 0.5f;
 
         // P0-3: EMA 속도 업데이트
-        const float rawVx = newX - tr.x;
-        const float rawVy = newY - tr.y;
-        tr.vx = 0.7f * tr.vx + 0.3f * rawVx;
-        tr.vy = 0.7f * tr.vy + 0.3f * rawVy;
+        tr.vx = 0.7f * tr.vx + 0.3f * (newX - tr.x);
+        tr.vy = 0.7f * tr.vy + 0.3f * (newY - tr.y);
 
         tr.x = newX;
         tr.y = newY;
@@ -299,12 +446,13 @@ void VisualTrackerManager::update_one_pyramid(
             auto refreshed = extract_gray_crop(gray, gw, gw, gh,
                                                bestX, bestY, tr.tw, tr.th,
                                                rdummy, cdummy);
-            if (rdummy == tr.tw && cdummy == tr.th && !refreshed.empty())
+            if (rdummy == tr.tw && cdummy == tr.th && !refreshed.empty()) {
                 tr.tmpl = std::move(refreshed);
+                precompute_tmpl_stats(tr); // float 템플릿 갱신
+            }
         }
     } else {
         ++tr.framesSinceMatch;
-        // 속도 감쇠 (실패 시)
         tr.vx *= 0.5f;
         tr.vy *= 0.5f;
     }
@@ -313,18 +461,19 @@ void VisualTrackerManager::update_one_pyramid(
 // ──────────────────────────────────────────────────────────────
 // update_all_impl — lock 없는 공통 구현 (mtx_ 보유 상태에서 호출)
 //
-// P0-1: 1/2 다운샘플 halfGray를 한 번 계산해 모든 트래커가 공유
+// Tier 3: 1/4 다운샘플 quarterGray를 한 번 계산해 모든 트래커가 공유
 // P0-2: framesSinceOcrValidate 증가; HARD_EXPIRY 초과 트래커 제거
 // ──────────────────────────────────────────────────────────────
 void VisualTrackerManager::update_all_impl(const uint8_t* gray, int gw, int gh)
 {
-    // coarse 레벨용 1/2 다운샘플 (모든 트래커 공유)
-    int hw, hh;
-    std::vector<uint8_t> halfGray = downsample_2x(gray, gw, gh, hw, hh);
+    // coarse 레벨용 1/4 다운샘플 (2×2× 박스 필터 2회)
+    int hw, hh, qw, qh;
+    std::vector<uint8_t> halfGray    = downsample_2x(gray,           gw, gh, hw, hh);
+    std::vector<uint8_t> quarterGray = downsample_2x(halfGray.data(), hw, hh, qw, qh);
 
     for (auto& tr : trackers_) {
-        if (hw > 0 && hh > 0)
-            update_one_pyramid(tr, gray, gw, gh, halfGray.data(), hw, hh);
+        if (qw > 0 && qh > 0)
+            update_one_pyramid(tr, gray, gw, gh, quarterGray.data(), qw, qh);
         ++tr.framesSinceOcrValidate;
     }
 
@@ -404,7 +553,11 @@ void VisualTrackerManager::register_or_update(
             int tw, th;
             auto crop = extract_gray_crop(gray.data(), width, width, height,
                                           tcx, tcy, tcw, tch, tw, th);
-            if (!crop.empty()) { tr.tw = tw; tr.th = th; tr.tmpl = std::move(crop); }
+            if (!crop.empty()) {
+                tr.tw = tw; tr.th = th;
+                tr.tmpl = std::move(crop);
+                precompute_tmpl_stats(tr); // AVX2 float 템플릿 갱신
+            }
         }
     }
 
@@ -438,6 +591,7 @@ void VisualTrackerManager::register_or_update(
         tr.framesSinceMatch       = 0;
         tr.framesSinceOcrValidate = 0;
         tr.vx = 0.0f; tr.vy = 0.0f;
+        precompute_tmpl_stats(tr); // AVX2 float 템플릿 초기화
         trackers_.push_back(std::move(tr));
     }
 }

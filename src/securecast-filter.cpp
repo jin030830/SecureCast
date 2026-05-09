@@ -435,6 +435,93 @@ static void destroy_ocr_stage_surface(SecureCastFilter* filter)
     filter->ocrStageHeight = 0;
 }
 
+// ================================================================
+// [Tier 1] GPU Grayscale Readback 헬퍼
+//
+// GPU에서 full-res BGRA → R8 grayscale 렌더 후 스테이징 readback.
+// 기존 8MB BGRA readback → 2MB gray (1 byte/pixel) 로 대체.
+// R8 렌더 타겟을 지원하지 않는 GPU에서는 false를 반환하며,
+// 호출자는 CPU bgra_to_gray 경로로 폴백한다.
+// ================================================================
+
+static bool ensure_tracker_gray_surfaces(
+    SecureCastFilter* filter, uint32_t w, uint32_t h)
+{
+    if (!filter || w == 0 || h == 0) return false;
+    if (filter->trackerGrayRender_ &&
+        filter->trackerGrayW_ == w && filter->trackerGrayH_ == h)
+        return true;
+
+    if (filter->trackerGrayStage_)  { gs_stagesurface_destroy(filter->trackerGrayStage_);  filter->trackerGrayStage_  = nullptr; }
+    if (filter->trackerGrayRender_) { gs_texrender_destroy(filter->trackerGrayRender_);    filter->trackerGrayRender_ = nullptr; }
+
+    filter->trackerGrayRender_ = gs_texrender_create(GS_R8, GS_ZS_NONE);
+    if (!filter->trackerGrayRender_) return false;
+
+    filter->trackerGrayStage_ = gs_stagesurface_create(w, h, GS_R8);
+    if (!filter->trackerGrayStage_) {
+        gs_texrender_destroy(filter->trackerGrayRender_);
+        filter->trackerGrayRender_ = nullptr;
+        return false;
+    }
+
+    filter->trackerGrayW_ = w;
+    filter->trackerGrayH_ = h;
+    return true;
+}
+
+// GPU에서 gray 렌더 → 스테이징 → CPU 버퍼로 복사.
+// 반환: true = grayPixels에 grayW×grayH 크기의 1-byte/pixel gray 데이터 기록됨.
+static bool read_tracker_gray_gpu(
+    SecureCastFilter* filter,
+    gs_texture_t*     srcTex,
+    uint32_t w, uint32_t h,
+    std::vector<uint8_t>& grayPixels)
+{
+    if (!filter || !filter->trackerGrayEffect_ || !srcTex) return false;
+    if (!ensure_tracker_gray_surfaces(filter, w, h))        return false;
+
+    gs_texrender_t* render = filter->trackerGrayRender_;
+    gs_stagesurf_t* stage  = filter->trackerGrayStage_;
+
+    // GPU render: srcTex → full-res R8 gray via GrayDownsample 기법
+    gs_texrender_reset(render);
+    if (!gs_texrender_begin(render, (int)w, (int)h)) return false;
+
+    gs_effect_t* eff  = filter->trackerGrayEffect_;
+    gs_eparam_t* pImg = gs_effect_get_param_by_name(eff, "image");
+    gs_eparam_t* pUV  = gs_effect_get_param_by_name(eff, "uv_bounds");
+
+    gs_effect_set_texture(pImg, srcTex);
+    if (pUV) {
+        struct vec4 bounds = {0.0f, 0.0f, 1.0f, 1.0f};
+        gs_effect_set_vec4(pUV, &bounds);
+    }
+    while (gs_effect_loop(eff, "GrayDownsample"))
+        gs_draw_sprite(srcTex, 0, (uint32_t)w, (uint32_t)h);
+
+    gs_texrender_end(render);
+
+    // stage copy + map
+    gs_texture_t* grayTex = gs_texrender_get_texture(render);
+    if (!grayTex) return false;
+    gs_stage_texture(stage, grayTex);
+
+    uint8_t*  mapped    = nullptr;
+    uint32_t  rowStride = 0;
+    if (!gs_stagesurface_map(stage, &mapped, &rowStride)) return false;
+
+    // R8: 1 byte/pixel; rowStride >= w (GPU alignment 고려)
+    grayPixels.resize(static_cast<size_t>(w) * h);
+    for (uint32_t y = 0; y < h; ++y)
+        std::memcpy(grayPixels.data() + (size_t)y * w,
+                    mapped + (size_t)y * rowStride,
+                    w);
+
+    gs_stagesurface_unmap(stage);
+    return true;
+}
+
 static bool ensure_ocr_stage_surface(SecureCastFilter* filter, uint32_t width, uint32_t height)
 {
     if (!filter || width == 0 || height == 0)
@@ -833,16 +920,30 @@ static void* securecast_create(obs_data_t* settings, obs_source_t* context)
 
     // HLSL 셰이더 컴파일 (그래픽스 컨텍스트 필요)
     obs_enter_graphics();
-    char *effect_path = obs_module_file("securecast_blur.effect");
-    if (effect_path) {
-        filter->blurEffect = gs_effect_create_from_file(effect_path, nullptr);
-        bfree(effect_path);
+    {
+        char *effect_path = obs_module_file("securecast_blur.effect");
+        if (effect_path) {
+            filter->blurEffect = gs_effect_create_from_file(effect_path, nullptr);
+            bfree(effect_path);
+        }
+    }
+    {
+        // Tier 1: GPU gray readback용 downsample.effect GrayDownsample 기법
+        char *ds_path = obs_module_file("downsample.effect");
+        if (ds_path) {
+            filter->trackerGrayEffect_ = gs_effect_create_from_file(ds_path, nullptr);
+            bfree(ds_path);
+        }
     }
     obs_leave_graphics();
     if (!filter->blurEffect)
         blog(LOG_WARNING, "[SecureCast] blur effect load failed; falling back to solid blackout.");
     else
         blog(LOG_INFO, "[SecureCast] blur effect loaded.");
+    if (!filter->trackerGrayEffect_)
+        blog(LOG_WARNING, "[SecureCast] downsample effect load failed; tracker uses CPU gray path.");
+    else
+        blog(LOG_INFO, "[SecureCast] downsample effect loaded (Tier 1 GPU gray active).");
 
     return filter;
 }
@@ -872,6 +973,10 @@ static void securecast_destroy(void* data)
 
     obs_enter_graphics();
     destroy_ocr_stage_surface(filter);
+    // Tier 1: GPU gray readback 리소스 해제
+    if (filter->trackerGrayStage_)  { gs_stagesurface_destroy(filter->trackerGrayStage_);  filter->trackerGrayStage_  = nullptr; }
+    if (filter->trackerGrayRender_) { gs_texrender_destroy(filter->trackerGrayRender_);    filter->trackerGrayRender_ = nullptr; }
+    if (filter->trackerGrayEffect_) { gs_effect_destroy(filter->trackerGrayEffect_);       filter->trackerGrayEffect_ = nullptr; }
 #ifdef _WIN32
     // [C2-5 수정] shutdown 경로에서는 spin-wait가 없는 destroyImmediate() 사용.
     filter->readback.destroyImmediate();
@@ -1176,43 +1281,20 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
         int stride = 0;
         gs_texture_t* ocrTex = delayedSlot->getTexture();
 
-        if (read_texture_bgra_to_cpu(filter, ocrTex, w, h, bgraPixels, stride)) {
-            // P0-B: OCR 결과 채널 소비 — render readback 픽셀과 동일 프레임으로 register_or_update
-            {
-                std::vector<VtOcrBox> pendingBoxes;
-                bool hasOcrResult = false;
-                {
-                    std::lock_guard<std::mutex> lock(filter->ocrBoxResultMutex_);
-                    if (filter->ocrBoxResultReady_) {
-                        pendingBoxes = std::move(filter->ocrBoxResult_);
-                        filter->ocrBoxResultReady_ = false;
-                        hasOcrResult = true;
-                    }
-                }
-                if (hasOcrResult && !pendingBoxes.empty()) {
-                    filter->trackerMgr.register_or_update(
-                        pendingBoxes, bgraPixels.data(), (int)w, (int)h, stride);
-                }
+        // Tier 1: GPU gray readback (30Hz, 2MB) — 기존 8MB BGRA readback 대체
+        // GS_R8 미지원 시 false 반환 → CPU bgra_to_gray 폴백 경로 사용.
+        std::vector<uint8_t> grayPixels;
+        bool grayOk = read_tracker_gray_gpu(filter, ocrTex, w, h, grayPixels);
+        if (!grayOk) {
+            // 폴백: 전체 BGRA readback → CPU gray 변환
+            if (read_texture_bgra_to_cpu(filter, ocrTex, w, h, bgraPixels, stride)) {
+                VisualTrackerManager::bgra_to_gray(bgraPixels.data(), (int)w, (int)h,
+                                                   stride, grayPixels);
+                grayOk = true;
             }
+        }
 
-            // OCR 제출: ocrIdle일 때만. pixels copy → OCR thread 소유.
-            if (ocrIdle) {
-                std::vector<uint8_t> ocrPixels(bgraPixels); // 8MB copy @~4fps
-                submit_ocr_frame(filter, std::move(ocrPixels), (int)w, (int)h, stride);
-
-                if (++filter->trackerLogCounter >= 150) {
-                    filter->trackerLogCounter = 0;
-                    blog(LOG_INFO, "[SC-tracker] active=%zu",
-                         filter->trackerMgr.active_boxes().size());
-                }
-            }
-
-            // P0-4: BGRA→gray 변환을 렌더 스레드에서 한 번만 수행
-            // (tracker thread 내부의 bgra_to_gray 호출 제거 → 5ms 절감)
-            std::vector<uint8_t> grayPixels;
-            VisualTrackerManager::bgra_to_gray(bgraPixels.data(), (int)w, (int)h,
-                                               stride, grayPixels);
-
+        if (grayOk) {
             // Tracker thread에 gray swap 전달 (O(1), 항상 30Hz)
             {
                 std::lock_guard<std::mutex> lock(filter->trackerInputMutex_);
@@ -1222,9 +1304,45 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
                 filter->trackerInputReady_ = true;
             }
             filter->trackerInputCv_.notify_one();
-        } else {
-            if (ocrIdle)
+        }
+
+        // OCR + register_or_update: ocrIdle일 때만 BGRA readback (~4fps)
+        // P0-B: ocrBoxResultReady_는 ocrWorkerIdle와 항상 같이 세팅되므로
+        //       ocrIdle 게이트 안에서만 체크해도 결과를 놓치지 않는다.
+        if (ocrIdle) {
+            if (read_texture_bgra_to_cpu(filter, ocrTex, w, h, bgraPixels, stride)) {
+                // P0-B: OCR 결과 채널 소비 — render readback 픽셀로 register_or_update
+                {
+                    std::vector<VtOcrBox> pendingBoxes;
+                    bool hasOcrResult = false;
+                    {
+                        std::lock_guard<std::mutex> lock(filter->ocrBoxResultMutex_);
+                        if (filter->ocrBoxResultReady_) {
+                            pendingBoxes = std::move(filter->ocrBoxResult_);
+                            filter->ocrBoxResultReady_ = false;
+                            hasOcrResult = true;
+                        }
+                    }
+                    if (hasOcrResult && !pendingBoxes.empty()) {
+                        filter->trackerMgr.register_or_update(
+                            pendingBoxes, bgraPixels.data(), (int)w, (int)h, stride);
+                    }
+                }
+
+                std::vector<uint8_t> ocrPixels(bgraPixels); // ~4fps: 8MB copy
+                submit_ocr_frame(filter, std::move(ocrPixels), (int)w, (int)h, stride);
+
+                if (++filter->trackerLogCounter >= 150) {
+                    filter->trackerLogCounter = 0;
+                    blog(LOG_INFO, "[SC-tracker] active=%zu",
+                         filter->trackerMgr.active_boxes().size());
+                }
+            } else {
                 filter->ocrWorkerIdle.store(true, std::memory_order_release);
+            }
+        } else if (!grayOk) {
+            // gray도 실패, OCR도 건너뜀 → ocrIdle 복원
+            filter->ocrWorkerIdle.store(true, std::memory_order_release);
         }
     }
 

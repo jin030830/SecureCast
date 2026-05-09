@@ -8,6 +8,12 @@ sampler_state pointSampler {
     AddressV = Clamp;
 };
 
+sampler_state linearSampler {
+    Filter   = Linear;
+    AddressU = Clamp;
+    AddressV = Clamp;
+};
+
 struct VertData {
     float4 pos : POSITION;
     float2 uv  : TEXCOORD0;
@@ -23,9 +29,24 @@ float4 PSDefault(VertData v) : TARGET {
     return image.Sample(pointSampler, v.uv);
 }
 
+// Tier 1: BGRA 텍스처를 bilinear 다운샘플 + ITU-R BT.601 grayscale 변환.
+// R 채널에 gray 값을 출력한다 (GS_R8 렌더 타겟 사용 시 1 byte/pixel 스테이징).
+float4 PSGrayDownsample(VertData v) : TARGET {
+    float4 c = image.Sample(linearSampler, v.uv);
+    float gray = dot(c.rgb, float3(0.299, 0.587, 0.114));
+    return float4(gray, 0.0, 0.0, 1.0);
+}
+
 technique Draw {
     pass {
         vertex_shader = VSDefault(v);
         pixel_shader  = PSDefault(v);
+    }
+}
+
+technique GrayDownsample {
+    pass {
+        vertex_shader = VSDefault(v);
+        pixel_shader  = PSGrayDownsample(v);
     }
 }

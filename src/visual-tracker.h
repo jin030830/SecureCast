@@ -82,6 +82,14 @@ private:
 
         // P0-2: OCR 미확인 수명 카운터 (HARD_EXPIRY 초과 시 강제 제거)
         int          framesSinceOcrValidate = 0;
+
+        // Tier 3: AVX2 NCC 용 사전 계산 float 템플릿
+        // tmpl_float[i] = (float)tmpl[i] - tmean  (centered)
+        // tmpl_dT = Σ tmpl_float[i]²  (template variance × N)
+        // tmpl_sumCt = Σ tmpl_float[i]  (≈ 0, 정수 반올림 오차 보정용)
+        std::vector<float> tmpl_float;
+        float              tmpl_dT    = 0.0f;
+        float              tmpl_sumCt = 0.0f;
     };
 
     mutable std::mutex    mtx_;
@@ -91,16 +99,27 @@ private:
     // 공통 구현 (lock 없이 호출; mtx_ 보유 상태에서만 사용)
     void update_all_impl(const uint8_t* gray, int gw, int gh);
 
-    // NCC score: template top-left at (sx, sy) in gray frame
+    // NCC score: template top-left at (sx, sy) in gray frame (scalar fallback)
     float ncc_at(const uint8_t* gray, int gstride, int gw, int gh,
                  const std::vector<uint8_t>& tmpl, int tw, int th,
                  int sx, int sy) const;
 
-    // P0-1: 2-Level 피라미드 매칭 + P0-3: 속도 예측 검색 중심
-    // halfGray: 1/2 다운샘플 gray (gw/2 × gh/2), hw/hh = 그 크기
+    // Tier 3: AVX2-accelerated NCC using precomputed float template.
+    // tmpl_float, tmpl_dT, tmpl_sumCt must be up-to-date in tr.
+    // Falls back to ncc_at when AVX2 unavailable.
+    float ncc_at_simd(const uint8_t* gray, int gstride, int gw, int gh,
+                      const Tracker& tr, int sx, int sy) const;
+
+    // Tier 3: tmpl → tmpl_float/tmpl_dT/tmpl_sumCt 사전 계산.
+    // tmpl 또는 tw/th 변경 시 반드시 호출한다.
+    static void precompute_tmpl_stats(Tracker& tr);
+
+    // Tier 3: 2-Level 피라미드 매칭 (quarter coarse → full fine)
+    // quarterGray: 1/4 다운샘플 gray (gw/4 × gh/4), qw/qh = 그 크기
+    // 코어스: quarter에서 SEARCH_FAR/4 반경 탐색 → 파인: 원해상도 ±6px AVX2 NCC
     void update_one_pyramid(Tracker& tr,
-                            const uint8_t* gray, int gw, int gh,
-                            const uint8_t* halfGray, int hw, int hh);
+                            const uint8_t* gray,        int gw, int gh,
+                            const uint8_t* quarterGray, int qw, int qh);
 
     // gray 프레임의 (cx, cy, cw, ch) 영역을 crop (프레임 경계 자동 클램프)
     static std::vector<uint8_t> extract_gray_crop(

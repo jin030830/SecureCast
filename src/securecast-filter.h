@@ -284,6 +284,17 @@ struct SecureCastFilter {
     // active_boxes()       → 매 render 프레임 블러 좌표 조회
     VisualTrackerManager trackerMgr;
 
+    // ----- [Tier 1] GPU Grayscale Readback for 30Hz Tracker -----
+    // 렌더 스레드에서 full BGRA readback(8MB) 대신:
+    //   GPU: 전체 프레임 → R8 gray 셰이더 → trackerGrayRender_
+    //   Stage: trackerGrayStage_ → map → 2MB gray (1 byte/pixel, 1080p 기준)
+    // BGRA readback은 ~4fps OCR 경로에서만 발생.
+    gs_effect_t*    trackerGrayEffect_ = nullptr;  // downsample.effect GrayDownsample
+    gs_texrender_t* trackerGrayRender_ = nullptr;  // full-res R8 gray render target
+    gs_stagesurf_t* trackerGrayStage_  = nullptr;  // staging for CPU readback
+    uint32_t        trackerGrayW_      = 0;
+    uint32_t        trackerGrayH_      = 0;
+
     // ----- [P0-B] OCR 결과 채널: OCR worker → render thread -----
     // OCR worker가 자신의 픽셀로 register_or_update를 직접 호출하면
     // NCC가 render 프레임에서 탬플릿을 찾지 못해 즉시 소멸한다.
