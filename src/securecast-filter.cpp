@@ -1602,8 +1602,11 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
 
     // --- [좌표계 동기화] use1GPath 활성 여부 사전 판별 ---
     // 트래커 gray 제출 전에 결정해야 트래커와 OCR이 동일 해상도 공간을 공유함.
+    // ⚠️ 1080p(1920px)에서는 절반(960×540)이 OCR 인식 한계 이하이므로
+    //    2K(2560×1440) 이상에서만 활성화. 1080p는 full-res OCR 사용.
 #ifdef _WIN32
-    const bool use1GPath = (w >= 1280) && filter->trackerGrayEffect_;
+    const bool use1GPath =
+        (w >= 2560 && h >= 1440) && filter->trackerGrayEffect_;
 #else
     constexpr bool use1GPath = false;
 #endif
