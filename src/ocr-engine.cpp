@@ -1,5 +1,6 @@
 #include "ocr-engine.h"
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <initializer_list>
@@ -11,6 +12,8 @@
 // === Google RE2 사용 ===
 // std::regex 대신 RE2를 강제로 사용한다.
 #include <re2/re2.h>
+
+#include <obs-module.h>
 
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Foundation.h>
@@ -48,6 +51,61 @@ struct SecureCastOcrEngine::Impl {
 // ============================================================
 
 namespace {
+
+class PhaseTimer {
+  double *acc_;
+  std::chrono::steady_clock::time_point start_;
+
+public:
+  PhaseTimer(double *acc)
+      : acc_(acc), start_(std::chrono::steady_clock::now()) {}
+  ~PhaseTimer() {
+    auto end = std::chrono::steady_clock::now();
+    if (acc_) {
+      *acc_ += std::chrono::duration<double, std::milli>(end - start_).count();
+    }
+  }
+};
+
+class FrameTimer {
+  ProfileEMA *p_;
+  std::chrono::steady_clock::time_point start_;
+
+public:
+  FrameTimer(ProfileEMA *p) : p_(p), start_(std::chrono::steady_clock::now()) {
+    p_->acc = {};
+  }
+  ~FrameTimer() {
+    auto end = std::chrono::steady_clock::now();
+    double total_ms =
+        std::chrono::duration<double, std::milli>(end - start_).count();
+
+    auto update_ema = [](double &ema, double val) {
+      ema = (ema == 0.0) ? val : (ema * 0.9 + val * 0.1);
+    };
+    update_ema(p_->bgra_ms, p_->acc.bgra);
+    update_ema(p_->recog_ms, p_->acc.recog);
+    update_ema(p_->multipass_ms, p_->acc.multipass);
+    update_ema(p_->dhash_ms, p_->acc.dhash);
+    update_ema(p_->detect_ms, p_->acc.detect);
+    update_ema(p_->total_ms, total_ms);
+
+    p_->sample_count++;
+    if (p_->sample_count == 1) {
+      p_->last_log = end;
+    }
+    if (std::chrono::duration_cast<std::chrono::seconds>(end - p_->last_log)
+            .count() >= 60) {
+      blog(LOG_INFO,
+           "[SecureCast][profile] bgra=%.2f ocr=%.2f mp=%.2f dhash=%.2f "
+           "pii=%.2f total=%.2f (n=%d)",
+           p_->bgra_ms, p_->recog_ms, p_->multipass_ms, p_->dhash_ms,
+           p_->detect_ms, p_->total_ms, p_->sample_count);
+      p_->last_log = end;
+      p_->sample_count = 0;
+    }
+  }
+};
 
 // === STEP 0: 언어팩 사전 검증 (플러그인 초기화 시 1회) ===
 bool check_ocr_language() {
@@ -124,6 +182,8 @@ bool SecureCastOcrEngine::available() const { return available_; }
 std::vector<SecureCastOcrBox>
 SecureCastOcrEngine::analyze_bgra_frame(const uint8_t *pixels, int width,
                                         int height, int stride) {
+  FrameTimer frame_timer(&profile_);
+
   if (!available_ || pixels == nullptr || width <= 0 || height <= 0 ||
       stride <= 0)
     return {};
@@ -282,6 +342,7 @@ SecureCastOcrEngine::analyze_bgra_frame(const uint8_t *pixels, int width,
 uint64_t SecureCastOcrEngine::compute_dhash_region(const uint8_t *px,
                                                    int stride, int x, int y,
                                                    int w, int h) const {
+  PhaseTimer t_dhash(&profile_.acc.dhash);
   if (!px || w <= 0 || h <= 0)
     return 0;
 
@@ -310,6 +371,7 @@ uint64_t SecureCastOcrEngine::compute_dhash_region(const uint8_t *px,
 uint64_t SecureCastOcrEngine::compute_roi_dhash(
     const uint8_t *px, int stride, int width, int height,
     const std::vector<SecureCastOcrBox> &boxes) const {
+  PhaseTimer t_dhash(&profile_.acc.dhash);
   (void)boxes;
   return compute_dhash_region(px, stride, 0, 0, width, height);
 }
@@ -377,36 +439,43 @@ SecureCastOcrEngine::recognize_text(const uint8_t *pixels, int width,
     std::vector<uint8_t> packed;
     packed.resize(static_cast<size_t>(rowBytes) * static_cast<size_t>(height));
 
-    for (int y = 0; y < height; ++y) {
-      const uint8_t *srcRow =
-          pixels + static_cast<size_t>(y) * static_cast<size_t>(stride);
+    winrt::Windows::Graphics::Imaging::SoftwareBitmap bitmap{nullptr};
+    {
+      PhaseTimer t_bgra(&profile_.acc.bgra);
+      for (int y = 0; y < height; ++y) {
+        const uint8_t *srcRow =
+            pixels + static_cast<size_t>(y) * static_cast<size_t>(stride);
 
-      uint8_t *dstRow = packed.data() +
-                        static_cast<size_t>(y) * static_cast<size_t>(rowBytes);
+        uint8_t *dstRow = packed.data() + static_cast<size_t>(y) *
+                                              static_cast<size_t>(rowBytes);
 
-      std::memcpy(dstRow, srcRow, static_cast<size_t>(rowBytes));
+        std::memcpy(dstRow, srcRow, static_cast<size_t>(rowBytes));
+      }
+
+      auto buffer = CryptographicBuffer::CreateFromByteArray(packed);
+
+      bitmap = SoftwareBitmap::CreateCopyFromBuffer(
+          buffer, BitmapPixelFormat::Bgra8, width, height,
+          BitmapAlphaMode::Premultiplied);
     }
-
-    auto buffer = CryptographicBuffer::CreateFromByteArray(packed);
-
-    SoftwareBitmap bitmap = SoftwareBitmap::CreateCopyFromBuffer(
-        buffer, BitmapPixelFormat::Bgra8, width, height,
-        BitmapAlphaMode::Premultiplied);
 
     // === STEP 2-1: OCR 실행 ===
     // op를 Impl에 보관해 두면 stop_ocr_worker가 Cancel()을 보낼 수 있다.
     // opMutex 구간을 짧게 유지하여 Cancel() 호출이 .get() 블로킹 외부에서
     // 처리된다.
-    auto op = impl_->engine.RecognizeAsync(bitmap);
+    winrt::Windows::Media::Ocr::OcrResult result{nullptr};
     {
-      std::lock_guard<std::mutex> lk(impl_->opMutex);
-      impl_->currentOp = op;
-    }
-    auto result =
-        op.get(); // hresult_canceled 포함 예외 → catch(...) → return {}
-    {
-      std::lock_guard<std::mutex> lk(impl_->opMutex);
-      impl_->currentOp = nullptr;
+      PhaseTimer t_recog(&profile_.acc.recog);
+      auto op = impl_->engine.RecognizeAsync(bitmap);
+      {
+        std::lock_guard<std::mutex> lk(impl_->opMutex);
+        impl_->currentOp = op;
+      }
+      result = op.get(); // hresult_canceled 포함 예외 → catch(...) → return {}
+      {
+        std::lock_guard<std::mutex> lk(impl_->opMutex);
+        impl_->currentOp = nullptr;
+      }
     }
 
     // === STEP 3: 결과에서 텍스트와 좌표 추출 ===
@@ -646,30 +715,30 @@ static bool has_adjacent_name_label(const std::vector<SecureCastOcrLine> &lines,
 }
 
 static bool looks_like_korean_address_text(const std::string &text) {
+  // 방향·이동 표현이 포함된 경우 주소가 아님 ("서울 쪽으로", "서울 방향")
+  if (contains_any(text, {"쪽으로", "방향으로", "방면으로", "쪽방향", "가는 길",
+                           "오는 길", "방향", "근처", "부근", "쪽"}))
+    return false;
+
   // 명시 라벨 → 단독으로 충분
   if (contains_any(text,
                    {"주소", "주소지", "거주지", "소재지", "사는곳", "배송지"}))
     return true;
 
   // 시·도 광역권 키워드 AND 행정구역 접미사 — 둘 다 만족해야 ADDRESS
-  // "서울 다녀옴" → 지역어는 있지만 접미사 없음 → false
-  // "도서관 가는 길" → 지역어 없음 → false
-  // "서울시 강남구 역삼동" → 지역어+접미사 → true
   const bool hasRegion = contains_any(
       text, {"서울", "부산", "대구", "인천", "광주", "대전", "울산",
              "세종", "경기", "강원", "충북", "충남", "충청", "전북",
              "전남", "전라", "경북", "경남", "경상", "제주"});
 
-  // B-2: 지역어 + 도로명 주소 ("서울 테헤란로 152", "경기 강남대로 1번길")
-  // 기존 AND 조건에서 제외한 '로/길'을 번지수가 있을 때만 허용한다.
+  // B-2: 지역어 + 도로명 주소 ("서울 테헤란로 152")
   if (hasRegion) {
     static const re2::RE2 PAT_ROAD(R"([가-힣]{2,}(?:로|길)\s*\d+)");
     if (RE2::PartialMatch(text, PAT_ROAD))
       return true;
   }
 
-  // B-3: 동·읍·면 + 번지 ("역삼동 736-1", "삼성동 167번지") — 지역어 없어도
-  // 충분한 시그널
+  // B-3: 동·읍·면 + 번지 ("역삼동 736-1") — 지역어 없어도 충분한 시그널
   {
     static const re2::RE2 PAT_LOT(
         R"([가-힣]{2,}(?:동|읍|면)\s*\d+(?:-\d+)?(?:번지)?)");
@@ -921,7 +990,14 @@ static bool valid_card_iin(const std::string &digits) {
 
 static bool valid_email(const std::string &e) {
   const auto at = e.find('@');
-  if (at == std::string::npos || at < 1 || at > 64)
+  if (at == std::string::npos || at < 1)
+    return false;
+  // RFC 5321: local-part 최대 64자
+  if (at > 64)
+    return false;
+  // 전체 이메일 주소가 지나치게 길면(> 254자) 유효하지 않음 (RFC 5321)
+  // 또는 local-part 자체가 비현실적으로 길면 더미/스팸으로 간주
+  if (at > 40)
     return false;
   const auto dot = e.rfind('.');
   if (dot == std::string::npos || dot < at + 2 || dot >= e.size() - 2)
@@ -975,30 +1051,30 @@ SecureCastOcrEngine::normalize_numeric_candidate(const std::string &text) {
 // === STEP 2-1: OCR 결과에 대해 RE2 패턴 매칭 실행 ===
 std::vector<SecureCastOcrBox>
 SecureCastOcrEngine::detect_pii(const std::vector<SecureCastOcrLine> &lines) {
+  PhaseTimer t_det(&profile_.acc.detect);
   // === 정규식 패턴 정의: 초기화 시 1회 컴파일 ===
 
   // 1) 주민등록번호: 6자리-7자리, 뒷자리 첫 글자 1~8 (외국인 포함)
-  // \s?[-–]\s?: OCR이 "850101 - 1234566" 처럼 구분자 앞뒤 공백을 추가하는 경우
-  // 허용.
-  static const re2::RE2 PATTERN_RRN(R"(\b(\d{6})\s?[-–]?\s?([1-8]\d{6})\b)");
+  // [-/·\s]?: OCR이 슬래시·중간점·공백으로 구분자를 잘못 읽는 경우까지 허용.
+  static const re2::RE2 PATTERN_RRN(
+      R"(\b(\d{6})\s?[-/·]?\s?([1-8]\d{6})\b)");
 
-  // 2) 전화번호: 휴대폰(010/011/016~019) + 지역번호(02/03x/04x/05x/06x) + +82
-  // 정규화 +82 대안: \b 를 제거 — RE2에서 \b 는 ASCII word-char 기준이므로 `+`
-  // 앞에서 미작동.
-  //           01X 대안은 \b 를 유지 (긴 숫자열 부분 매칭 방지).
+  // 2) 전화번호: 국내(010/011/016~019, 02~06x) + 국제(+1-xxx, +44-xx...)
+  // 국제번호는 \b 없이 +로 시작하므로 별도 alt 추가.
   static const re2::RE2 PATTERN_PHONE(
-      R"((?:\+82[-\s]?1[016-9]|\b01[016-9])[-\s]?\d{3,4}[-\s]?\d{4}\b|\b0(?:2[-\s]?\d{3,4}|[3-9]\d[-\s]?\d{3,4}|[3-9]\d{2}[-\s]?\d{3,4})[-\s]?\d{4}\b)");
+      R"((?:\+82[-\s]?1[016-9]|\b01[016-9])[-\s]?\d{3,4}[-\s]?\d{4}\b|\b0(?:2[-\s]?\d{3,4}|[3-9]\d[-\s]?\d{3,4}|[3-9]\d{2}[-\s]?\d{3,4})[-\s]?\d{4}\b|\+[1-9]\d{0,2}[-\s]?(?:\d[-\s]?){6,13}\d)");
 
   // 3) 이메일: 전체를 그룹 1로 캡처 (valid_email 검증에 사용)
   static const re2::RE2 PATTERN_EMAIL(
       R"(([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}))");
 
-  // 4) 신용카드 번호: 정확히 4-4-4-4 구조 + 그룹 캡처 (Luhn/IIN 검증용)
+  // 4) 신용카드 번호: 4-4-4-4(일반) 또는 4-6-5(AmEx) 구조 + 그룹 캡처
   static const re2::RE2 PATTERN_CARD(
       R"(\b(\d{4})[-\s](\d{4})[-\s](\d{4})[-\s](\d{4})\b)");
+  static const re2::RE2 PATTERN_CARD_AMEX(
+      R"(\b(\d{4})[-\s](\d{6})[-\s](\d{5})\b)");
 
-  // 5) IP 주소: 각 옥텟 캡처 (사설/예약 대역 제외는 아래 is_valid_public_ip로
-  // 검증)
+  // 5) IP 주소: 각 옥텟 캡처 (사설/예약 대역 제외는 아래에서 검증)
   static const re2::RE2 PATTERN_IP(
       R"(\b(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\b)");
 
@@ -1006,9 +1082,12 @@ SecureCastOcrEngine::detect_pii(const std::vector<SecureCastOcrLine> &lines) {
   static const re2::RE2 PATTERN_ACCOUNT(
       R"(\d{3,4}[-\s]?\d{2,4}[-\s]?\d{4,6}(?:[-\s]?\d{0,3})?)");
 
-  // 7) OCR 보정이 필요한 숫자 cluster 추출
+  // 7) OCR 보정 숫자 cluster 추출
+  // ⚠️ EN DASH(–, U+2013)를 문자 클래스 내에 직접 삽입하면 RE2가
+  //    앞 문자와 범위로 해석하여 I·O 등 ASCII 문자 매칭을 깨뜨린다.
+  //    → EN DASH는 제거하고 일반 하이픈(\-)만 유지한다.
   static const re2::RE2 PATTERN_NUMERIC_CLUSTER(
-      R"([0-9OoIlSBZz](?:[0-9OoIlSBZz\-\s\.–+]*[0-9OoIlSBZz])?)");
+      R"([0-9OoIlSBZz](?:[0-9OoIlSBZz\-\s\.+]*[0-9OoIlSBZz])?)");
 
   // A-7) 이름 + 호칭 직접 패턴 (높은 신뢰도)
   // "김철수님", "이민준씨" 등 — 성씨 시작 2~4자 + 님/씨
@@ -1135,6 +1214,10 @@ SecureCastOcrEngine::detect_pii(const std::vector<SecureCastOcrLine> &lines) {
       while (RE2::FindAndConsume(&input, PATTERN_NUMERIC_CLUSTER, &cluster)) {
         normalizedLine += normalize_numeric_candidate(cluster) + " ";
       }
+      // 클러스터 추출 실패 시(OCR 오류 문자 포함): rawText 전체를 직접 정규화
+      // 예: "O1O-1234-5678" → 클러스터 미추출 → normalize 직접 적용 → "010-1234-5678"
+      if (normalizedLine.empty())
+        normalizedLine = normalize_numeric_candidate(rawText);
       if (normalizedLine.empty())
         normalizedLine = rawText;
 
@@ -1164,13 +1247,18 @@ SecureCastOcrEngine::detect_pii(const std::vector<SecureCastOcrLine> &lines) {
         }
       }
 
-      // (b) PHONE: \b 경계 + prefix 화이트리스트 패턴으로 탐지
+      // (b) PHONE: 기술 문서 맥락(버전·빌드·코드 등)에서만 제외, 나머지는 모두 탐지
+      // 🚨 보안 원칙: 화이트리스트가 아닌 블랙리스트로 통제 — 차단 범위를 최소화해
+      //    "전화 010-", "담당 010-", "본가 010-" 같은 실제 개인정보를 놓치지 않는다.
       if (type == nullptr && RE2::PartialMatch(normalizedLine, PATTERN_PHONE)) {
-        type = "PHONE";
+        // 기술 문서 키워드가 전화번호 바로 앞에 있을 때만 제외 (정확한 블랙리스트)
+        static const re2::RE2 PAT_PHONE_TECH_BLOCK(
+            R"((?:빌드|버전|version|v\.|build|patch|패치|품번|코드|code|모델|model|ref|rev|번호[가-힣]{0,2}(?=\s*(?!\d{3})))\s*(?:010|01[16-9]|02|0[3-9]))");
+        if (!RE2::PartialMatch(rawText, PAT_PHONE_TECH_BLOCK))
+          type = "PHONE";
       }
 
-      // CARD: 4-4-4-4 구조 + Luhn checksum + IIN 검증
-      // Luhn만으로 무작위 16자리의 ~90%를, IIN으로 추가 ~50%를 배제한다.
+      // CARD: 4-4-4-4(일반) 또는 4-6-5(AmEx) + Luhn + IIN 검증
       if (type == nullptr) {
         std::string g1, g2, g3, g4;
         if (RE2::PartialMatch(normalizedLine, PATTERN_CARD, &g1, &g2, &g3,
@@ -1179,31 +1267,57 @@ SecureCastOcrEngine::detect_pii(const std::vector<SecureCastOcrLine> &lines) {
           if (luhn_check(digits) && valid_card_iin(digits))
             type = "CARD";
         }
+        // AmEx: 4-6-5 구조, 15자리, Luhn 검증
+        if (type == nullptr) {
+          std::string a1, a2, a3;
+          if (RE2::PartialMatch(normalizedLine, PATTERN_CARD_AMEX, &a1, &a2,
+                                &a3)) {
+            const std::string digits15 = a1 + a2 + a3;
+            // AmEx는 34 또는 37로 시작
+            if ((digits15[0] == '3' &&
+                 (digits15[1] == '4' || digits15[1] == '7')) &&
+                [](const std::string &d) {
+                  int sum = 0;
+                  for (int k = 0; k < (int)d.size(); ++k) {
+                    int v = d[d.size() - 1 - k] - '0';
+                    if (k % 2 == 1) {
+                      v *= 2;
+                      if (v > 9) v -= 9;
+                    }
+                    sum += v;
+                  }
+                  return sum % 10 == 0;
+                }(digits15))
+              type = "CARD";
+          }
+        }
       }
 
-      // (a) IP: 옥텟 범위 + 사설/예약 대역 제외 검증
+      // (a) IP: 옥텟 범위 + 사설/예약/멀티캐스트 대역 제외 검증
       if (type == nullptr) {
         std::string oa, ob, oc, od;
         re2::StringPiece ipInput(normalizedLine);
         while (RE2::FindAndConsume(&ipInput, PATTERN_IP, &oa, &ob, &oc, &od)) {
           int a = std::stoi(oa), b = std::stoi(ob), c = std::stoi(oc),
               d = std::stoi(od);
-          // 옥텟 범위 검증
           if (a > 255 || b > 255 || c > 255 || d > 255)
             continue;
-          // 사설/예약 대역 제외 (RFC 1918, 루프백, 링크로컬, 브로드캐스트)
           if (a == 10)
-            continue; // 10.0.0.0/8
+            continue; // 10.0.0.0/8 사설
           if (a == 172 && b >= 16 && b <= 31)
-            continue; // 172.16.0.0/12
+            continue; // 172.16.0.0/12 사설
           if (a == 192 && b == 168)
-            continue; // 192.168.0.0/16
+            continue; // 192.168.0.0/16 사설
           if (a == 127)
             continue; // 루프백
           if (a == 169 && b == 254)
             continue; // 링크로컬
           if (a == 0 || a == 255)
             continue; // 0.x.x.x / 브로드캐스트
+          if (a >= 224 && a <= 239)
+            continue; // 멀티캐스트 (RFC 3171)
+          if (a >= 240)
+            continue; // 예약 대역 (RFC 1112)
           type = "IP";
           break;
         }
@@ -1258,6 +1372,21 @@ SecureCastOcrEngine::detect_pii(const std::vector<SecureCastOcrLine> &lines) {
       const bool sameLineLabel = has_name_label(rawText);
       const bool adjLabel = has_adjacent_name_label(lines, i);
 
+      // === 영문 이름 탐지 (라벨 + FirstName LastName 패턴) ===
+      // "name: Hong Gildong", "Full Name: Alice Smith" 형태
+      if (type == nullptr && sameLineLabel) {
+        static const re2::RE2 PAT_ENG_NAME(
+            R"((?:[A-Z][a-z]{1,14}\s){1,2}[A-Z][a-z]{1,14})");
+        std::string engName;
+        if (RE2::PartialMatch(rawText, PAT_ENG_NAME, &engName)) {
+          static const std::unordered_set<std::string> ENG_NAME_BLOCKLIST = {
+              "Full Name", "First Name", "Last Name", "User Name",
+              "Error Code", "Build Version"};
+          if (ENG_NAME_BLOCKLIST.find(engName) == ENG_NAME_BLOCKLIST.end())
+            type = "NAME";
+        }
+      }
+
       if (sameLineLabel || adjLabel) {
         // 같은 줄 라벨("이름: 김철수")이면 라벨 이후 텍스트만 검사한다.
         // 인접 줄 라벨이면 현재 라인 전체를 검사한다.
@@ -1311,6 +1440,7 @@ SecureCastOcrEngine::detect_pii(const std::vector<SecureCastOcrLine> &lines) {
 std::vector<SecureCastOcrLine> SecureCastOcrEngine::multipass_small_text(
     const std::vector<SecureCastOcrLine> &lines, const uint8_t *pixels,
     int width, int height, int stride) {
+  PhaseTimer t_mp(&profile_.acc.multipass);
   // MAX_PASSES = 6: 성능/OCR 스레드 예산 상한.
   // 커밋 메시지 "MAX_PASSES 32"는 실험값이며 실제로는 6으로 확정.
   // 소형 라인 7개 초과분은 Phase 2 union bbox batch OCR로 처리.

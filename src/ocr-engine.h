@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -28,6 +29,18 @@ struct SecureCastOcrLine {
   float y;
   float w;
   float h;
+};
+
+struct ProfileEMA {
+  double bgra_ms = 0, recog_ms = 0, multipass_ms = 0;
+  double dhash_ms = 0, detect_ms = 0, total_ms = 0;
+  uint32_t sample_count = 0;
+  std::chrono::steady_clock::time_point last_log;
+
+  // 프레임 내 누적을 위한 임시 저장소
+  struct {
+    double bgra = 0, recog = 0, multipass = 0, dhash = 0, detect = 0;
+  } acc;
 };
 
 class SecureCastOcrEngine {
@@ -77,6 +90,7 @@ private:
   std::unique_ptr<Impl> impl_;
 
   bool available_ = false;
+  mutable ProfileEMA profile_;
 
   // ========================================================
   // Dirty Skip — dHash 기반 2-Level 캐시
