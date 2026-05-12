@@ -122,13 +122,28 @@ jobs:
 
           $srcBin = Join-Path $vcpkgRoot "installed\x64-windows\bin"
           $buildBin = "${{ github.workspace }}\build_x64\${{ needs.check-event.outputs.config }}"
+          $pluginName = "${{ steps.setup.outputs.pluginName }}"
+          
+          # Define full path to release binary folder
+          $releaseBin = Join-Path "${{ github.workspace }}" "release\${{ needs.check-event.outputs.config }}\${pluginName}\bin\64bit"
 
-          Write-Host "Copying RE2 runtime DLLs from $srcBin to $buildBin"
+          Write-Host "Copying RE2 runtime DLLs from $srcBin to both build and release dirs"
 
+          # Ensure releaseBin exists just in case (though CMake should have made it)
+          if (-not (Test-Path $releaseBin)) {
+              New-Item -ItemType Directory -Force -Path $releaseBin | Out-Null
+          }
+
+          # Copy to build dir
           Copy-Item (Join-Path $srcBin "re2.dll") $buildBin -Force
           Copy-Item (Join-Path $srcBin "absl_*.dll") $buildBin -Force
 
-          Get-ChildItem $buildBin -Filter "*.dll" | Select-Object Name
+          # Copy to release package dir (CRITICAL FOR ZIP ARCHIVE)
+          Copy-Item (Join-Path $srcBin "re2.dll") $releaseBin -Force
+          Copy-Item (Join-Path $srcBin "absl_*.dll") $releaseBin -Force
+
+          Write-Host "Successfully copied to $releaseBin"
+          Get-ChildItem $releaseBin -Filter "*.dll" | Select-Object Name
 
 
       - name: Package Plugin 📀
