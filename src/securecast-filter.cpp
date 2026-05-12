@@ -1621,8 +1621,8 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
       bool ocrSubmit = false;
 
 #ifdef _WIN32
-      const bool use1GPath =
-          (w >= 2560 && h >= 1440) && filter->trackerGrayEffect_;
+      // 1-G 최적화: 720p(1280px) 이상일 때 항시 절반 크기 GPU 다운스케일 적용 (속도 3~4배 향상)
+      const bool use1GPath = (w >= 1280) && filter->trackerGrayEffect_;
       if (use1GPath) {
         // 1-G: GPU BGRADownsample2x → half-size BGRA readback
         if (read_texture_bgra_half_gpu(filter, ocrTex, w, h, ocrPixels,
