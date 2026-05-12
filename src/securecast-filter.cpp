@@ -1600,9 +1600,32 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
       }
     }
 
+    // --- [좌표계 동기화] use1GPath 활성 여부 사전 판별 ---
+    // 트래커 gray 제출 전에 결정해야 트래커와 OCR이 동일 해상도 공간을 공유함.
+#ifdef _WIN32
+    const bool use1GPath = (w >= 1280) && filter->trackerGrayEffect_;
+#else
+    constexpr bool use1GPath = false;
+#endif
+
     if (grayOk) {
-      // Tracker thread에 gray swap 전달 (O(1), 항상 30Hz)
-      {
+      // [좌표계 동기화] use1GPath 시: 트래커도 half-res 공간에서 추적해야
+      // OCR이 넘겨준 박스 좌표(half-res)와 공간이 일치한다.
+      // trackerCoordScale_=2.0f로 저장해두어 렌더 시 원본 해상도로 복원.
+      if (use1GPath) {
+        std::vector<uint8_t> halfGray;
+        int hw = 0, hh = 0;
+        VisualTrackerManager::downsample_2x_into(grayPixels.data(), (int)w,
+                                                 (int)h, halfGray, hw, hh);
+        filter->trackerCoordScale_ = 2.0f;
+        std::lock_guard<std::mutex> lock(filter->trackerInputMutex_);
+        filter->trackerInputGray_.swap(halfGray);
+        filter->trackerInputW_ = hw;
+        filter->trackerInputH_ = hh;
+        filter->trackerInputReady_ = true;
+      } else {
+        // full-res 모드: 스케일 복원 불필요
+        filter->trackerCoordScale_ = 1.0f;
         std::lock_guard<std::mutex> lock(filter->trackerInputMutex_);
         filter->trackerInputGray_.swap(grayPixels);
         filter->trackerInputW_ = (int)w;
@@ -1613,16 +1636,14 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
     }
 
     // OCR 제출: ocrIdle일 때만 (~4fps)
-    // 1-G: 1440p+ → GPU 2× 다운샘플 readback (2 MB). 그 외 → 전체 BGRA readback
-    // (8 MB).
+    // 1-G: 1280px+ → GPU 2× 다운샘플 readback으로 속도 최적화.
+    //      트래커도 동일 half-res 공간을 사용하므로 좌표계 불일치 없음.
     if (ocrIdle) {
       std::vector<uint8_t> ocrPixels;
       int ocrW = static_cast<int>(w), ocrH = static_cast<int>(h), ocrStride = 0;
       bool ocrSubmit = false;
 
 #ifdef _WIN32
-      // 1-G 최적화: 720p(1280px) 이상일 때 항시 절반 크기 GPU 다운스케일 적용 (속도 3~4배 향상)
-      const bool use1GPath = (w >= 1280) && filter->trackerGrayEffect_;
       if (use1GPath) {
         // 1-G: GPU BGRADownsample2x → half-size BGRA readback
         if (read_texture_bgra_half_gpu(filter, ocrTex, w, h, ocrPixels,
@@ -1634,7 +1655,7 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
       }
 #endif
       if (!ocrSubmit) {
-        // 폴백: 전체 BGRA readback (1080p 이하 또는 GPU 다운스케일 실패)
+        // 폴백: 전체 BGRA readback (use1GPath 미활성 또는 GPU 다운스케일 실패)
         if (!bgraPixels.empty()) {
           ocrPixels = bgraPixels;
           ocrStride = static_cast<int>(w) * 4;
@@ -1714,16 +1735,19 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
   }
 #endif
   // OCR 박스 — Visual Tracker가 제공하는 NCC 추적 위치
+  // [좌표계 동기화] use1GPath 모드에서는 트래커가 half-res 공간에서 추적하므로
+  // trackerCoordScale_(=2.0f)를 곱해 원본 해상도로 좌표를 복원한다.
   {
+    const float tScale = filter->trackerCoordScale_;
     const auto trackerBoxes = filter->trackerMgr.active_boxes();
     for (const auto &tb : trackerBoxes) {
       if (all_count >= (int)(sizeof(all_rects) / sizeof(all_rects[0])))
         break;
       BlurRect r{};
-      r.x = static_cast<int>(tb.x);
-      r.y = static_cast<int>(tb.y);
-      r.width = static_cast<int>(tb.w);
-      r.height = static_cast<int>(tb.h);
+      r.x = static_cast<int>(tb.x * tScale);
+      r.y = static_cast<int>(tb.y * tScale);
+      r.width = static_cast<int>(tb.w * tScale);
+      r.height = static_cast<int>(tb.h * tScale);
       r.type = 0; // Blur
       if (r.width > 0 && r.height > 0)
         all_rects[all_count++] = r;

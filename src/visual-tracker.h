@@ -86,6 +86,13 @@ public:
 
   void clear();
 
+  // 재사용 버퍼 버전: 2× 박스-필터 다운샘플 (gray → gray/2, public static).
+  // 렌더 스레드에서 트래커에 half-res gray를 전달할 때 직접 호출 가능.
+  // out_w/out_h = gw/2, gh/2 (정수 나눗셈).
+  static void downsample_2x_into(const uint8_t *gray, int gw, int gh,
+                                 std::vector<uint8_t> &out, int &out_w,
+                                 int &out_h);
+
 private:
   struct Tracker {
     int id;
@@ -165,11 +172,6 @@ private:
   // P0-1: 2× 박스-필터 다운샘플 (gray → gray/2)
   static std::vector<uint8_t> downsample_2x(const uint8_t *gray, int gw, int gh,
                                             int &out_w, int &out_h);
-
-  // 재사용 버퍼 버전: 30Hz 매 프레임 heap 재할당 방지 (1080p: 0.63 MB/frame)
-  static void downsample_2x_into(const uint8_t *gray, int gw, int gh,
-                                 std::vector<uint8_t> &out, int &out_w,
-                                 int &out_h);
 
   static float box_iou(const VtOcrBox &a, const Tracker &b);
 };

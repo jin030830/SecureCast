@@ -275,8 +275,8 @@ struct SecureCastFilter {
   float trackerAccumulator =
       0.0f; // 윈도우 스캔 틱 조절(0.15초 단위)용 시간 누산기
   gs_effect_t *blurEffect = nullptr; // 컴파일된 HLSL 셰이더
-  std::mutex blacklistMutex; // video_tick(비디오)과 video_render(렌더) 간의
-                             // 동시 접근을 막는 뮤텍스
+  std::mutex blacklistMutex;   // video_tick(비디오)과 video_render(렌더) 간의
+                               // 동시 접근을 막는 뮤텍스
   MaskPayload blacklistMask{}; // [우선순위 1] Role A가 추적한 블랙리스트 앱
                                // 좌표 (AI 처리 전에 최상단에 덮어씌움)
 #ifdef _WIN32
@@ -284,9 +284,9 @@ struct SecureCastFilter {
   TrackedWindowList windowList{};        // 현재 추적 중인 창 목록
   TrackedWindowList captureWindowList{}; // pushFrame 스냅샷: 직전 프레임 DWM
                                          // 좌표 (캡처 레이턴시 보정)
-  TrackedWindowList prevWindowList{}; // lingering 감지용 직전 스캔 결과
-  TrackedWindowList recentlySeenList{}; // 과거에 추적했던 창 목록 (quick
-                                        // restore용, 닫힐 때까지 유지)
+  TrackedWindowList prevWindowList{};    // lingering 감지용 직전 스캔 결과
+  TrackedWindowList recentlySeenList{};  // 과거에 추적했던 창 목록 (quick
+                                         // restore용, 닫힐 때까지 유지)
   LingeringWindow lingeringWindows[SC_MAX_LINGERING]{};
   int lingeringCount = 0;
 
@@ -383,4 +383,11 @@ struct SecureCastFilter {
   bool trackerInputReady_ = false;
   std::atomic<bool> trackerThreadRunning_{false};
   int trackerFrameSkip_ = 0; // 30Hz gate: 2프레임마다 readback
+
+  // ----- [좌표계 동기화] OCR 다운스케일 ↔ 트래커 공간 정합 -----
+  // use1GPath(OCR 절반 크기 제출)가 활성화된 경우, 트래커도 절반 해상도
+  // 공간에서 추적하므로 렌더 시 박스 좌표를 trackerCoordScale_ 배율로
+  // 원본 해상도로 복원해야 한다.
+  // 1.0f = full-res 모드(기본), 2.0f = half-res OCR 최적화 모드.
+  float trackerCoordScale_ = 1.0f;
 };
