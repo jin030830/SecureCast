@@ -23,6 +23,7 @@
 #ifdef _WIN32
 #include "window_tracker.h" // sc_tracker_tick (Role A: 블랙리스트 앱 좌표 수집)
 #include <obs-frontend-api.h> // obs_hotkey_register_frontend
+#include <dwmapi.h>
 #endif
 #include "ocr-engine.h" // Role B: OCR engine
 
@@ -77,6 +78,50 @@ static constexpr float GM_SAMPLE_INTERVAL = 1.0f; // CPU 샘플링 주기 (초)
 // 멀티코어 기준 전체 평균값. 오버헤드 거의 0 (단순 syscall).
 // ================================================================
 #ifdef _WIN32
+
+// DWM 썸네일 보호: 타겟 창이 최소화될 때 gray 비트맵으로 라이브 프리뷰를 덮는다.
+// DwmSetWindowAttribute는 같은 프로세스 소유 창에만 동작하므로 외부 앱(카톡 등)에는
+// 실제 적용되지 않지만 구조상 안전하게 fail-silently 한다.
+static void dwm_begin_protection(HWND hwnd, int w, int h)
+{
+  if (w <= 0) w = 200;
+  if (h <= 0) h = 150;
+
+  BOOL val = TRUE;
+  DwmSetWindowAttribute(hwnd, DWMWA_FORCE_ICONIC_REPRESENTATION, &val, sizeof(val));
+  DwmSetWindowAttribute(hwnd, DWMWA_HAS_ICONIC_BITMAP, &val, sizeof(val));
+
+  BITMAPV5HEADER bih{};
+  bih.bV5Size        = sizeof(bih);
+  bih.bV5Width       = w;
+  bih.bV5Height      = -h; // top-down
+  bih.bV5Planes      = 1;
+  bih.bV5BitCount    = 32;
+  bih.bV5Compression = BI_RGB;
+
+  void *pvBits = nullptr;
+  HDC hdc = GetDC(nullptr);
+  HBITMAP hbm = CreateDIBSection(hdc, (BITMAPINFO *)&bih, DIB_RGB_COLORS,
+                                 &pvBits, nullptr, 0);
+  ReleaseDC(nullptr, hdc);
+  if (hbm && pvBits) {
+    memset(pvBits, 0x80, (size_t)w * h * 4); // mid-gray
+    DwmSetIconicThumbnail(hwnd, hbm, 0);
+    DwmSetIconicLivePreviewBitmap(hwnd, hbm, nullptr, 0);
+    DeleteObject(hbm);
+  }
+  DwmInvalidateIconicBitmaps(hwnd);
+}
+
+// DWM 썸네일 보호 해제. 창이 완전히 소멸(IsWindow==false)한 이후에만 호출한다.
+static void dwm_end_protection(HWND hwnd)
+{
+  BOOL val = FALSE;
+  DwmSetWindowAttribute(hwnd, DWMWA_FORCE_ICONIC_REPRESENTATION, &val, sizeof(val));
+  DwmSetWindowAttribute(hwnd, DWMWA_HAS_ICONIC_BITMAP, &val, sizeof(val));
+  DwmInvalidateIconicBitmaps(hwnd);
+}
+
 static float sampleCpuUsage(FILETIME *prevIdle, FILETIME *prevKernel,
                             FILETIME *prevUser) {
   FILETIME idle, kernel, user;
@@ -317,6 +362,19 @@ FrameRingBuffer::peekSlotAtOffset(int framesBack) const {
       SC_RING_BUFFER_SLOTS;
   return &m_slots[idx];
 }
+
+#ifdef _WIN32
+void FrameRingBuffer::purgeWindowFromAllSlots(HWND hwnd)
+{
+  for (auto &slot : m_slots) {
+    TrackedWindowList &wl = slot.windowSnapshot;
+    for (int i = wl.count - 1; i >= 0; --i) {
+      if (wl.items[i].hwnd == hwnd)
+        wl.items[i] = wl.items[--wl.count];
+    }
+  }
+}
+#endif
 
 // ================================================================
 // [Role C] MockAIWorker 구현부
@@ -1875,6 +1933,46 @@ static void securecast_video_tick(void *data, float seconds) {
     }
   }
 
+  // ── MINIMIZESTART: 최소화 즉시 처리 (ring buffer 정리 + 30-tick lingering) ──
+  {
+    HWND minHwnd = filter->winListener.popMinimizeStart();
+    if (minHwnd) {
+      // 1. ring buffer 모든 슬롯에서 제거 → 이후 render에서 stale blur 없음.
+      filter->ringBuffer.purgeWindowFromAllSlots(minHwnd);
+
+      // 2. captureWindowList / windowList / prevWindowList 에서 즉시 제거.
+      auto purgeList = [&](TrackedWindowList &wl) {
+        for (int i = wl.count - 1; i >= 0; --i)
+          if (wl.items[i].hwnd == minHwnd)
+            wl.items[i] = wl.items[--wl.count];
+      };
+      purgeList(filter->windowList);
+      purgeList(filter->captureWindowList);
+      purgeList(filter->prevWindowList);
+
+      // 3. lingeringWindows 에 30-tick (최소화 애니메이션 ~300ms + ring buffer 여유)
+      bool alreadyLingering = false;
+      for (int li = 0; li < filter->lingeringCount; ++li) {
+        if (filter->lingeringWindows[li].window.hwnd == minHwnd) {
+          filter->lingeringWindows[li].ticksRemaining = 30;
+          alreadyLingering = true;
+          break;
+        }
+      }
+      if (!alreadyLingering && filter->lingeringCount < SC_MAX_LINGERING) {
+        TrackedWindow tw{};
+        tw.hwnd = minHwnd;
+        for (int ri = 0; ri < filter->recentlySeenList.count; ++ri) {
+          if (filter->recentlySeenList.items[ri].hwnd == minHwnd) {
+            tw = filter->recentlySeenList.items[ri];
+            break;
+          }
+        }
+        filter->lingeringWindows[filter->lingeringCount++] = {tw, 30};
+      }
+    }
+  }
+
   // ── WinEvent: 포그라운드 전환 감지 → Quick Restore ─
   // 게임 모드는 CPU 임계값(≤30%, 5s)으로만 해제한다.
   // WinEvent로 해제하면 게임 실행 중 발생하는 내부 창 이벤트(알림, 팝업 등)에
@@ -1885,8 +1983,10 @@ static void securecast_video_tick(void *data, float seconds) {
     // Quick restore: foreground 전환 이벤트 직후 recentlySeenList 조회 → 즉시
     // 복원. EnumWindows 스캔(느림) 전에 captureWindowList를 채워 이번 render의
     // pushFrame 시점부터 마스킹이 적용되도록 한다.
+    // isMinimized 가드: 최소화된 창이 포그라운드로 오는 경우는 없지만, Aero Peek
+    // 중에 EVENT_SYSTEM_FOREGROUND가 발생할 수 있어 잘못된 restore를 막는다.
     HWND fgHwnd = GetForegroundWindow();
-    if (fgHwnd) {
+    if (fgHwnd && !WinEventListener::isMinimized(fgHwnd)) {
       for (int ri = 0; ri < filter->recentlySeenList.count; ++ri) {
         if (filter->recentlySeenList.items[ri].hwnd != fgHwnd)
           continue;
@@ -1940,10 +2040,13 @@ static void securecast_video_tick(void *data, float seconds) {
           filter->windowList.items[wi];
   }
   // 완전히 닫힌 프로세스의 HWND 정리 (최소화/숨김은 IsWindow=true라 유지됨)
+  // 창이 완전히 소멸된 시점에만 DWM 보호 해제 — 최소화 중엔 유지해야 한다.
   for (int ri = filter->recentlySeenList.count - 1; ri >= 0; --ri) {
-    if (!IsWindow(filter->recentlySeenList.items[ri].hwnd))
+    if (!IsWindow(filter->recentlySeenList.items[ri].hwnd)) {
+      dwm_end_protection(filter->recentlySeenList.items[ri].hwnd);
       filter->recentlySeenList.items[ri] =
           filter->recentlySeenList.items[--filter->recentlySeenList.count];
+    }
   }
 
   // Lingering: 직전 스캔에 있었지만 이번엔 사라진 창 감지.
@@ -1997,6 +2100,10 @@ static void securecast_video_tick(void *data, float seconds) {
       if (!already && filter->lingeringCount < SC_MAX_LINGERING)
         filter->lingeringWindows[filter->lingeringCount++] = {
             filter->windowList.items[ci], SC_RING_BUFFER_SLOTS + 1};
+
+      // 새 창 등장 시 DWM 썸네일 보호 시작.
+      const RECT &b = filter->windowList.items[ci].bounds;
+      dwm_begin_protection(ch, b.right - b.left, b.bottom - b.top);
     }
   }
 

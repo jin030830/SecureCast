@@ -58,6 +58,13 @@ void WinEventListener::run()
         nullptr, eventProc, 0, 0,
         WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
 
+    // 그룹 3: 최소화 시작/완료. IsIconic()은 Aero Peek 중에 FALSE를 반환하는 경우가
+    // 있으므로 WinEvent 세트를 별도로 유지한다.
+    m_hookGroup3 = SetWinEventHook(
+        EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND,
+        nullptr, eventProc, 0, 0,
+        WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+
     if (!m_hookGroup1) {
         blog(LOG_ERROR, "[SecureCast] SetWinEventHook failed; falling back to polling only.");
     } else {
@@ -76,14 +83,29 @@ void WinEventListener::run()
 
     if (m_hookGroup1) UnhookWinEvent(m_hookGroup1);
     if (m_hookGroup2) UnhookWinEvent(m_hookGroup2);
+    if (m_hookGroup3) UnhookWinEvent(m_hookGroup3);
     m_hookGroup1 = nullptr;
     m_hookGroup2 = nullptr;
+    m_hookGroup3 = nullptr;
     m_threadId   = 0;
 
     blog(LOG_INFO, "[SecureCast] WinEventListener stopped.");
 }
 
-void CALLBACK WinEventListener::eventProc(HWINEVENTHOOK /*hHook*/, DWORD /*event*/,
+bool WinEventListener::isMinimized(HWND hwnd)
+{
+    WinEventListener* self = s_active.load(std::memory_order_acquire);
+    if (!self)
+        return IsIconic(hwnd) != 0;
+    std::lock_guard<std::mutex> lk(self->m_minimizedMutex);
+    for (int i = 0; i < self->m_minimizedCount; ++i) {
+        if (self->m_minimizedSet[i] == hwnd)
+            return true;
+    }
+    return false;
+}
+
+void CALLBACK WinEventListener::eventProc(HWINEVENTHOOK /*hHook*/, DWORD event,
                                           HWND hwnd, LONG idObject, LONG idChild,
                                           DWORD /*idEventThread*/, DWORD /*dwmsEventTime*/)
 {
@@ -96,8 +118,33 @@ void CALLBACK WinEventListener::eventProc(HWINEVENTHOOK /*hHook*/, DWORD /*event
     if (!self)
         return;
 
-    // 단순 flag set. 무거운 작업은 video_tick 에서.
-    self->m_needRescan.store(true, std::memory_order_release);
+    if (event == EVENT_SYSTEM_MINIMIZESTART) {
+        {
+            std::lock_guard<std::mutex> lk(self->m_minimizedMutex);
+            bool found = false;
+            for (int i = 0; i < self->m_minimizedCount; ++i) {
+                if (self->m_minimizedSet[i] == hwnd) { found = true; break; }
+            }
+            if (!found && self->m_minimizedCount < 16)
+                self->m_minimizedSet[self->m_minimizedCount++] = hwnd;
+        }
+        // video_tick 이 popMinimizeStart()로 consume할 때까지 보관.
+        self->m_minimizeStartHwnd.store(hwnd, std::memory_order_release);
+    } else if (event == EVENT_SYSTEM_MINIMIZEEND) {
+        {
+            std::lock_guard<std::mutex> lk(self->m_minimizedMutex);
+            for (int i = 0; i < self->m_minimizedCount; ++i) {
+                if (self->m_minimizedSet[i] == hwnd) {
+                    self->m_minimizedSet[i] =
+                        self->m_minimizedSet[--self->m_minimizedCount];
+                    break;
+                }
+            }
+        }
+        self->m_needRescan.store(true, std::memory_order_release);
+    } else {
+        self->m_needRescan.store(true, std::memory_order_release);
+    }
 }
 
 #endif // _WIN32

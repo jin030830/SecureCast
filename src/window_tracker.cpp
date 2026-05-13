@@ -19,6 +19,7 @@
 // =============================================================================
 
 #include "window_tracker.h"
+#include "win_event_listener.h"
 #include "plugin-support.h"   // obs_log
 
 #include <obs.h>
@@ -143,7 +144,8 @@ BOOL CALLBACK enum_proc(HWND hwnd, LPARAM lparam)
 		return FALSE; // 슬롯 소진 — 순회 중단
 
 	// 최소화·숨김 창은 화면에 안 그려지므로 보호 대상 아님.
-	if (!IsWindowVisible(hwnd))
+	// WinEvent 세트 우선 확인 — Aero Peek 중에 IsIconic이 FALSE를 반환하는 경우 대비.
+	if (!IsWindowVisible(hwnd) || WinEventListener::isMinimized(hwnd))
 		return TRUE;
 
 	// DWM 기반 정확한 화면 좌표 (그림자 영역 제외).
@@ -217,7 +219,7 @@ extern "C" void sc_update_tracked_bounds(TrackedWindowList *list)
 		HWND hwnd = list->items[i].hwnd;
 
 		// 창이 닫혔거나 최소화됐으면 슬롯 제거 (마지막 원소와 swap-and-pop).
-		if (!IsWindowVisible(hwnd)) {
+		if (!IsWindowVisible(hwnd) || WinEventListener::isMinimized(hwnd)) {
 			list->items[i] = list->items[--list->count];
 			continue;
 		}

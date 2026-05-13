@@ -28,6 +28,7 @@
 
 #include <windows.h>
 #include <atomic>
+#include <mutex>
 #include <thread>
 
 class WinEventListener {
@@ -46,6 +47,15 @@ public:
         return m_needRescan.exchange(false, std::memory_order_acq_rel);
     }
 
+    // 호출 시 m_minimizeStartHwnd 를 nullptr 로 교체하고 이전 값 반환. 없으면 nullptr.
+    HWND popMinimizeStart() {
+        return m_minimizeStartHwnd.exchange(nullptr, std::memory_order_acq_rel);
+    }
+
+    // window_tracker 에서 enum_proc / sc_update_tracked_bounds 가 호출.
+    // s_active 없으면 IsIconic 으로 fallback.
+    static bool isMinimized(HWND hwnd);
+
 private:
     void run();
 
@@ -58,8 +68,17 @@ private:
     DWORD             m_threadId    = 0;
     HWINEVENTHOOK     m_hookGroup1  = nullptr; // SHOW / HIDE / DESTROY
     HWINEVENTHOOK     m_hookGroup2  = nullptr; // SYSTEM_FOREGROUND (포그라운드 전환)
+    HWINEVENTHOOK     m_hookGroup3  = nullptr; // MINIMIZESTART / MINIMIZEEND
 
     std::atomic<bool> m_needRescan{false};
+
+    // 최소화된 HWND 집합. eventProc 스레드 ↔ video_tick 스레드 양쪽에서 접근.
+    mutable std::mutex m_minimizedMutex;
+    HWND               m_minimizedSet[16]{};
+    int                m_minimizedCount = 0;
+
+    // 가장 최근 MINIMIZESTART 이벤트의 HWND. popMinimizeStart()가 consume.
+    std::atomic<HWND>  m_minimizeStartHwnd{nullptr};
 
     // 콜백에서 도달하기 위한 스레드별 self 포인터 (한 프로세스에 instance 1개 가정).
     static std::atomic<WinEventListener*> s_active;

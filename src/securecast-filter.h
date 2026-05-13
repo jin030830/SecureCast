@@ -141,6 +141,12 @@ public:
   // 합집합용).
   const Slot *peekSlotAtOffset(int framesBack) const;
 
+#ifdef _WIN32
+  // 모든 링버퍼 슬롯의 windowSnapshot에서 hwnd 를 즉시 제거.
+  // MINIMIZESTART 이벤트 처리 시 ring buffer 드레인 전에 stale blur 를 차단.
+  void purgeWindowFromAllSlots(HWND hwnd);
+#endif
+
   bool isInitialized() const { return m_initialized; }
   uint32_t getWidth() const { return m_width; }
   uint32_t getHeight() const { return m_height; }
