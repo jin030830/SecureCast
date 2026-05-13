@@ -66,9 +66,15 @@ void WinEventListener::run()
         WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
 
     if (!m_hookGroup1) {
-        blog(LOG_ERROR, "[SecureCast] SetWinEventHook failed; falling back to polling only.");
+        blog(LOG_WARNING, "[SecureCast] hookGroup1 (SHOW/HIDE/DESTROY) failed — range issue, non-fatal.");
+    }
+    if (!m_hookGroup2) {
+        blog(LOG_ERROR, "[SecureCast] hookGroup2 (FOREGROUND) failed.");
+    }
+    if (!m_hookGroup3) {
+        blog(LOG_ERROR, "[SecureCast] hookGroup3 (MINIMIZESTART/END) failed — minimize detection will not work!");
     } else {
-        blog(LOG_INFO, "[SecureCast] WinEventListener started (SHOW/HIDE/DESTROY + FOREGROUND).");
+        blog(LOG_INFO, "[SecureCast] WinEventListener started (FOREGROUND + MINIMIZESTART/END hooks active).");
     }
 
     // 메시지 펌프 — WINEVENT_OUTOFCONTEXT 콜백은 이 펌프에서 dispatch 됨.
@@ -119,6 +125,7 @@ void CALLBACK WinEventListener::eventProc(HWINEVENTHOOK /*hHook*/, DWORD event,
         return;
 
     if (event == EVENT_SYSTEM_MINIMIZESTART) {
+        blog(LOG_INFO, "[SecureCast] MINIMIZESTART hwnd=%p IsIconic=%d", hwnd, IsIconic(hwnd));
         {
             std::lock_guard<std::mutex> lk(self->m_minimizedMutex);
             bool found = false;
@@ -131,6 +138,7 @@ void CALLBACK WinEventListener::eventProc(HWINEVENTHOOK /*hHook*/, DWORD event,
         // video_tick 이 popMinimizeStart()로 consume할 때까지 보관.
         self->m_minimizeStartHwnd.store(hwnd, std::memory_order_release);
     } else if (event == EVENT_SYSTEM_MINIMIZEEND) {
+        blog(LOG_INFO, "[SecureCast] MINIMIZEEND hwnd=%p", hwnd);
         {
             std::lock_guard<std::mutex> lk(self->m_minimizedMutex);
             for (int i = 0; i < self->m_minimizedCount; ++i) {

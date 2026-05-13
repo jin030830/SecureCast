@@ -189,6 +189,19 @@ BOOL CALLBACK enum_proc(HWND hwnd, LPARAM lparam)
 	if (!is_blacklisted(exe_name))
 		return TRUE;
 
+	// 최소화 상태 진단 로그 — 릴리스 전 제거 예정.
+	{
+		RECT wr{};
+		GetWindowRect(hwnd, &wr);
+		obs_log(LOG_INFO,
+			"[dbg] %ls hwnd=%p IsIconic=%d isMin=%d"
+			" DWM=(%ld,%ld)-(%ld,%ld) GWR=(%ld,%ld)-(%ld,%ld)",
+			exe_name, hwnd,
+			IsIconic(hwnd), WinEventListener::isMinimized(hwnd) ? 1 : 0,
+			rect.left, rect.top, rect.right, rect.bottom,
+			wr.left, wr.top, wr.right, wr.bottom);
+	}
+
 	// Z-order: 창 중앙이 다른 앱에 가려져 있으면 (뒤로 보내기 상태) 추적 대상 제외.
 	// 카톡이 OBS 뒤로 가도 IsWindowVisible=true라 이 체크 없이는 계속 추적된다.
 	if (!is_window_top_at_center(hwnd, rect))

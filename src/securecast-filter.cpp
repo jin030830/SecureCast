@@ -1950,26 +1950,8 @@ static void securecast_video_tick(void *data, float seconds) {
       purgeList(filter->captureWindowList);
       purgeList(filter->prevWindowList);
 
-      // 3. lingeringWindows 에 30-tick (최소화 애니메이션 ~300ms + ring buffer 여유)
-      bool alreadyLingering = false;
-      for (int li = 0; li < filter->lingeringCount; ++li) {
-        if (filter->lingeringWindows[li].window.hwnd == minHwnd) {
-          filter->lingeringWindows[li].ticksRemaining = 30;
-          alreadyLingering = true;
-          break;
-        }
-      }
-      if (!alreadyLingering && filter->lingeringCount < SC_MAX_LINGERING) {
-        TrackedWindow tw{};
-        tw.hwnd = minHwnd;
-        for (int ri = 0; ri < filter->recentlySeenList.count; ++ri) {
-          if (filter->recentlySeenList.items[ri].hwnd == minHwnd) {
-            tw = filter->recentlySeenList.items[ri];
-            break;
-          }
-        }
-        filter->lingeringWindows[filter->lingeringCount++] = {tw, 30};
-      }
+      // 3. ring buffer는 purgeWindowFromAllSlots로 이미 비워졌으므로
+      //    lingering 추가 없이 즉시 블러 제거.
     }
   }
 
