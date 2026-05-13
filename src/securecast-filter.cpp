@@ -1933,27 +1933,11 @@ static void securecast_video_tick(void *data, float seconds) {
     }
   }
 
-  // ── MINIMIZESTART: 최소화 즉시 처리 (ring buffer 정리 + 30-tick lingering) ──
-  {
-    HWND minHwnd = filter->winListener.popMinimizeStart();
-    if (minHwnd) {
-      // 1. ring buffer 모든 슬롯에서 제거 → 이후 render에서 stale blur 없음.
-      filter->ringBuffer.purgeWindowFromAllSlots(minHwnd);
-
-      // 2. captureWindowList / windowList / prevWindowList 에서 즉시 제거.
-      auto purgeList = [&](TrackedWindowList &wl) {
-        for (int i = wl.count - 1; i >= 0; --i)
-          if (wl.items[i].hwnd == minHwnd)
-            wl.items[i] = wl.items[--wl.count];
-      };
-      purgeList(filter->windowList);
-      purgeList(filter->captureWindowList);
-      purgeList(filter->prevWindowList);
-
-      // 3. ring buffer는 purgeWindowFromAllSlots로 이미 비워졌으므로
-      //    lingering 추가 없이 즉시 블러 제거.
-    }
-  }
+  // MINIMIZESTART: m_minimizedSet는 WinEvent 콜백이 이미 채웠음.
+  // enum_proc에서 isMinimized && !IsIconic(Aero Peek 조건)으로 차단.
+  // 애니메이션 중(IsIconic=TRUE)에는 is_window_top_at_center가 자연 처리하므로
+  // 별도 purge/linger 불필요 — 원래 "뒤로 보내기"와 동일한 경로로 처리됨.
+  filter->winListener.popMinimizeStart(); // atomic 소모(stale read 방지)
 
   // ── WinEvent: 포그라운드 전환 감지 → Quick Restore ─
   // 게임 모드는 CPU 임계값(≤30%, 5s)으로만 해제한다.
