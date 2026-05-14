@@ -37,6 +37,13 @@ struct ProfileEMA {
   uint32_t sample_count = 0;
   std::chrono::steady_clock::time_point last_log;
 
+  // 0-a: 캐시 hit/miss 텔레메트리 (60s 주기 로그, 로그 후 리셋)
+  uint32_t total_calls = 0;      // analyze_bgra_frame 호출 횟수
+  uint32_t scene_gate_hits = 0;  // Scene gate 히트 (가장 저렴한 경로)
+  uint32_t l1_hits = 0;          // L1 dHash 히트
+  uint32_t l2_hits = 0;          // L2 partial OCR 히트
+  uint32_t full_ocr_count = 0;   // Full OCR 실행 횟수
+
   // 프레임 내 누적을 위한 임시 저장소
   struct {
     double bgra = 0, recog = 0, multipass = 0, dhash = 0, detect = 0;
@@ -121,9 +128,16 @@ private:
   int consecutiveSkips_ = 0;
   // 2-C: 직전 full OCR 사이클의 라인 평균 높이. 적응형 스케일 계산에 사용.
   float avgLineHeight_ = 0.0f;
-  // 연속 L1 히트 허용 횟수: 2 = 정적 화면 OCR ~1.3 fps, 최대 ~500 ms stale
-  // 허용.
-  static constexpr int kMaxConsecutiveSkips = 2;
+  // L1 연속 히트 허용 횟수: 5 = 정적 화면 OCR ~0.8fps (at 4fps submit rate).
+  static constexpr int kMaxConsecutiveSkips = 5;
+
+  // Scene-change gate: FrameTimer 바깥에서 관리되는 전-파이프라인 게이트.
+  // L1보다 앞서 실행되어 완전히 정적인 화면의 OCR 호출을 차단한다.
+  // kMaxSceneGateSkips 도달 시 강제 Full OCR → 새로 등장한 PII를 놓치지 않음.
+  uint64_t lastSceneGateHash_ = 0;
+  bool hasLastSceneGateHash_ = false;
+  int sceneGateConsecutive_ = 0;
+  static constexpr int kMaxSceneGateSkips = 120; // ~2s at 60fps
 
   // 8×8 구역 dHash: 9×8 샘플 격자 → 인접 밝기 비교 → 64비트
   uint64_t compute_dhash_region(const uint8_t *px, int stride, int x, int y,

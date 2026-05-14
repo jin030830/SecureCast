@@ -96,13 +96,21 @@ public:
     }
     if (std::chrono::duration_cast<std::chrono::seconds>(end - p_->last_log)
             .count() >= 60) {
+      const uint32_t tc = p_->total_calls > 0 ? p_->total_calls : 1;
+      const double hit_pct = 100.0 * (tc - p_->full_ocr_count) / (double)tc;
       blog(LOG_INFO,
            "[SecureCast][profile] bgra=%.2f ocr=%.2f mp=%.2f dhash=%.2f "
-           "pii=%.2f total=%.2f (n=%d)",
+           "pii=%.2f total=%.2f (n=%d) | "
+           "cache: scene=%u L1=%u L2=%u full=%u/%u hit=%.0f%%",
            p_->bgra_ms, p_->recog_ms, p_->multipass_ms, p_->dhash_ms,
-           p_->detect_ms, p_->total_ms, p_->sample_count);
+           p_->detect_ms, p_->total_ms, p_->sample_count,
+           p_->scene_gate_hits, p_->l1_hits, p_->l2_hits,
+           p_->full_ocr_count, p_->total_calls, hit_pct);
       p_->last_log = end;
       p_->sample_count = 0;
+      // 60s 주기마다 카운터 리셋
+      p_->total_calls = p_->scene_gate_hits = p_->l1_hits = 0;
+      p_->l2_hits = p_->full_ocr_count = 0;
     }
   }
 };
@@ -165,7 +173,29 @@ bool SecureCastOcrEngine::init() {
     }
 
     available_ = impl_->engine != nullptr;
-    return available_;
+    if (!available_) return false;
+
+    // 0-c: WinRT warmup — 첫 RecognizeAsync 호출은 모델 로딩으로 1~3초 지연됨.
+    // 여기서 64×64 더미 프레임 1회 실행 → 사용자 첫 화면 노출 전에 비용 이전.
+    // 이 함수는 OCR worker thread에서 호출되므로 동기 .get() 안전.
+    try {
+      using winrt::Windows::Graphics::Imaging::BitmapAlphaMode;
+      using winrt::Windows::Graphics::Imaging::BitmapPixelFormat;
+      using winrt::Windows::Graphics::Imaging::SoftwareBitmap;
+      using winrt::Windows::Security::Cryptography::CryptographicBuffer;
+
+      constexpr int W = 64, H = 64;
+      std::vector<uint8_t> dummy(W * H * 4, 0);
+      auto buf = CryptographicBuffer::CreateFromByteArray(dummy);
+      auto bm = SoftwareBitmap::CreateCopyFromBuffer(
+          buf, BitmapPixelFormat::Bgra8, W, H, BitmapAlphaMode::Premultiplied);
+      impl_->engine.RecognizeAsync(bm).get();
+      blog(LOG_INFO, "[SecureCast] WinRT OCR warmup complete.");
+    } catch (...) {
+      blog(LOG_WARNING, "[SecureCast] WinRT OCR warmup failed (non-fatal).");
+    }
+
+    return true;
   } catch (...) {
     available_ = false;
     return false;
@@ -179,10 +209,30 @@ bool SecureCastOcrEngine::available() const { return available_; }
 // 현재 구현: FNV-1a 전체 픽셀 해시 기반 Dirty Skip
 // ============================================================
 
+// Scene gate 전용 dHash: PhaseTimer 없이 직접 계산 (FrameTimer 바깥에서 호출됨).
+static uint64_t compute_scene_hash_fast(const uint8_t *px, int stride, int w,
+                                        int h) {
+  constexpr int COLS = 9, ROWS = 8;
+  uint64_t hash = 0;
+  for (int r = 0; r < ROWS; ++r) {
+    uint8_t g[COLS];
+    for (int c = 0; c < COLS; ++c) {
+      const int sx = COLS > 1 ? c * (w - 1) / (COLS - 1) : 0;
+      const int sy = ROWS > 1 ? r * (h - 1) / (ROWS - 1) : 0;
+      const uint8_t *p = px + sy * stride + sx * 4;
+      g[c] = static_cast<uint8_t>(((int)p[0] + p[1] + p[2]) / 3);
+    }
+    for (int c = 0; c < COLS - 1; ++c)
+      hash = (hash << 1) | (g[c] > g[c + 1] ? 1u : 0u);
+  }
+  return hash;
+}
+
 std::vector<SecureCastOcrBox>
 SecureCastOcrEngine::analyze_bgra_frame(const uint8_t *pixels, int width,
                                         int height, int stride) {
-  FrameTimer frame_timer(&profile_);
+  // 텔레메트리: 모든 호출 카운트 (scene gate 히트 포함)
+  ++profile_.total_calls;
 
   if (!available_ || pixels == nullptr || width <= 0 || height <= 0 ||
       stride <= 0)
@@ -193,22 +243,46 @@ SecureCastOcrEngine::analyze_bgra_frame(const uint8_t *pixels, int width,
   const bool sameRes =
       impl_->lastFrameWidth == width && impl_->lastFrameHeight == height;
 
-  // 해상도 변경 시 모든 캐시 상태 초기화
+  // 해상도 변경 시 모든 캐시 상태 초기화 (scene gate 포함)
   if (!sameRes) {
     lastLineDhashes_.clear();
     hasLastRoiDhash_ = false;
     consecutiveSkips_ = 0;
+    hasLastSceneGateHash_ = false;
+    sceneGateConsecutive_ = 0;
   }
 
+  // ── Scene-change gate ──────────────────────────────────────────
+  // FrameTimer 바깥에서 실행 → EMA를 왜곡하지 않음.
+  // L1보다 앞서 EVERY 프레임 실행. 완전히 정적인 화면을 0.1ms 미만으로 차단.
+  // kMaxSceneGateSkips 도달 시 강제 full OCR → 새로 등장한 PII 탐지 보장.
+  if (sameRes && hasLastSceneGateHash_) {
+    const uint64_t sg = compute_scene_hash_fast(pixels, stride, width, height);
+    if (hamming_distance(sg, lastSceneGateHash_) <= 1 &&
+        sceneGateConsecutive_ < kMaxSceneGateSkips) {
+      ++sceneGateConsecutive_;
+      ++profile_.scene_gate_hits;
+      return lastBoxes_;
+    }
+    lastSceneGateHash_ = sg;
+    sceneGateConsecutive_ = 0;
+  } else if (sameRes) {
+    lastSceneGateHash_ = compute_scene_hash_fast(pixels, stride, width, height);
+    hasLastSceneGateHash_ = true;
+  }
+
+  FrameTimer frame_timer(&profile_);
+
   // ── L1: ROI dHash ─────────────────────────────────────────────
-  // PII 박스 영역만 해시 → 시계·커서 등 ROI 외부 변화는 완전히 무시.
-  // hamming_distance ≤ 2 → 안티앨리어싱·압축 노이즈 허용 → OCR 생략.
+  // hamming_distance ≤ 3 (보수적 시작): 안티앨리어싱·압축 노이즈 허용 → OCR 생략.
   if (sameRes && hasLastRoiDhash_) {
     const uint64_t roiHash =
         compute_roi_dhash(pixels, stride, width, height, lastBoxes_);
-    if (hamming_distance(roiHash, lastRoiDhash_) <= 2) {
-      if (++consecutiveSkips_ < kMaxConsecutiveSkips)
+    if (hamming_distance(roiHash, lastRoiDhash_) <= 3) {
+      if (++consecutiveSkips_ < kMaxConsecutiveSkips) {
+        ++profile_.l1_hits;
         return lastBoxes_; // L1 hit
+      }
       // kMaxConsecutiveSkips 연속 히트: 새 텍스트 발견용 주기적 full OCR
     }
   }
@@ -278,12 +352,14 @@ SecureCastOcrEngine::analyze_bgra_frame(const uint8_t *pixels, int width,
       }
       lastRoiDhash_ = compute_roi_dhash(pixels, stride, width, height, merged);
       lastBoxes_ = merged;
+      ++profile_.l2_hits;
       return merged; // L2 hit (partial)
     }
     // 모든 라인 불변이지만 L1 실패 → ROI 외부에 새 텍스트 가능 → full OCR
   }
 
   // ── Full OCR ──────────────────────────────────────────────────
+  ++profile_.full_ocr_count;
   auto lines = recognize_text(pixels, width, height, stride);
 
   // 2-C: 라인 평균 높이 갱신 (다음 사이클 적응형 스케일 계산에 사용)

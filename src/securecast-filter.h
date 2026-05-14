@@ -277,6 +277,12 @@ struct SecureCastFilter {
       0; // 파이프라인 포화 경고 로그 주기 카운터 (30프레임마다 1회)
   int logEnqueueCount = 0; // enqueue 성공 로그 주기 카운터 (300프레임마다 1회)
 
+  // ----- [OCR Adaptive Rate / Window pre-filter] -----
+  // CPU 부하에 따라 OCR 제출 주기를 동적으로 조절한다.
+  // ocrRateInterval_: 0.25s(4fps) ~ 1.0s(1fps). video_tick에서 cpuUsage 기반 갱신.
+  float ocrRateInterval_ = 0.25f;
+  std::chrono::steady_clock::time_point lastOcrSubmitTime_{};
+
   // ----- [Role A 담당: 윈도우 추적 및 블랙리스트] -----
   // 일반 모드(게임 모드 OFF)에서 차단할 앱 목록.
   // 게임 모드(게임 모드 ON)에서 전체 블러 처리할 앱 목록.

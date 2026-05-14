@@ -2092,13 +2092,28 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
       filter->trackerInputCv_.notify_one();
     }
 
-    // OCR 제출: ocrIdle일 때만 (~4fps)
+    // Window pre-filter: game_capture 소스면 OCR 완전 스킵 (CPU -100%).
+    // game_capture는 게임 전용 저수준 캡처라 화면에 PII가 거의 없음.
+    const char *parentSrcId =
+        parent ? obs_source_get_id(parent) : nullptr;
+    const bool isGameCaptureSource =
+        parentSrcId && strcmp(parentSrcId, "game_capture") == 0;
+
+    // Adaptive rate gate: video_tick에서 설정된 ocrRateInterval_ 기준 제출 빈도 제한.
+    const auto rateNow = std::chrono::steady_clock::now();
+    const float rateElapsed = std::chrono::duration<float>(
+        rateNow - filter->lastOcrSubmitTime_).count();
+    const bool rateLimited = rateElapsed < filter->ocrRateInterval_;
+
+    // OCR 제출: ocrIdle일 때만 (~4fps, adaptive rate 적용)
     // CPU 디그레이드 모드에서는 OCR 제출을 건너뛰고 idle 플래그를 즉시 반환.
     // 1-G: 1280px+ → GPU 2× 다운샘플 readback으로 속도 최적화.
     //      트래커도 동일 half-res 공간을 사용하므로 좌표계 불일치 없음.
-    if (ocrIdle && filter->cpuDegraded.load(std::memory_order_acquire)) {
+    if (ocrIdle && (filter->cpuDegraded.load(std::memory_order_acquire)
+                    || isGameCaptureSource || rateLimited)) {
       filter->ocrWorkerIdle.store(true, std::memory_order_release);
     } else if (ocrIdle) {
+      filter->lastOcrSubmitTime_ = rateNow;
       std::vector<uint8_t> ocrPixels;
       int ocrW = static_cast<int>(w), ocrH = static_cast<int>(h), ocrStride = 0;
       bool ocrSubmit = false;
@@ -2349,6 +2364,17 @@ static void securecast_video_tick(void *data, float seconds) {
       } else {
         filter->gameModeExitTimer = 0.0f;
       }
+    }
+
+    // Adaptive OCR rate: 게임 모드 진입 전 구간(CPU 20~40%)에서 OCR 부하 선제 감소.
+    // isGameMode면 OCR 워커 자체가 멈추므로 여기서 조절 불필요.
+    if (!filter->isGameMode) {
+      if (filter->cpuUsage >= 30.0f)
+        filter->ocrRateInterval_ = 1.0f;   // ~1fps
+      else if (filter->cpuUsage >= 20.0f)
+        filter->ocrRateInterval_ = 0.5f;   // ~2fps
+      else
+        filter->ocrRateInterval_ = 0.25f;  // ~4fps (기본)
     }
   }
 
