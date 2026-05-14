@@ -2423,6 +2423,10 @@ static void securecast_video_tick(void *data, float seconds) {
       purgeList(filter->captureWindowList);
       purgeList(filter->prevWindowList);
 
+      // OCR tracker 박스도 즉시 제거 — 최소화 후 Aero Peek thumbnail에
+      // stale 블러 박스가 그려지는 버그 수정.
+      filter->trackerMgr.clear();
+
       if (found) {
         bool already = false;
         for (int li = 0; li < filter->lingeringCount; ++li) {
