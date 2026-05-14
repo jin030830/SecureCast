@@ -209,6 +209,34 @@ bool SecureCastOcrEngine::available() const { return available_; }
 // 현재 구현: FNV-1a 전체 픽셀 해시 기반 Dirty Skip
 // ============================================================
 
+// P3: 저대비 화면용 히스토그램 스트레치 (LUT 기반)
+// packed BGRA 버퍼에 인-플레이스 적용. luma 기준 min/max → [0,255] 선형 매핑.
+static void stretch_contrast_bgra(uint8_t *data, int width, int height) {
+  const int n = width * height;
+  if (n <= 0) return;
+  uint8_t minL = 255, maxL = 0;
+  for (int i = 0; i < n; ++i) {
+    const uint8_t *p = data + i * 4;
+    const uint8_t luma =
+        static_cast<uint8_t>(((int)p[0] + p[1] + p[2]) / 3);
+    if (luma < minL) minL = luma;
+    if (luma > maxL) maxL = luma;
+  }
+  if (maxL <= minL) return;
+  uint8_t lut[256];
+  const int range = maxL - minL;
+  for (int v = 0; v < 256; ++v) {
+    const int s = (v - (int)minL) * 255 / range;
+    lut[v] = static_cast<uint8_t>(s < 0 ? 0 : s > 255 ? 255 : s);
+  }
+  for (int i = 0; i < n; ++i) {
+    uint8_t *p = data + i * 4;
+    p[0] = lut[p[0]];
+    p[1] = lut[p[1]];
+    p[2] = lut[p[2]];
+  }
+}
+
 // Scene gate 전용 dHash: PhaseTimer 없이 직접 계산 (FrameTimer 바깥에서 호출됨).
 static uint64_t compute_scene_hash_fast(const uint8_t *px, int stride, int w,
                                         int h) {
@@ -528,6 +556,10 @@ SecureCastOcrEngine::recognize_text(const uint8_t *pixels, int width,
         std::memcpy(dstRow, srcRow, static_cast<size_t>(rowBytes));
       }
 
+      if (kEnableContrastStretch) {
+        stretch_contrast_bgra(packed.data(), width, height);
+      }
+
       auto buffer = CryptographicBuffer::CreateFromByteArray(packed);
 
       bitmap = SoftwareBitmap::CreateCopyFromBuffer(
@@ -769,6 +801,10 @@ static bool has_name_label(const std::string &text) {
                                 "Full Name",
                                 "First Name",
                                 "Last Name",
+                                "Customer",
+                                "Recipient",
+                                "Employee",
+                                "Patient",
                             });
 }
 
@@ -1100,6 +1136,36 @@ static bool lines_visually_adjacent(const SecureCastOcrLine &a,
   return true;
 }
 
+// P3: WinRT 한글 음절 분리 정규화 — 한글 음절 사이 OCR 삽입 공백 제거.
+// "계 좌 번 호" → "계좌번호", "김 철 수님" → "김철수님"
+static std::string collapse_hangul_spaces(const std::string &text) {
+  struct CharInfo { uint32_t cp; size_t start, len; };
+  std::vector<CharInfo> chars;
+  {
+    size_t idx = 0;
+    while (idx < text.size()) {
+      uint32_t cp = 0; size_t cs = 0, cl = 0;
+      decode_utf8_next(text, idx, cp, cs, cl);
+      chars.push_back({cp, cs, cl});
+    }
+  }
+  std::string out;
+  out.reserve(text.size());
+  for (size_t i = 0; i < chars.size(); ++i) {
+    if (chars[i].cp == ' ') {
+      uint32_t prev = 0, next = 0;
+      for (int j = (int)i - 1; j >= 0; --j)
+        if (chars[j].cp != ' ') { prev = chars[j].cp; break; }
+      for (size_t j = i + 1; j < chars.size(); ++j)
+        if (chars[j].cp != ' ') { next = chars[j].cp; break; }
+      if (is_hangul_syllable(prev) && is_hangul_syllable(next))
+        continue;
+    }
+    out.append(text.data() + chars[i].start, chars[i].len);
+  }
+  return out;
+}
+
 } // namespace
 
 // === STEP 2-0: OCR 오류 보정 ===
@@ -1176,6 +1242,9 @@ SecureCastOcrEngine::detect_pii(const std::vector<SecureCastOcrLine> &lines) {
   for (int i = 0; i < static_cast<int>(lines.size()); ++i) {
     const auto &line = lines[i];
     const std::string &rawText = line.text;
+    // P3: 한글 음절 분리 정규화 — 라벨 탐지에 사용
+    const std::string normText =
+        kEnableHangulNormalize ? collapse_hangul_spaces(rawText) : rawText;
 
     const char *type = nullptr;
 
@@ -1222,7 +1291,7 @@ SecureCastOcrEngine::detect_pii(const std::vector<SecureCastOcrLine> &lines) {
                                 "e-mail", "메일주소", "이메일주소", "수신자",
                                 "보낸이"});
       };
-      bool labelFound = has_email_label(rawText);
+      bool labelFound = has_email_label(normText);
       for (int d = 1; d <= 2 && !labelFound; ++d) {
         if (i - d >= 0)
           labelFound = has_email_label(lines[i - d].text);
@@ -1239,7 +1308,7 @@ SecureCastOcrEngine::detect_pii(const std::vector<SecureCastOcrLine> &lines) {
     // 배제.
     if (type == nullptr) {
       std::string honorName;
-      if (RE2::PartialMatch(rawText, PATTERN_NAME_HONORIFIC, &honorName)) {
+      if (RE2::PartialMatch(normText, PATTERN_NAME_HONORIFIC, &honorName)) {
         const std::string h = extract_hangul_syllables_utf8(honorName);
         const int hc = count_hangul_syllables(h);
         if (hc >= 2 && hc <= 4 && starts_with_common_korean_surname(h) &&
@@ -1251,7 +1320,7 @@ SecureCastOcrEngine::detect_pii(const std::vector<SecureCastOcrLine> &lines) {
 
     // === STEP 2-2-A: 주소 탐지 (단일 라인) ===
     // 예: 주소:서울시, 서울시 강남구, 역삼동, 테헤란로 등
-    if (type == nullptr && looks_like_korean_address_text(rawText)) {
+    if (type == nullptr && looks_like_korean_address_text(normText)) {
       type = "ADDRESS";
     }
 
@@ -1261,13 +1330,13 @@ SecureCastOcrEngine::detect_pii(const std::vector<SecureCastOcrLine> &lines) {
     // 단, line i에 지역어 또는 주소 라벨이 없으면 스킵 (이름+숫자 오탐 방지).
     if (type == nullptr && i + 1 < static_cast<int>(lines.size())) {
       if (contains_any(
-              rawText,
+              normText,
               {"주소", "주소지", "거주지", "소재지", "사는곳", "배송지", "서울",
                "부산", "대구",   "인천",   "광주",   "대전",   "울산",   "세종",
                "경기", "강원",   "충북",   "충남",   "충청",   "전북",   "전남",
                "전라", "경북",   "경남",   "경상",   "제주"}) &&
           lines_visually_adjacent(lines[i], lines[i + 1])) {
-        const std::string combined = rawText + " " + lines[i + 1].text;
+        const std::string combined = normText + " " + lines[i + 1].text;
         if (looks_like_korean_address_text(combined)) {
           boxes.push_back(
               SecureCastOcrBox{"ADDRESS", line.x, line.y, line.w, line.h});
@@ -1296,6 +1365,15 @@ SecureCastOcrEngine::detect_pii(const std::vector<SecureCastOcrLine> &lines) {
         normalizedLine = normalize_numeric_candidate(rawText);
       if (normalizedLine.empty())
         normalizedLine = rawText;
+
+      // P3: OCR 숫자 공백 정규화 ("0 1 0" → "010", "010 - 1234" → "010-1234")
+      if (kEnableHangulNormalize && !normalizedLine.empty()) {
+        static const re2::RE2 PAT_DIGIT_SPACE(R"((\d) (\d))");
+        static const re2::RE2 PAT_DIGIT_SEP(R"((\d) - (\d))");
+        while (RE2::GlobalReplace(&normalizedLine, PAT_DIGIT_SPACE,
+                                  R"(\1\2)") > 0) {}
+        RE2::GlobalReplace(&normalizedLine, PAT_DIGIT_SEP, R"(\1-\2)");
+      }
 
       // (d) RRN: 패턴 매칭 후 체크섬 검증
       {
@@ -1429,7 +1507,7 @@ SecureCastOcrEngine::detect_pii(const std::vector<SecureCastOcrLine> &lines) {
             return true; // 계조
           return false;
         };
-        bool hasAccountLabel = hasLabel(rawText);
+        bool hasAccountLabel = hasLabel(normText);
         for (int d = 1; d <= 2 && !hasAccountLabel; ++d) {
           if (i - d >= 0 && hasLabel(lines[i - d].text))
             hasAccountLabel = true;
@@ -1445,16 +1523,17 @@ SecureCastOcrEngine::detect_pii(const std::vector<SecureCastOcrLine> &lines) {
     // === STEP 2-3-A: 이름 탐지 (라벨 필수) ===
     // 라벨이 같은 줄 또는 ±1 줄에 없으면 탐지하지 않는다 (오탐 방지).
     if (type == nullptr) {
-      const bool sameLineLabel = has_name_label(rawText);
+      const bool sameLineLabel = has_name_label(normText);
       const bool adjLabel = has_adjacent_name_label(lines, i);
 
       // === 영문 이름 탐지 (라벨 + FirstName LastName 패턴) ===
-      // "name: Hong Gildong", "Full Name: Alice Smith" 형태
-      if (type == nullptr && sameLineLabel) {
+      // "name: Hong Gildong", "Full Name: Alice Smith" 형태.
+      // adjLabel: 인접 라인에 이름 라벨 → 현재 라인이 이름인 경우도 탐지.
+      if (type == nullptr && (sameLineLabel || adjLabel)) {
         static const re2::RE2 PAT_ENG_NAME(
             R"((?:[A-Z][a-z]{1,14}\s){1,2}[A-Z][a-z]{1,14})");
         std::string engName;
-        if (RE2::PartialMatch(rawText, PAT_ENG_NAME, &engName)) {
+        if (RE2::PartialMatch(normText, PAT_ENG_NAME, &engName)) {
           static const std::unordered_set<std::string> ENG_NAME_BLOCKLIST = {
               "Full Name", "First Name", "Last Name", "User Name",
               "Error Code", "Build Version"};
@@ -1471,10 +1550,11 @@ SecureCastOcrEngine::detect_pii(const std::vector<SecureCastOcrLine> &lines) {
           // has_name_label 에 포함된 라벨 전부 — 탈루 시 후보 텍스트가 라벨
           // 포함 채로 hangulCount 범위를 초과해 NONE 으로 빠지는 문제 방지.
           static const char *const LABEL_STRS[] = {
-              "이름",       "성명",      "성함",   "고객명", "사용자명",
-              "예금주",     "수취인",    "발신인", "수신인", "보호자",
-              "담당자",     "신청인",    "회원명", "환자명", "Full Name",
-              "First Name", "Last Name", "name",   "Name",   "NAME"};
+              "이름",       "성명",      "성함",     "고객명",    "사용자명",
+              "예금주",     "수취인",    "발신인",   "수신인",    "보호자",
+              "담당자",     "신청인",    "회원명",   "환자명",    "Full Name",
+              "First Name", "Last Name", "Customer", "Recipient", "Employee",
+              "Patient",    "name",      "Name",     "NAME"};
           for (const char *lbl : LABEL_STRS) {
             const auto pos = rawText.find(lbl);
             if (pos != std::string::npos) {
@@ -1517,10 +1597,9 @@ std::vector<SecureCastOcrLine> SecureCastOcrEngine::multipass_small_text(
     const std::vector<SecureCastOcrLine> &lines, const uint8_t *pixels,
     int width, int height, int stride) {
   PhaseTimer t_mp(&profile_.acc.multipass);
-  // MAX_PASSES = 6: 성능/OCR 스레드 예산 상한.
-  // 커밋 메시지 "MAX_PASSES 32"는 실험값이며 실제로는 6으로 확정.
-  // 소형 라인 7개 초과분은 Phase 2 union bbox batch OCR로 처리.
-  static constexpr int MAX_PASSES = 6;
+  // MAX_PASSES = kMultipassMax (8): 성능/OCR 스레드 예산 상한.
+  // 소형 라인 초과분은 Phase 2 union bbox batch OCR로 처리.
+  const int MAX_PASSES = kMultipassMax;
   static constexpr int PAD = 4;
 
   // 2-D: SMALL_H를 직전 사이클 평균 라인 높이 기반으로 동적 결정.

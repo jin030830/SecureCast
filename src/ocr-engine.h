@@ -135,10 +135,17 @@ private:
   //   kL1HammingThreshold       : 3   (원래 2)
   //   kMaxSceneGateSkips        : 120 (0으로 설정 시 scene gate 완전 비활성)
   //   kSceneGateHammingThreshold: 1   (0으로 설정 시 exact match만 스킵)
-  static constexpr int kMaxConsecutiveSkips       = 5;
-  static constexpr int kL1HammingThreshold        = 3;
-  static constexpr int kMaxSceneGateSkips         = 120; // ~2s at 60fps
-  static constexpr int kSceneGateHammingThreshold = 1;
+  static constexpr int  kMaxConsecutiveSkips       = 5;
+  static constexpr int  kL1HammingThreshold        = 3;
+  static constexpr int  kMaxSceneGateSkips         = 120; // ~2s at 60fps
+  static constexpr int  kSceneGateHammingThreshold = 1;
+  // Phase 3 tuning
+  //   kMultipassMax           : 8  (원래 6) — 롤백: 6
+  //   kEnableContrastStretch  : true        — 롤백: false
+  //   kEnableHangulNormalize  : true        — 롤백: false
+  static constexpr int  kMultipassMax            = 8;
+  static constexpr bool kEnableContrastStretch   = true;
+  static constexpr bool kEnableHangulNormalize   = true;
   // ──────────────────────────────────────────────────────────────
 
   // Scene-change gate: FrameTimer 바깥에서 관리되는 전-파이프라인 게이트.
