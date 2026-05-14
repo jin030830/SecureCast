@@ -160,11 +160,11 @@ BOOL CALLBACK enum_proc(HWND hwnd, LPARAM lparam)
 	if (out->count >= SC_MAX_TRACKED_WINDOWS)
 		return FALSE; // 슬롯 소진 — 순회 중단
 
-	// 최소화·숨김 창은 보호 대상 아님.
-	// WinEvent 기반 isMinimized()로 판정 — IsIconic()은 Aero Peek 중에도
-	// TRUE를 반환하므로 신뢰할 수 없다.
-	// 최소화 애니메이션 중 블러 공백은 MINIMIZESTART purge + lingering이 커버.
-	if (!IsWindowVisible(hwnd) || is_truly_minimized(hwnd))
+	// 최소화·숨김 창은 화면에 안 그려지므로 보호 대상 아님.
+	// Aero Peek 차단 조건: isMinimized=TRUE && IsIconic=FALSE
+	//   - 애니메이션 중(IsIconic=TRUE): 창이 화면에 있으므로 정상 추적
+	//   - Aero Peek(IsIconic=FALSE): DWM이 ghost로 보여주는 것이므로 차단
+	if (!IsWindowVisible(hwnd) || (WinEventListener::isMinimized(hwnd) && !IsIconic(hwnd)))
 		return TRUE;
 
 	// DWM 기반 정확한 화면 좌표 (그림자 영역 제외).
@@ -267,8 +267,8 @@ extern "C" void sc_update_tracked_bounds(TrackedWindowList *list)
 	for (int i = list->count - 1; i >= 0; --i) {
 		HWND hwnd = list->items[i].hwnd;
 
-		// 창이 닫혔거나 최소화 상태면 슬롯 제거 (swap-and-pop).
-		if (!IsWindowVisible(hwnd) || is_truly_minimized(hwnd)) {
+		// 창이 닫혔거나 Aero Peek 상태면 슬롯 제거 (swap-and-pop).
+		if (!IsWindowVisible(hwnd) || (WinEventListener::isMinimized(hwnd) && !IsIconic(hwnd))) {
 			list->items[i] = list->items[--list->count];
 			continue;
 		}

@@ -235,10 +235,13 @@ set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_nam
 
 # 빌드 후 OBS 플러그인 경로에 자동 배포.
 # CMAKE_INSTALL_PREFIX = C:/ProgramData/obs-studio/plugins (defaults.cmake에서 설정)
+# OBS는 %APPDATA%\obs-studio\plugins 를 우선 로드하므로 두 경로 모두 배포한다.
 if(WIN32)
+  set(_obs_appdata_plugins "$ENV{APPDATA}/obs-studio/plugins")
   add_custom_command(
     TARGET ${CMAKE_PROJECT_NAME}
     POST_BUILD
+    # ProgramData 경로
     COMMAND "${CMAKE_COMMAND}" -E make_directory
       "${CMAKE_INSTALL_PREFIX}/${CMAKE_PROJECT_NAME}/bin/64bit"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
@@ -249,7 +252,13 @@ if(WIN32)
     COMMAND "${CMAKE_COMMAND}" -E copy_directory
       "${CMAKE_CURRENT_SOURCE_DIR}/data"
       "${CMAKE_INSTALL_PREFIX}/${CMAKE_PROJECT_NAME}/data"
-    COMMENT "Deploy ${CMAKE_PROJECT_NAME} to OBS plugins: ${CMAKE_INSTALL_PREFIX}"
+    # AppData 경로 (OBS가 우선 로드하는 경로)
+    COMMAND "${CMAKE_COMMAND}" -E make_directory
+      "${_obs_appdata_plugins}/${CMAKE_PROJECT_NAME}/bin/64bit"
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+      "$<TARGET_FILE:${CMAKE_PROJECT_NAME}>"
+      "${_obs_appdata_plugins}/${CMAKE_PROJECT_NAME}/bin/64bit/"
+    COMMENT "Deploy ${CMAKE_PROJECT_NAME} to OBS plugins: ${CMAKE_INSTALL_PREFIX} + ${_obs_appdata_plugins}"
     VERBATIM
   )
 endif()

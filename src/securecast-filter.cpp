@@ -2392,55 +2392,11 @@ static void securecast_video_tick(void *data, float seconds) {
     }
   }
 
-  // ── MINIMIZESTART: 즉시 purge + 링거링으로 애니메이션 커버 ──────────────
-  // IsIconic()은 Aero Peek 중에도 TRUE → "isMinimized && !IsIconic" 가드 무의미.
-  // 따라서 isMinimized() 단독 가드 사용 + MINIMIZESTART 시 즉시 처리.
-  //   1. ring buffer 전 슬롯 purge → 직후 render에서 stale blur 없음
-  //   2. captureWindowList / windowList / prevWindowList 즉시 제거
-  //   3. 링거링 SC_RING_BUFFER_SLOTS+1 틱 추가 → 최소화 애니메이션 중 블러 커버
-  {
-    HWND minHwnd = filter->winListener.popMinimizeStart();
-    if (minHwnd) {
-      filter->ringBuffer.purgeWindowFromAllSlots(minHwnd);
-
-      auto purgeList = [&](TrackedWindowList &wl) {
-        for (int i = wl.count - 1; i >= 0; --i)
-          if (wl.items[i].hwnd == minHwnd)
-            wl.items[i] = wl.items[--wl.count];
-      };
-
-      // lingeringWindows에 마지막 좌표 보존 후 리스트 제거
-      TrackedWindow lastKnown{};
-      bool found = false;
-      for (int i = 0; i < filter->windowList.count; ++i) {
-        if (filter->windowList.items[i].hwnd == minHwnd) {
-          lastKnown = filter->windowList.items[i];
-          found = true;
-          break;
-        }
-      }
-      purgeList(filter->windowList);
-      purgeList(filter->captureWindowList);
-      purgeList(filter->prevWindowList);
-
-      // OCR tracker 박스도 즉시 제거 — 최소화 후 Aero Peek thumbnail에
-      // stale 블러 박스가 그려지는 버그 수정.
-      filter->trackerMgr.clear();
-
-      if (found) {
-        bool already = false;
-        for (int li = 0; li < filter->lingeringCount; ++li) {
-          if (filter->lingeringWindows[li].window.hwnd == minHwnd) {
-            filter->lingeringWindows[li].ticksRemaining = SC_RING_BUFFER_SLOTS + 1;
-            already = true;
-            break;
-          }
-        }
-        if (!already && filter->lingeringCount < SC_MAX_LINGERING)
-          filter->lingeringWindows[filter->lingeringCount++] = {lastKnown, SC_RING_BUFFER_SLOTS + 1};
-      }
-    }
-  }
+  // MINIMIZESTART: m_minimizedSet는 WinEvent 콜백이 이미 채웠음.
+  // enum_proc에서 isMinimized && !IsIconic(Aero Peek 조건)으로 차단.
+  // 애니메이션 중(IsIconic=TRUE)에는 is_window_top_at_center가 자연 처리하므로
+  // 별도 purge/linger 불필요 — 원래 "뒤로 보내기"와 동일한 경로로 처리됨.
+  filter->winListener.popMinimizeStart(); // atomic 소모(stale read 방지)
 
   // ── WinEvent: 포그라운드 전환 감지 → Quick Restore ─
   // 게임 모드는 CPU 임계값(≤30%, 5s)으로만 해제한다.
