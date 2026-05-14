@@ -37,13 +37,6 @@ constexpr int MIN_WINDOW_DIMENSION = 100;
 // 게임 모드에서는 호출자(securecast-filter.cpp)가 SCAN_INTERVAL_GAME(0.5초)을 전달한다.
 constexpr float SCAN_INTERVAL_SEC = 0.15f;
 
-// 보호 대상 앱 목록. 향후 OBS Properties UI에서 사용자가 편집할 수 있게 확장 예정.
-const wchar_t *const kBlacklist[] = {
-	L"KakaoTalk.exe",
-	L"Discord.exe",
-	L"Slack.exe",
-};
-
 // UWP (Microsoft Store) 앱은 모두 ApplicationFrameHost.exe라는 단일 호스트
 // 프로세스로 보고된다. 실제 앱 식별은 자식 윈도우의 PID를 다시 봐야 가능하므로
 // 1주차에선 일괄 스킵하고 후속 단계에서 EnumChildWindows로 보강한다.
@@ -79,13 +72,36 @@ void path_basename(const wchar_t *full_path, wchar_t *out, size_t out_cap)
 	out[i] = 0;
 }
 
-bool is_blacklisted(const wchar_t *exe_name)
+bool is_blacklisted(const wchar_t *exe_name, const wchar_t *const *appList, int appCount)
 {
-	for (const wchar_t *entry : kBlacklist) {
-		if (iequals(entry, exe_name))
+	for (int i = 0; i < appCount; ++i) {
+		if (appList[i] && iequals(appList[i], exe_name))
 			return true;
 	}
 	return false;
+}
+
+struct EnumContext {
+	TrackedWindowList *out;
+	const wchar_t *const *appList;
+	int appCount;
+};
+
+// Aero Peek 중 Windows가 EVENT_SYSTEM_MINIMIZEEND를 spurious하게 발사해
+// m_minimizedSet에서 HWND가 빠지는 경우가 있다.
+// GetWindowPlacement().showCmd == SW_SHOWMINIMIZED는 WinEvent 상태와 무관하게
+// 창이 실제로 최소화 상태인지 OS 레벨에서 반환하므로 이를 ground truth로 쓴다.
+static bool is_truly_minimized(HWND hwnd)
+{
+	if (WinEventListener::isMinimized(hwnd))
+		return true;
+	// IsIconic checks WS_MINIMIZE style bit directly — reliable even when
+	// WinEvent set is stale from a spurious MINIMIZEEND during Aero Peek.
+	if (IsIconic(hwnd))
+		return true;
+	WINDOWPLACEMENT wp{};
+	wp.length = sizeof(wp);
+	return GetWindowPlacement(hwnd, &wp) && wp.showCmd == SW_SHOWMINIMIZED;
 }
 
 // Win+Tab(Task View)나 Alt+Tab(앱 전환기)인지 클래스명으로 판별.
@@ -139,15 +155,16 @@ bool is_window_top_at_center(HWND hwnd, const RECT &rect)
 //   FALSE → 즉시 순회 중단 (슬롯 소진 시 사용)
 BOOL CALLBACK enum_proc(HWND hwnd, LPARAM lparam)
 {
-	auto *out = reinterpret_cast<TrackedWindowList *>(lparam);
+	auto *ctx = reinterpret_cast<EnumContext *>(lparam);
+	auto *out = ctx->out;
 	if (out->count >= SC_MAX_TRACKED_WINDOWS)
 		return FALSE; // 슬롯 소진 — 순회 중단
 
-	// 최소화·숨김 창은 화면에 안 그려지므로 보호 대상 아님.
-	// Aero Peek 차단 조건: isMinimized=TRUE && IsIconic=FALSE
-	//   - 애니메이션 중(IsIconic=TRUE): 창이 화면에 있으므로 정상 추적
-	//   - Aero Peek(IsIconic=FALSE): DWM이 ghost로 보여주는 것이므로 차단
-	if (!IsWindowVisible(hwnd) || (WinEventListener::isMinimized(hwnd) && !IsIconic(hwnd)))
+	// 최소화·숨김 창은 보호 대상 아님.
+	// WinEvent 기반 isMinimized()로 판정 — IsIconic()은 Aero Peek 중에도
+	// TRUE를 반환하므로 신뢰할 수 없다.
+	// 최소화 애니메이션 중 블러 공백은 MINIMIZESTART purge + lingering이 커버.
+	if (!IsWindowVisible(hwnd) || is_truly_minimized(hwnd))
 		return TRUE;
 
 	// DWM 기반 정확한 화면 좌표 (그림자 영역 제외).
@@ -183,12 +200,29 @@ BOOL CALLBACK enum_proc(HWND hwnd, LPARAM lparam)
 	wchar_t exe_name[64] = {};
 	path_basename(exe_path, exe_name, sizeof(exe_name) / sizeof(exe_name[0]));
 
-	// UWP 앱은 ApplicationFrameHost.exe로 잡힘 → 자식 윈도우 PID로 재시도가 필요하지만
-	// 1주차 골격에서는 일단 무시하고 다음 단계에서 EnumChildWindows로 보강한다.
-	if (iequals(exe_name, kUwpHost))
-		return TRUE;
+	// ApplicationFrameHost = 패키지 앱(메모장, 계산기 등) 프레임 호스트.
+	// 자식 윈도우에서 실제 앱 프로세스를 찾아 exe_name을 덮어쓴다.
+	if (iequals(exe_name, kUwpHost)) {
+		struct Ctx { DWORD hostPid; wchar_t realPath[MAX_PATH]; bool found; };
+		Ctx c{pid, {}, false};
+		EnumChildWindows(hwnd, [](HWND child, LPARAM clp) -> BOOL {
+			auto *cx = reinterpret_cast<Ctx *>(clp);
+			DWORD cpid = 0;
+			GetWindowThreadProcessId(child, &cpid);
+			if (!cpid || cpid == cx->hostPid) return TRUE;
+			HANDLE ph = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, cpid);
+			if (!ph) return TRUE;
+			DWORD csz = MAX_PATH;
+			cx->found = QueryFullProcessImageNameW(ph, 0, cx->realPath, &csz) != 0;
+			CloseHandle(ph);
+			return cx->found ? FALSE : TRUE;
+		}, reinterpret_cast<LPARAM>(&c));
+		if (!c.found) return TRUE;
+		path_basename(c.realPath, exe_name, sizeof(exe_name) / sizeof(exe_name[0]));
+		// 실제 exe_name으로 블랙리스트 검사 계속
+	}
 
-	if (!is_blacklisted(exe_name))
+	if (!is_blacklisted(exe_name, ctx->appList, ctx->appCount))
 		return TRUE;
 
 	// 최소화 상태 진단 로그 — 릴리스 전 제거 예정.
@@ -233,8 +267,8 @@ extern "C" void sc_update_tracked_bounds(TrackedWindowList *list)
 	for (int i = list->count - 1; i >= 0; --i) {
 		HWND hwnd = list->items[i].hwnd;
 
-		// 창이 닫혔거나 Aero Peek 상태면 슬롯 제거 (swap-and-pop).
-		if (!IsWindowVisible(hwnd) || (WinEventListener::isMinimized(hwnd) && !IsIconic(hwnd))) {
+		// 창이 닫혔거나 최소화 상태면 슬롯 제거 (swap-and-pop).
+		if (!IsWindowVisible(hwnd) || is_truly_minimized(hwnd)) {
 			list->items[i] = list->items[--list->count];
 			continue;
 		}
@@ -255,17 +289,21 @@ extern "C" void sc_update_tracked_bounds(TrackedWindowList *list)
 
 // 호출자는 OBS의 video_tick / video_render 같은 렌더 스레드 컨텍스트에서만 호출할 것.
 // (DWM/Win32 윈도우 핸들 조회는 caller 스레드의 메시지 큐에 의존)
-extern "C" void sc_scan_blacklisted_windows(TrackedWindowList *out)
+extern "C" void sc_scan_blacklisted_windows(TrackedWindowList *out,
+                                            const wchar_t *const *appList,
+                                            int appCount)
 {
-	if (!out)
+	if (!out || !appList || appCount <= 0)
 		return;
 	out->count = 0;
-	EnumWindows(enum_proc, reinterpret_cast<LPARAM>(out));
+	EnumContext ctx{out, appList, appCount};
+	EnumWindows(enum_proc, reinterpret_cast<LPARAM>(&ctx));
 }
 
 // 60fps tick에서 매번 호출되어도 실제 무거운 EnumWindows는 0.15초마다 1회만 실행.
 // 매칭된 창은 일단 obs_log로만 출력 — 후속 단계에서 BlurRect로 변환 후 셰이더에 전달.
-extern "C" void sc_tracker_tick(float seconds, float *accumulator, TrackedWindowList *out, float interval)
+extern "C" void sc_tracker_tick(float seconds, float *accumulator, TrackedWindowList *out,
+                                float interval, const wchar_t *const *appList, int appCount)
 {
 	if (!accumulator)
 		return;
@@ -276,7 +314,7 @@ extern "C" void sc_tracker_tick(float seconds, float *accumulator, TrackedWindow
 	*accumulator = 0.0f;
 
 	TrackedWindowList list{};
-	sc_scan_blacklisted_windows(&list);
+	sc_scan_blacklisted_windows(&list, appList, appCount);
 
 	// 스캔 결과를 호출자에게 전달 (창이 0개여도 업데이트 — 닫힌 창 반영).
 	if (out)

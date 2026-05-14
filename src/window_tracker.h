@@ -52,7 +52,10 @@ struct TrackedWindowList {
 // 결과는 out에 채워 반환. count 멤버에 매칭된 창 수가 들어온다.
 // 호출자는 video_tick / video_render에서만 부를 것 — 다른 스레드에서 부르면 안 됨
 // (DwmGetWindowAttribute는 caller 스레드 컨텍스트로 동작).
-void sc_scan_blacklisted_windows(TrackedWindowList *out);
+// appList/appCount: 사용자가 설정한 민감 앱 exe 이름 배열 (e.g. L"KakaoTalk.exe").
+//                   null이면 스캔 결과 없음.
+void sc_scan_blacklisted_windows(TrackedWindowList *out,
+                                 const wchar_t *const *appList, int appCount);
 
 // Fast-path 좌표 갱신: 이미 list에 들어있는 HWND들에 대해 DWM으로 bounds만 재조회.
 // EnumWindows / OpenProcess 없이 DWM query만 수행하므로 매 프레임 호출 가능.
@@ -66,6 +69,7 @@ void sc_update_tracked_bounds(TrackedWindowList *list);
 // accumulator : 누산값 보관 위치 (보통 SecureCastFilter::trackerAccumulator)
 // out         : 스캔이 실행된 경우에만 결과로 채워짐; throttle로 스킵되면 불변.
 //               null 허용 (결과가 필요 없으면 null 전달).
+// appList/appCount: 민감 앱 목록 (sc_scan_blacklisted_windows에 그대로 전달).
 //
 // 동작:
 //   1. *accumulator += seconds
@@ -73,7 +77,8 @@ void sc_update_tracked_bounds(TrackedWindowList *list);
 //   3. 임계 도달 시 sc_scan_blacklisted_windows 1회 + *out 업데이트 + obs_log 출력
 //   4. *accumulator = 0
 // interval: 실제 스캔 주기(초). 기본 0.15초, 게임 모드 시 0.5초 전달.
-void sc_tracker_tick(float seconds, float *accumulator, TrackedWindowList *out, float interval);
+void sc_tracker_tick(float seconds, float *accumulator, TrackedWindowList *out,
+                     float interval, const wchar_t *const *appList, int appCount);
 
 #ifdef __cplusplus
 }

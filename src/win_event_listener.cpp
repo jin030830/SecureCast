@@ -138,18 +138,24 @@ void CALLBACK WinEventListener::eventProc(HWINEVENTHOOK /*hHook*/, DWORD event,
         // video_tick 이 popMinimizeStart()로 consume할 때까지 보관.
         self->m_minimizeStartHwnd.store(hwnd, std::memory_order_release);
     } else if (event == EVENT_SYSTEM_MINIMIZEEND) {
-        blog(LOG_INFO, "[SecureCast] MINIMIZEEND hwnd=%p", hwnd);
-        {
-            std::lock_guard<std::mutex> lk(self->m_minimizedMutex);
-            for (int i = 0; i < self->m_minimizedCount; ++i) {
-                if (self->m_minimizedSet[i] == hwnd) {
-                    self->m_minimizedSet[i] =
-                        self->m_minimizedSet[--self->m_minimizedCount];
-                    break;
+        blog(LOG_INFO, "[SecureCast] MINIMIZEEND hwnd=%p IsIconic=%d", hwnd, IsIconic(hwnd));
+        // IsIconic() still TRUE → window is still minimized (Aero Peek spurious fire).
+        // Do NOT remove from set — only remove on genuine restore.
+        if (IsIconic(hwnd)) {
+            self->m_needRescan.store(true, std::memory_order_release);
+        } else {
+            {
+                std::lock_guard<std::mutex> lk(self->m_minimizedMutex);
+                for (int i = 0; i < self->m_minimizedCount; ++i) {
+                    if (self->m_minimizedSet[i] == hwnd) {
+                        self->m_minimizedSet[i] =
+                            self->m_minimizedSet[--self->m_minimizedCount];
+                        break;
+                    }
                 }
             }
+            self->m_needRescan.store(true, std::memory_order_release);
         }
-        self->m_needRescan.store(true, std::memory_order_release);
     } else {
         self->m_needRescan.store(true, std::memory_order_release);
     }

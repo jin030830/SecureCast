@@ -1189,20 +1189,413 @@ static const char *securecast_get_name(void *type_data) {
   return "SecureCast Privacy Masking";
 }
 
+// 처음 필터를 추가할 때 OBS가 채우는 기본 설정값.
+// app_blacklist를 미설정 상태로 두면 목록이 비어 아무 앱도 안 가려지므로
+// 초기값을 여기서 세팅한다.
+static void securecast_get_defaults(obs_data_t *settings) {
+  static const char *kDefaults[] = {"KakaoTalk.exe", "Discord.exe",
+                                    "Slack.exe"};
+  auto make_arr = [&](const char *key) {
+    obs_data_array_t *arr = obs_data_array_create();
+    for (const char *app : kDefaults) {
+      obs_data_t *item = obs_data_create();
+      obs_data_set_string(item, "value", app);
+      obs_data_array_push_back(arr, item);
+      obs_data_release(item);
+    }
+    obs_data_set_array(settings, key, arr);
+    obs_data_array_release(arr);
+  };
+  make_arr("app_blacklist_normal");
+  make_arr("app_blacklist_game");
+}
+
+// ------------------------------------------------------------
+// Installed-app picker helpers (Windows only)
+// ------------------------------------------------------------
+#ifdef _WIN32
+#include <winreg.h>
+#include <winver.h>
+
+struct InstalledApp {
+  char name[256]; // 앱 표시 이름 (UTF-8)
+  char exeA[64];  // exe 베이스네임 (블랙리스트 저장값)
+};
+
+static void to_utf8(const wchar_t *src, char *dst, int len) {
+  WideCharToMultiByte(CP_UTF8, 0, src, -1, dst, len, nullptr, nullptr);
+}
+
+static bool app_dup(const std::vector<InstalledApp> &v, const char *exe) {
+  for (const auto &a : v)
+    if (_stricmp(a.exeA, exe) == 0) return true;
+  return false;
+}
+
+// exe 버전 리소스에서 FileDescription 또는 ProductName을 읽는다.
+static bool get_file_desc(const wchar_t *path, char *out, int outLen)
+{
+  DWORD dummy;
+  DWORD sz = GetFileVersionInfoSizeW(path, &dummy);
+  if (!sz) return false;
+  std::vector<BYTE> buf(sz);
+  if (!GetFileVersionInfoW(path, 0, sz, buf.data())) return false;
+  struct LANGCP { WORD lang; WORD cp; } *t;
+  UINT tsz;
+  if (!VerQueryValueW(buf.data(), L"\\VarFileInfo\\Translation",
+                      reinterpret_cast<LPVOID *>(&t), &tsz) || !tsz)
+    return false;
+  for (auto *field : {L"FileDescription", L"ProductName"}) {
+    wchar_t sub[80];
+    swprintf_s(sub, L"\\StringFileInfo\\%04x%04x\\%s", t[0].lang, t[0].cp, field);
+    wchar_t *val = nullptr; UINT vlen;
+    if (VerQueryValueW(buf.data(), sub, reinterpret_cast<LPVOID *>(&val), &vlen)
+        && val && val[0]) {
+      to_utf8(val, out, outLen);
+      return true;
+    }
+  }
+  return false;
+}
+
+// Source 1: 레지스트리 언인스톨 키 (Win32 앱, MSIX 패키지 앱 포함)
+static void apps_from_registry(std::vector<InstalledApp> &out)
+{
+  struct K { HKEY root; const wchar_t *path; };
+  K keys[] = {
+    {HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall"},
+    {HKEY_LOCAL_MACHINE, L"SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall"},
+    {HKEY_CURRENT_USER,  L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall"},
+  };
+  for (auto &k : keys) {
+    HKEY hRoot;
+    if (RegOpenKeyExW(k.root, k.path, 0, KEY_READ, &hRoot) != ERROR_SUCCESS) continue;
+    wchar_t sub[256];
+    for (DWORD i = 0; RegEnumKeyW(hRoot, i, sub, 256) == ERROR_SUCCESS; ++i) {
+      HKEY hSub;
+      if (RegOpenKeyExW(hRoot, sub, 0, KEY_READ, &hSub) != ERROR_SUCCESS) continue;
+
+      // SystemComponent=1 인 항목은 프로그램 목록에서 숨겨지는 시스템 구성 요소
+      DWORD sc = 0, scSz = sizeof(DWORD);
+      RegQueryValueExW(hSub, L"SystemComponent", nullptr, nullptr, (LPBYTE)&sc, &scSz);
+      if (sc) { RegCloseKey(hSub); continue; }
+
+      auto readW = [&](const wchar_t *v, wchar_t *buf, DWORD chars) -> bool {
+        DWORD type, s = chars * 2;
+        return RegQueryValueExW(hSub, v, nullptr, &type, (LPBYTE)buf, &s)
+                   == ERROR_SUCCESS && type == REG_SZ && buf[0];
+      };
+
+      wchar_t dn[256] = {};
+      if (!readW(L"DisplayName", dn, 256)) { RegCloseKey(hSub); continue; }
+
+      wchar_t icon[MAX_PATH] = {};
+      if (!readW(L"DisplayIcon", icon, MAX_PATH)) { RegCloseKey(hSub); continue; }
+
+      // "C:\app.exe,0" → "C:\app.exe"
+      wchar_t *comma = wcschr(icon, L',');
+      if (comma) *comma = L'\0';
+      wchar_t *ep = icon;
+      if (*ep == L'"') { ++ep; wchar_t *q = wcschr(ep, L'"'); if (q) *q = L'\0'; }
+
+      const wchar_t *dot = wcsrchr(ep, L'.');
+      if (!dot || _wcsicmp(dot, L".exe") != 0) { RegCloseKey(hSub); continue; }
+
+      const wchar_t *base = ep;
+      for (const wchar_t *p = ep; *p; ++p)
+        if (*p == L'\\' || *p == L'/') base = p + 1;
+
+      char exeA[64] = {};
+      to_utf8(base, exeA, 64);
+      if (!exeA[0] || app_dup(out, exeA)) { RegCloseKey(hSub); continue; }
+
+      InstalledApp app{};
+      to_utf8(dn, app.name, 256);
+      strncpy_s(app.exeA, exeA, _TRUNCATE);
+      out.push_back(app);
+      RegCloseKey(hSub);
+    }
+    RegCloseKey(hRoot);
+  }
+}
+
+// Source 2: %LOCALAPPDATA%\Microsoft\WindowsApps\*.exe  (스토어/패키지 앱 스텁)
+// Notepad, 계산기, 시계 등 Windows 기본 앱이 여기 있다.
+static void apps_from_windows_apps(std::vector<InstalledApp> &out)
+{
+  wchar_t local[MAX_PATH] = {};
+  if (!GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH)) return;
+
+  wchar_t pattern[MAX_PATH];
+  swprintf_s(pattern, L"%s\\Microsoft\\WindowsApps\\*.exe", local);
+
+  WIN32_FIND_DATAW fd{};
+  HANDLE h = FindFirstFileW(pattern, &fd);
+  if (h == INVALID_HANDLE_VALUE) return;
+  do {
+    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+
+    char exeA[64] = {};
+    to_utf8(fd.cFileName, exeA, 64);
+    if (!exeA[0] || app_dup(out, exeA)) continue;
+
+    InstalledApp app{};
+    strncpy_s(app.exeA, exeA, _TRUNCATE);
+
+    // 버전 리소스에서 표시 이름 시도; 실패하면 .exe 제거한 파일명 사용
+    wchar_t fullPath[MAX_PATH];
+    swprintf_s(fullPath, L"%s\\Microsoft\\WindowsApps\\%s", local, fd.cFileName);
+    if (!get_file_desc(fullPath, app.name, 256)) {
+      char *dot = strrchr(exeA, '.');
+      if (dot) strncpy_s(app.name, exeA, (size_t)(dot - exeA));
+      else strncpy_s(app.name, exeA, _TRUNCATE);
+    }
+    if (!app.name[0]) continue;
+    out.push_back(app);
+  } while (FindNextFileW(h, &fd));
+  FindClose(h);
+}
+
+// Source 3: 현재 실행 중인 앱 (위 두 소스에서 빠진 경우 보완)
+static BOOL CALLBACK enum_running_for_picker(HWND hwnd, LPARAM lp)
+{
+  auto *out = reinterpret_cast<std::vector<InstalledApp> *>(lp);
+  if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) return TRUE;
+
+  DWORD pid = 0;
+  GetWindowThreadProcessId(hwnd, &pid);
+  if (!pid) return TRUE;
+
+  HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+  if (!proc) return TRUE;
+  wchar_t path[MAX_PATH] = {};
+  DWORD sz = MAX_PATH;
+  bool ok = QueryFullProcessImageNameW(proc, 0, path, &sz) != 0;
+  CloseHandle(proc);
+  if (!ok) return TRUE;
+
+  const wchar_t *base = path;
+  for (const wchar_t *q = path; *q; ++q)
+    if (*q == L'\\' || *q == L'/') base = q + 1;
+
+  if (_wcsicmp(base, L"explorer.exe") == 0) return TRUE;
+
+  // AFH 호스트 → 자식에서 실제 앱 찾기
+  wchar_t realPath[MAX_PATH] = {};
+  if (_wcsicmp(base, L"ApplicationFrameHost.exe") == 0) {
+    struct Ctx { DWORD hpid; wchar_t *out; bool found; };
+    Ctx c{pid, realPath, false};
+    EnumChildWindows(hwnd, [](HWND child, LPARAM clp) -> BOOL {
+      auto *cx = reinterpret_cast<Ctx *>(clp);
+      DWORD cpid = 0;
+      GetWindowThreadProcessId(child, &cpid);
+      if (!cpid || cpid == cx->hpid) return TRUE;
+      HANDLE ph = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, cpid);
+      if (!ph) return TRUE;
+      DWORD csz = MAX_PATH;
+      cx->found = QueryFullProcessImageNameW(ph, 0, cx->out, &csz) != 0;
+      CloseHandle(ph);
+      return cx->found ? FALSE : TRUE;
+    }, reinterpret_cast<LPARAM>(&c));
+    if (!c.found) return TRUE;
+    base = realPath;
+    for (const wchar_t *q = realPath; *q; ++q)
+      if (*q == L'\\' || *q == L'/') base = q + 1;
+  }
+
+  char exeA[64] = {};
+  to_utf8(base, exeA, 64);
+  if (!exeA[0] || app_dup(*out, exeA)) return TRUE;
+
+  InstalledApp app{};
+  strncpy_s(app.exeA, exeA, _TRUNCATE);
+
+  // 창 제목이나 버전 리소스에서 표시 이름 시도
+  wchar_t title[128] = {};
+  GetWindowTextW(hwnd, title, 128);
+  if (title[0]) to_utf8(title, app.name, 256);
+  else if (!get_file_desc(base == path ? path : realPath, app.name, 256)) {
+    char *dot = strrchr(exeA, '.');
+    if (dot) strncpy_s(app.name, exeA, (size_t)(dot - exeA));
+    else strncpy_s(app.name, exeA, _TRUNCATE);
+  }
+  if (!app.name[0]) return TRUE;
+  out->push_back(app);
+  return TRUE;
+}
+
+static void populate_app_combo(obs_property_t *p)
+{
+  std::vector<InstalledApp> apps;
+  apps_from_registry(apps);
+  apps_from_windows_apps(apps);
+  EnumWindows(enum_running_for_picker, reinterpret_cast<LPARAM>(&apps));
+
+  std::sort(apps.begin(), apps.end(), [](const InstalledApp &a, const InstalledApp &b) {
+    return _stricmp(a.name, b.name) < 0;
+  });
+
+  for (const auto &a : apps) {
+    char label[320];
+    snprintf(label, sizeof(label), "%s  (%s)", a.name, a.exeA);
+    obs_property_list_add_string(p, label, a.exeA);
+  }
+}
+
+// 버튼 콜백 공용 구현 — 선택된 앱을 key 목록에 추가.
+static bool add_to_list(void *data, const char *key)
+{
+  auto *filter = static_cast<SecureCastFilter *>(data);
+  if (!filter || !filter->context) return false;
+
+  obs_data_t *settings = obs_source_get_settings(filter->context);
+  if (!settings) return false;
+
+  const char *sel = obs_data_get_string(settings, "app_selector");
+  if (!sel || !*sel) { obs_data_release(settings); return false; }
+
+  obs_data_array_t *arr = obs_data_get_array(settings, key);
+  if (!arr) arr = obs_data_array_create();
+
+  bool exists = false;
+  for (size_t i = 0; i < obs_data_array_count(arr); ++i) {
+    obs_data_t *item = obs_data_array_item(arr, i);
+    const char *val = obs_data_get_string(item, "value");
+    if (val && _stricmp(val, sel) == 0) exists = true;
+    obs_data_release(item);
+    if (exists) break;
+  }
+
+  if (!exists) {
+    obs_data_t *newItem = obs_data_create();
+    obs_data_set_string(newItem, "value", sel);
+    obs_data_array_push_back(arr, newItem);
+    obs_data_release(newItem);
+    obs_data_set_array(settings, key, arr);
+    obs_source_update(filter->context, settings);
+  }
+
+  obs_data_array_release(arr);
+  obs_data_release(settings);
+  return true;
+}
+
+static bool add_to_normal_clicked(obs_properties_t *, obs_property_t *,
+                                   void *data)
+{
+  return add_to_list(data, "app_blacklist_normal");
+}
+
+static bool add_to_game_clicked(obs_properties_t *, obs_property_t *,
+                                 void *data)
+{
+  return add_to_list(data, "app_blacklist_game");
+}
+#endif // _WIN32
+
+// OBS 필터 속성창에 표시할 UI 위젯 생성.
+static obs_properties_t *securecast_get_properties(void *data) {
+  obs_properties_t *props = obs_properties_create();
+
+#ifdef _WIN32
+  // 공유 앱 선택 드롭다운 (두 목록에 모두 사용)
+  obs_property_t *sel =
+      obs_properties_add_list(props, "app_selector",
+                              obs_module_text("AppSelector"),
+                              OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+  populate_app_combo(sel);
+
+  // 일반 모드 그룹 (게임 모드 OFF 시 차단 앱)
+  obs_properties_t *normal_grp = obs_properties_create();
+  obs_properties_set_param(normal_grp, data, nullptr);
+  obs_properties_add_button(normal_grp, "add_normal_btn",
+                             obs_module_text("AppSelectorAddNormal"),
+                             add_to_normal_clicked);
+  obs_properties_add_editable_list(normal_grp, "app_blacklist_normal",
+                                   obs_module_text("AppBlacklistNormal"),
+                                   OBS_EDITABLE_LIST_TYPE_STRINGS, nullptr,
+                                   nullptr);
+  obs_properties_add_group(props, "normal_section",
+                           obs_module_text("AppGroupNormal"),
+                           OBS_GROUP_NORMAL, normal_grp);
+
+  // 게임 모드 그룹 (게임 모드 ON 시 전체 블러 앱)
+  obs_properties_t *game_grp = obs_properties_create();
+  obs_properties_set_param(game_grp, data, nullptr);
+  obs_properties_add_button(game_grp, "add_game_btn",
+                             obs_module_text("AppSelectorAddGame"),
+                             add_to_game_clicked);
+  obs_properties_add_editable_list(game_grp, "app_blacklist_game",
+                                   obs_module_text("AppBlacklistGame"),
+                                   OBS_EDITABLE_LIST_TYPE_STRINGS, nullptr,
+                                   nullptr);
+  obs_properties_add_group(props, "game_section",
+                           obs_module_text("AppGroupGame"),
+                           OBS_GROUP_NORMAL, game_grp);
+#endif
+
+  (void)data;
+  return props;
+}
+
+// obs_data_array → wstring 벡터 변환 헬퍼.
+static std::vector<std::wstring> array_to_wlist(obs_data_t *settings,
+                                                  const char *key)
+{
+  obs_data_array_t *arr = obs_data_get_array(settings, key);
+  const size_t count = arr ? obs_data_array_count(arr) : 0;
+  std::vector<std::wstring> list;
+  list.reserve(count);
+  for (size_t i = 0; i < count; ++i) {
+    obs_data_t *item = obs_data_array_item(arr, i);
+    const char *val = obs_data_get_string(item, "value");
+    if (val && *val) {
+      const int len = MultiByteToWideChar(CP_UTF8, 0, val, -1, nullptr, 0);
+      if (len > 1) {
+        std::wstring ws(len - 1, L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, val, -1, ws.data(), len);
+        list.push_back(std::move(ws));
+      }
+    }
+    obs_data_release(item);
+  }
+  if (arr) obs_data_array_release(arr);
+  return list;
+}
+
+// 사용자가 속성창에서 설정을 변경할 때마다 OBS가 호출.
+static void securecast_update(void *data, obs_data_t *settings) {
+  auto *filter = static_cast<SecureCastFilter *>(data);
+  if (!filter || !settings)
+    return;
+
+  auto normalList = array_to_wlist(settings, "app_blacklist_normal");
+  auto gameList   = array_to_wlist(settings, "app_blacklist_game");
+
+  {
+    std::lock_guard<std::mutex> lk(filter->appBlacklistMutex);
+    filter->appBlacklist     = std::move(normalList);
+    filter->appBlacklistGame = std::move(gameList);
+  }
+  blog(LOG_INFO, "[SecureCast] Blacklist updated: normal=%d, game=%d.",
+       (int)filter->appBlacklist.size(), (int)filter->appBlacklistGame.size());
+}
+
 // 사용자가 어떤 비디오 소스에 SecureCast 필터를 추가할 때 호출.
 // settings는 OBS Properties UI에서 사용자가 입력한 값 (현재 미사용),
 // context는 OBS가 만든 이 필터의 source 핸들.
 //
 // 반환값은 OBS가 보관하다가 이후 모든 콜백의 data 인자로 다시 넘겨준다.
 static void *securecast_create(obs_data_t *settings, obs_source_t *context) {
-  (void)settings;
-
   SecureCastFilter *filter = new SecureCastFilter();
   filter->context = context;
   filter->isActive = true;
   filter->isGameMode = false;
   filter->currentState = SecurityState::SAFE;
   filter->trackerAccumulator = 0.0f; // window_tracker tick throttle 누산기
+
+  // 저장된 설정(또는 get_defaults로 채운 기본값)으로 blacklist 초기화.
+  securecast_update(filter, settings);
 
   obs_log(LOG_INFO, "[SecureCast] Filter created.");
   // [핵심 해결] 그래픽 리소스 생성 시 반드시 그래픽 컨텍스트 진입 필요
@@ -1418,10 +1811,13 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
     filter->mockWorker.start(w, h, [filter](const MaskPayload &payload) {
       filter->maskChannel.publish(payload);
     });
-    start_ocr_worker(filter);
+    // CPU 디그레이드 모드 중에는 OCR 워커를 재시작하지 않는다.
+    if (!filter->cpuDegraded.load(std::memory_order_acquire))
+      start_ocr_worker(filter);
     start_tracker_thread(filter);
     blog(LOG_INFO,
-         "[securecast][ocr] Async OCR worker restarted after resize.");
+         "[securecast][ocr] Async OCR worker restarted after resize%s.",
+         filter->cpuDegraded.load() ? " (degraded: OCR skipped)" : "");
 
 #ifdef _WIN32
     // [C-6 수정] 해상도 변경 시 readback 풀도 반드시 재구성
@@ -1697,9 +2093,12 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
     }
 
     // OCR 제출: ocrIdle일 때만 (~4fps)
+    // CPU 디그레이드 모드에서는 OCR 제출을 건너뛰고 idle 플래그를 즉시 반환.
     // 1-G: 1280px+ → GPU 2× 다운샘플 readback으로 속도 최적화.
     //      트래커도 동일 half-res 공간을 사용하므로 좌표계 불일치 없음.
-    if (ocrIdle) {
+    if (ocrIdle && filter->cpuDegraded.load(std::memory_order_acquire)) {
+      filter->ocrWorkerIdle.store(true, std::memory_order_release);
+    } else if (ocrIdle) {
       std::vector<uint8_t> ocrPixels;
       int ocrW = static_cast<int>(w), ocrH = static_cast<int>(h), ocrStride = 0;
       bool ocrSubmit = false;
@@ -1796,9 +2195,10 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
   }
 #endif
   // OCR 박스 — Visual Tracker가 제공하는 NCC 추적 위치
+  // CPU 디그레이드 모드에서는 OCR/Tracker 박스를 생략. Role A 창 전체 블러만 유지.
   // [좌표계 동기화] use1GPath 모드에서는 트래커가 half-res 공간에서 추적하므로
   // trackerCoordScale_(=2.0f)를 곱해 원본 해상도로 좌표를 복원한다.
-  {
+  if (!filter->cpuDegraded.load(std::memory_order_relaxed)) {
     const float tScale = filter->trackerCoordScale_;
     const auto trackerBoxes = filter->trackerMgr.active_boxes();
     for (const auto &tb : trackerBoxes) {
@@ -1912,6 +2312,16 @@ static void securecast_video_tick(void *data, float seconds) {
           filter->mockWorker.setPaused(true);
           blog(LOG_INFO, "[SecureCast] Game mode ON  (CPU: %.0f%%)",
                filter->cpuUsage);
+          // CPU 디그레이드 모드 진입: OCR 워커 완전 중단
+          if (!filter->cpuDegraded.exchange(true, std::memory_order_acq_rel)) {
+            filter->ocrWorkerIdle.store(true, std::memory_order_release);
+            stop_ocr_worker(filter);
+            filter->trackerMgr.clear();
+            blog(LOG_INFO,
+                 "[SecureCast] CPU degraded mode ON — OCR stopped, "
+                 "full-window blur only (CPU: %.0f%%)",
+                 filter->cpuUsage);
+          }
         }
       } else {
         filter->gameModeEntryTimer = 0.0f;
@@ -1926,6 +2336,15 @@ static void securecast_video_tick(void *data, float seconds) {
           blog(LOG_INFO,
                "[SecureCast] Game mode OFF (CPU: %.0f%%, 5s cooldown)",
                filter->cpuUsage);
+          // CPU 디그레이드 모드 해제: OCR 워커 재시작
+          if (filter->cpuDegraded.exchange(false, std::memory_order_acq_rel)) {
+            start_ocr_worker(filter);
+            filter->trackerMgr.clear();
+            blog(LOG_INFO,
+                 "[SecureCast] CPU degraded mode OFF — OCR restarting "
+                 "(CPU: %.0f%%)",
+                 filter->cpuUsage);
+          }
         }
       } else {
         filter->gameModeExitTimer = 0.0f;
@@ -1933,11 +2352,51 @@ static void securecast_video_tick(void *data, float seconds) {
     }
   }
 
-  // MINIMIZESTART: m_minimizedSet는 WinEvent 콜백이 이미 채웠음.
-  // enum_proc에서 isMinimized && !IsIconic(Aero Peek 조건)으로 차단.
-  // 애니메이션 중(IsIconic=TRUE)에는 is_window_top_at_center가 자연 처리하므로
-  // 별도 purge/linger 불필요 — 원래 "뒤로 보내기"와 동일한 경로로 처리됨.
-  filter->winListener.popMinimizeStart(); // atomic 소모(stale read 방지)
+  // ── MINIMIZESTART: 즉시 purge + 링거링으로 애니메이션 커버 ──────────────
+  // IsIconic()은 Aero Peek 중에도 TRUE → "isMinimized && !IsIconic" 가드 무의미.
+  // 따라서 isMinimized() 단독 가드 사용 + MINIMIZESTART 시 즉시 처리.
+  //   1. ring buffer 전 슬롯 purge → 직후 render에서 stale blur 없음
+  //   2. captureWindowList / windowList / prevWindowList 즉시 제거
+  //   3. 링거링 SC_RING_BUFFER_SLOTS+1 틱 추가 → 최소화 애니메이션 중 블러 커버
+  {
+    HWND minHwnd = filter->winListener.popMinimizeStart();
+    if (minHwnd) {
+      filter->ringBuffer.purgeWindowFromAllSlots(minHwnd);
+
+      auto purgeList = [&](TrackedWindowList &wl) {
+        for (int i = wl.count - 1; i >= 0; --i)
+          if (wl.items[i].hwnd == minHwnd)
+            wl.items[i] = wl.items[--wl.count];
+      };
+
+      // lingeringWindows에 마지막 좌표 보존 후 리스트 제거
+      TrackedWindow lastKnown{};
+      bool found = false;
+      for (int i = 0; i < filter->windowList.count; ++i) {
+        if (filter->windowList.items[i].hwnd == minHwnd) {
+          lastKnown = filter->windowList.items[i];
+          found = true;
+          break;
+        }
+      }
+      purgeList(filter->windowList);
+      purgeList(filter->captureWindowList);
+      purgeList(filter->prevWindowList);
+
+      if (found) {
+        bool already = false;
+        for (int li = 0; li < filter->lingeringCount; ++li) {
+          if (filter->lingeringWindows[li].window.hwnd == minHwnd) {
+            filter->lingeringWindows[li].ticksRemaining = SC_RING_BUFFER_SLOTS + 1;
+            already = true;
+            break;
+          }
+        }
+        if (!already && filter->lingeringCount < SC_MAX_LINGERING)
+          filter->lingeringWindows[filter->lingeringCount++] = {lastKnown, SC_RING_BUFFER_SLOTS + 1};
+      }
+    }
+  }
 
   // ── WinEvent: 포그라운드 전환 감지 → Quick Restore ─
   // 게임 모드는 CPU 임계값(≤30%, 5s)으로만 해제한다.
@@ -1986,8 +2445,20 @@ static void securecast_video_tick(void *data, float seconds) {
 
   const float scanInterval =
       filter->isGameMode ? SCAN_INTERVAL_GAME : SCAN_INTERVAL_NORMAL;
+  // 게임 모드 ON: appBlacklistGame / OFF: appBlacklist 사용.
+  // main 스레드(update)와 video 스레드(여기)가 동시 접근 가능 — 잠그고 복사.
+  std::vector<std::wstring> blCopy;
+  {
+    std::lock_guard<std::mutex> lk(filter->appBlacklistMutex);
+    blCopy = filter->isGameMode ? filter->appBlacklistGame
+                                : filter->appBlacklist;
+  }
+  std::vector<const wchar_t *> blPtrs;
+  blPtrs.reserve(blCopy.size());
+  for (const auto &s : blCopy)
+    blPtrs.push_back(s.c_str());
   sc_tracker_tick(seconds, &filter->trackerAccumulator, &filter->windowList,
-                  scanInterval);
+                  scanInterval, blPtrs.data(), (int)blPtrs.size());
 
   // recentlySeenList 유지: windowList 항목을 upsert, 완전히 닫힌 HWND 제거.
   // recentlySeenList는 앱이 다시 등장했을 때 quick restore의 소스가 된다.
@@ -2103,6 +2574,9 @@ struct obs_source_info securecast_filter_info = []() {
   info.type = OBS_SOURCE_TYPE_FILTER;
   info.output_flags = OBS_SOURCE_VIDEO;
   info.get_name = securecast_get_name;
+  info.get_defaults = securecast_get_defaults;
+  info.get_properties = securecast_get_properties;
+  info.update = securecast_update;
   info.create = securecast_create;
   info.destroy = securecast_destroy;
   info.video_tick = securecast_video_tick;

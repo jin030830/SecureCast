@@ -278,6 +278,13 @@ struct SecureCastFilter {
   int logEnqueueCount = 0; // enqueue 성공 로그 주기 카운터 (300프레임마다 1회)
 
   // ----- [Role A 담당: 윈도우 추적 및 블랙리스트] -----
+  // 일반 모드(게임 모드 OFF)에서 차단할 앱 목록.
+  // 게임 모드(게임 모드 ON)에서 전체 블러 처리할 앱 목록.
+  // 둘 다 video_tick에서 읽으므로 같은 mutex로 보호.
+  std::vector<std::wstring> appBlacklist;      // 일반 모드
+  std::vector<std::wstring> appBlacklistGame;  // 게임 모드
+  std::mutex appBlacklistMutex;
+
   float trackerAccumulator =
       0.0f; // 윈도우 스캔 틱 조절(0.15초 단위)용 시간 누산기
   gs_effect_t *blurEffect = nullptr; // 컴파일된 HLSL 셰이더
@@ -309,6 +316,13 @@ struct SecureCastFilter {
   // ----- [Panic Button] Ctrl+Shift+F12 -----
   std::atomic<bool> panicMode{false};
   obs_hotkey_id panicHotkeyId = OBS_INVALID_HOTKEY_ID;
+
+  // ----- [CPU Degraded Mode] -----
+  // CPU ≥ GM_CPU_ENTER(40%)가 GM_ENTER_TIME(3s) 지속 시 진입.
+  // OCR 워커 완전 중단 + tracker 박스 렌더 생략 → Role A 창 전체 블러만 유지.
+  // CPU ≤ GM_CPU_EXIT(30%)가 GM_EXIT_TIME(5s) 지속 시 해제 → OCR 워커 재시작.
+  // Game Mode와 동일 임계값으로 동시 진입/해제 (isGameMode와 항상 함께 전환).
+  std::atomic<bool> cpuDegraded{false};
 
   // ----- [Role B] Visual Tracker -----
   // OCR("what": ~250ms) 과 Tracker("where": render rate) 분리.
