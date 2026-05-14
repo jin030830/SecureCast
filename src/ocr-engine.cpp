@@ -13,7 +13,18 @@
 // std::regex 대신 RE2를 강제로 사용한다.
 #include <re2/re2.h>
 
+#ifndef SC_ENABLE_TESTS
 #include <obs-module.h>
+#else
+// 테스트 빌드: OBS SDK 없이 컴파일하기 위한 최소 스텁
+#define LOG_INFO    300
+#define LOG_WARNING 200
+#define LOG_ERROR   100
+#include <cstdio>
+inline void blog(int /*level*/, const char *fmt, ...) {
+  (void)fmt;
+}
+#endif
 
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Foundation.h>
