@@ -258,7 +258,7 @@ SecureCastOcrEngine::analyze_bgra_frame(const uint8_t *pixels, int width,
   // kMaxSceneGateSkips 도달 시 강제 full OCR → 새로 등장한 PII 탐지 보장.
   if (sameRes && hasLastSceneGateHash_) {
     const uint64_t sg = compute_scene_hash_fast(pixels, stride, width, height);
-    if (hamming_distance(sg, lastSceneGateHash_) <= 1 &&
+    if (hamming_distance(sg, lastSceneGateHash_) <= kSceneGateHammingThreshold &&
         sceneGateConsecutive_ < kMaxSceneGateSkips) {
       ++sceneGateConsecutive_;
       ++profile_.scene_gate_hits;
@@ -278,7 +278,7 @@ SecureCastOcrEngine::analyze_bgra_frame(const uint8_t *pixels, int width,
   if (sameRes && hasLastRoiDhash_) {
     const uint64_t roiHash =
         compute_roi_dhash(pixels, stride, width, height, lastBoxes_);
-    if (hamming_distance(roiHash, lastRoiDhash_) <= 3) {
+    if (hamming_distance(roiHash, lastRoiDhash_) <= kL1HammingThreshold) {
       if (++consecutiveSkips_ < kMaxConsecutiveSkips) {
         ++profile_.l1_hits;
         return lastBoxes_; // L1 hit

@@ -128,16 +128,23 @@ private:
   int consecutiveSkips_ = 0;
   // 2-C: 직전 full OCR 사이클의 라인 평균 높이. 적응형 스케일 계산에 사용.
   float avgLineHeight_ = 0.0f;
-  // L1 연속 히트 허용 횟수: 5 = 정적 화면 OCR ~0.8fps (at 4fps submit rate).
-  static constexpr int kMaxConsecutiveSkips = 5;
+
+  // ── Tuning constants ── 롤백 시 이 블록만 수정 ────────────────
+  // 회귀 발생 시 각 값을 괄호 안 원래 값으로 되돌린다.
+  //   kMaxConsecutiveSkips      : 5   (원래 2)
+  //   kL1HammingThreshold       : 3   (원래 2)
+  //   kMaxSceneGateSkips        : 120 (0으로 설정 시 scene gate 완전 비활성)
+  //   kSceneGateHammingThreshold: 1   (0으로 설정 시 exact match만 스킵)
+  static constexpr int kMaxConsecutiveSkips       = 5;
+  static constexpr int kL1HammingThreshold        = 3;
+  static constexpr int kMaxSceneGateSkips         = 120; // ~2s at 60fps
+  static constexpr int kSceneGateHammingThreshold = 1;
+  // ──────────────────────────────────────────────────────────────
 
   // Scene-change gate: FrameTimer 바깥에서 관리되는 전-파이프라인 게이트.
-  // L1보다 앞서 실행되어 완전히 정적인 화면의 OCR 호출을 차단한다.
-  // kMaxSceneGateSkips 도달 시 강제 Full OCR → 새로 등장한 PII를 놓치지 않음.
   uint64_t lastSceneGateHash_ = 0;
   bool hasLastSceneGateHash_ = false;
   int sceneGateConsecutive_ = 0;
-  static constexpr int kMaxSceneGateSkips = 120; // ~2s at 60fps
 
   // 8×8 구역 dHash: 9×8 샘플 격자 → 인접 밝기 비교 → 64비트
   uint64_t compute_dhash_region(const uint8_t *px, int stride, int x, int y,
