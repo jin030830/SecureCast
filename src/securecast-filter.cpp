@@ -1340,7 +1340,7 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
 
 #ifdef _WIN32
     // 게임 모드 활성 시: 우상단에 빨간 네모 박스 표시 (임시 인디케이터)
-    if (filter->isGameMode) {
+    if (filter->isGameMode.load(std::memory_order_acquire)) {
         gs_effect_t* solid = obs_get_base_effect(OBS_EFFECT_SOLID);
         constexpr uint32_t GM_SZ = 20, GM_PAD = 8;
         gs_effect_set_color(gs_effect_get_param_by_name(solid, "color"), 0xFFFF0000);
@@ -1383,11 +1383,13 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
 static void securecast_video_tick(void* data, float seconds)
 {
     SecureCastFilter* filter = (SecureCastFilter*)data;
+    if (!filter)
+        return;
 
     // [Role D] isActive는 GUI 스레드(update)에서도 쓸 수 있으므로 settingsMutex로 보호
     {
         std::lock_guard<std::mutex> lock(filter->settingsMutex);
-        if (!filter || !filter->isActive)
+        if (!filter->isActive)
             return;
     }
 
@@ -1400,11 +1402,11 @@ static void securecast_video_tick(void* data, float seconds)
                                            &filter->prevKernelTime,
                                            &filter->prevUserTime);
 
-        if (!filter->isGameMode) {
+        if (!filter->isGameMode.load(std::memory_order_acquire)) {
             if (filter->cpuUsage >= GM_CPU_ENTER) {
                 filter->gameModeEntryTimer += GM_SAMPLE_INTERVAL;
                 if (filter->gameModeEntryTimer >= GM_ENTER_TIME) {
-                    filter->isGameMode        = true;
+                    filter->isGameMode.store(true, std::memory_order_release);
                     filter->gameModeEntryTimer = 0.0f;
                     filter->gameModeExitTimer  = 0.0f;
                     filter->mockWorker.setPaused(true);
@@ -1417,7 +1419,7 @@ static void securecast_video_tick(void* data, float seconds)
             if (filter->cpuUsage <= GM_CPU_EXIT) {
                 filter->gameModeExitTimer += GM_SAMPLE_INTERVAL;
                 if (filter->gameModeExitTimer >= GM_EXIT_TIME) {
-                    filter->isGameMode       = false;
+                    filter->isGameMode.store(false, std::memory_order_release);
                     filter->gameModeExitTimer = 0.0f;
                     filter->mockWorker.setPaused(false);
                     blog(LOG_INFO, "[SecureCast] Game mode OFF (CPU: %.0f%%, 5s cooldown)", filter->cpuUsage);
@@ -1468,7 +1470,7 @@ static void securecast_video_tick(void* data, float seconds)
         }
     }
 
-    const float scanInterval = filter->isGameMode ? SCAN_INTERVAL_GAME : SCAN_INTERVAL_NORMAL;
+    const float scanInterval = filter->isGameMode.load(std::memory_order_acquire) ? SCAN_INTERVAL_GAME : SCAN_INTERVAL_NORMAL;
     sc_tracker_tick(seconds, &filter->trackerAccumulator, &filter->windowList, scanInterval);
 
     // [Role D] windowList 스캔 결과를 blacklistMask에 반영 (video_render에서 최우선 차단에 사용)
@@ -1648,10 +1650,10 @@ static void securecast_update(void* data, obs_data_t* settings)
 }
 
 // ================================================================
-// [Role D] 수동 드로그 블로 -- OBS Interaction API 콜백
-// mouse_click : 좌클릭 DOWN -> 드로그 시작 / UP -> BlurRect 확정
-//               우클릭 DOWN -> 수동 블로 전체 초기화
-// mouse_move  : 드로그 중 현재 τ편접 좌표 갱신 (미리보기용)
+// [Role D] 수동 드래그 블러 -- OBS Interaction API 콜백
+// mouse_click : 좌클릭 DOWN -> 드래그 시작 / UP -> BlurRect 확정
+//               우클릭 DOWN -> 수동 블러 전체 초기화
+// mouse_move  : 드래그 중 현재 커서 좌표 갱신 (미리보기용)
 // 좌표계: obs_mouse_event.x/y 는 소스 픽셀 좌표 (0~srcW, 0~srcH)
 // 스레드: UI 스레드에서 호출 -> settingsMutex로 Render 스레드와 동기화
 // ================================================================
@@ -1663,7 +1665,7 @@ static void securecast_mouse_click(void* data,
     auto* filter = static_cast<SecureCastFilter*>(data);
     std::lock_guard<std::mutex> lock(filter->settingsMutex);
 
-    // 우클릭 DOWN: 수동 블로 전체 초기화
+    // 우클릭 DOWN: 수동 블러 전체 초기화
     if (type == MOUSE_RIGHT && !mouse_up) {
         filter->manualRectCount = 0;
         filter->dragActive      = false;
@@ -1675,14 +1677,14 @@ static void securecast_mouse_click(void* data,
         return;
 
     if (!mouse_up) {
-        // 좌클릭 DOWN: 드로그 시작
+        // 좌클릭 DOWN: 드래그 시작
         filter->dragActive = true;
         filter->dragStartX = event->x;
         filter->dragStartY = event->y;
         filter->dragCurX   = event->x;
         filter->dragCurY   = event->y;
     } else if (filter->dragActive) {
-        // 좌클릭 UP: 드로그 완료 -> BlurRect 확정
+        // 좌클릭 UP: 드래그 완료 -> BlurRect 확정
         filter->dragActive = false;
         int x  = std::min(filter->dragStartX, event->x);
         int y  = std::min(filter->dragStartY, event->y);
@@ -1720,7 +1722,7 @@ struct obs_source_info securecast_filter_info = []() {
     struct obs_source_info info = {};
     info.id           = "securecast_filter";
     info.type         = OBS_SOURCE_TYPE_FILTER;
-    info.output_flags = OBS_SOURCE_VIDEO;
+    info.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_INTERACTION;
     info.get_name       = securecast_get_name;
     info.create         = securecast_create;
     info.destroy        = securecast_destroy;
@@ -1729,5 +1731,9 @@ struct obs_source_info securecast_filter_info = []() {
     info.get_properties = securecast_get_properties;
     info.get_defaults   = securecast_get_defaults;
     info.update         = securecast_update;
+#ifdef _WIN32
+    info.mouse_click    = securecast_mouse_click;
+    info.mouse_move     = securecast_mouse_move;
+#endif
     return info;
 }();

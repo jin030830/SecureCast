@@ -193,7 +193,7 @@ struct SecureCastFilter {
     obs_source_t* context = nullptr; // OBS 필터 컨텍스트 포인터
 
     bool          isActive     = true;
-    bool          isGameMode   = false;                // CPU 임계값 기반 자동 전환
+    std::atomic<bool> isGameMode{false};               // CPU 임계값 기반 자동 전환 (render/tick 크로스 스레드)
     SecurityState currentState = SecurityState::SAFE;
 
     // ----- [Role C] -----
