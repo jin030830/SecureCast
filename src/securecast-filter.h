@@ -191,8 +191,8 @@ struct SecureCastFilter {
 
     obs_source_t* context = nullptr; // OBS 필터 컨텍스트 포인터
 
-    bool          isActive     = true;
-    // bool        isGameMode  = false;                 // [v2] 게임 모드 — 현재 스코프 외
+    bool          isActive    = true;
+    bool          isGameMode  = false;
     SecurityState currentState = SecurityState::SAFE;
 
     // ----- [Role C] -----

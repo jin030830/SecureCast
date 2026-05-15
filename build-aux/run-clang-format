@@ -38,20 +38,20 @@ else
     exit 1
 fi
 
-status=0
+format_status=0
 
 if (( check_only )); then
     for file in "${files[@]}"; do
         if ! "${FORMATTER}" -style=file "${file}" | diff -q "${file}" - > /dev/null; then
             echo "Formatting error in: ${file}"
-            status=1
+            format_status=1
         fi
     done
 else
     "${FORMATTER}" -i -style=file "${files[@]}"
 fi
 
-if (( status && fail_on_error )); then
+if (( format_status && fail_on_error )); then
     exit 1
 fi
 
