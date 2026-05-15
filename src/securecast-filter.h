@@ -212,9 +212,10 @@ struct SecureCastFilter {
     PipelineHealth       health;           // GPU 스톨 또는 쿼리 실패 감지 시 자가 치유(Reset)를 담당하는 헬스 매니저
 
     // [C2-3 수정] 함수-scope static → 멤버 변수로 이동 (다중 필터 인스턴스 간 공유 방지)
-    int  logUnchangedFrames = 0;
-    int  logStallCount      = 0;
-    int  logEnqueueCount    = 0;
+    int  logUnchangedFrames = 0;  // 미변화 상태 로그 주기 카운터 (120프레임마다 1회)
+    int  logStallCount      = 0;  // 파이프라인 포화 경고 로그 주기 카운터 (30프레임마다 1회)
+    int  logEnqueueCount    = 0;  // enqueue 성공 로그 주기 카운터 (300프레임마다 1회)
+    int  logScanThrottle    = 0;  // 블랙리스트 윈도우 스캔 로그 주기 카운터 (10틱 = 1.5초 주기)
 
     // ----- [Role A 담당: 윈도우 추적 및 블랙리스트] -----
     float         trackerAccumulator = 0.0f;
@@ -302,4 +303,10 @@ struct SecureCastFilter {
     int                  ocrPendingStride = 0;
 
     uint32_t ocrFrameCounter = 0;
+
+    // ----- [Role D] UI 설정 -----
+    mutable std::mutex settingsMutex;        // GUI 스레드(update)와 렌더 스레드 간 data race 방지
+    std::string        blacklistApps  = "";  // 줄바꿈 구분 앱 이름 목록
+    float              blurIntensity  = 5.0f;
+    float              sensitivity    = 0.5f;
 };

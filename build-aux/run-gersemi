@@ -31,20 +31,20 @@ if ! (( ${+commands[gersemi]} )); then
     exit 0
 fi
 
-status=0
+format_status=0
 
 if (( check_only )); then
     for file in "${files[@]}"; do
         if ! gersemi -c "${file}" > /dev/null 2>&1; then
             echo "CMake formatting error in: ${file}"
-            status=1
+            format_status=1
         fi
     done
 else
     gersemi -i "${files[@]}"
 fi
 
-if (( status && fail_on_error )); then
+if (( format_status && fail_on_error )); then
     exit 1
 fi
 

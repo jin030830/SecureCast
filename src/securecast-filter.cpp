@@ -1126,26 +1126,6 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
                     // filter->aiWorker.feedFrame(result);
                     (void)finalBox;
                 }
-
-                // [Role D] 알림 영역 자동 블러 트리거
-                // 64×64 그리드 기준 우측 25%(x ≥ 48), 하단 20%(y ≥ 51) 에 변화가
-                // 겹치면 Windows 알림 팝업으로 판단하여 3초 블러를 적용한다.
-                // forceCheck(강제 전체 스캔)는 의도적 트리거이므로 제외.
-                static constexpr int NOTIF_GRID_X = 48; // 64 * 0.75
-                static constexpr int NOTIF_GRID_Y = 51; // 64 * 0.80
-                bool notifAreaChanged = !forceCheck &&
-                    (gridBox.x + gridBox.width)  > NOTIF_GRID_X &&
-                    (gridBox.y + gridBox.height) > NOTIF_GRID_Y;
-                if (notifAreaChanged) {
-                    filter->notifBlurActive   = true;
-                    filter->notifBlurCooldown = 3.0f;
-                    // 소스 픽셀 좌표: 우측 35% × 하단 18% (팝업 알림 일반 등장 범위)
-                    filter->notifBlurRect = {
-                        (int)(w * 0.65f), (int)(h * 0.82f),
-                        (int)(w * 0.35f), (int)(h * 0.18f), 0
-                    };
-                    blog(LOG_INFO, "[SecureCast][D] Notification area change — auto-blur ON (3s).");
-                }
             } else {
                 // [C2-3 수정] static → 멤버 변수 사용 (다중 인스턴스 공유 방지)
                 if (++filter->logUnchangedFrames >= 120) {
@@ -1291,6 +1271,22 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
             }
             gs_matrix_pop();
         }
+    }
+
+    // [Role D] 블랙리스트 마스크를 불투명 검정으로 최우선 덮어씌우기 (blur shader 위에 덮어씀)
+    if (blacklistSnapshot.rectCount > 0) {
+        gs_effect_t* solid = obs_get_base_effect(OBS_EFFECT_SOLID);
+        gs_effect_set_color(gs_effect_get_param_by_name(solid, "color"), 0xFF000000);
+        gs_matrix_push();
+        while (gs_effect_loop(solid, "Solid")) {
+            for (int i = 0; i < blacklistSnapshot.rectCount; i++) {
+                const BlurRect& r = blacklistSnapshot.rects[i];
+                gs_matrix_identity();
+                gs_matrix_translate3f((float)r.x, (float)r.y, 0.0f);
+                gs_draw_sprite(nullptr, 0, (uint32_t)r.width, (uint32_t)r.height);
+            }
+        }
+        gs_matrix_pop();
     }
 
     // --- [Role D] 보안 상태 테두리 오버레이 ---
@@ -1460,6 +1456,24 @@ static void securecast_video_tick(void* data, float seconds)
 
     const float scanInterval = filter->isGameMode ? SCAN_INTERVAL_GAME : SCAN_INTERVAL_NORMAL;
     sc_tracker_tick(seconds, &filter->trackerAccumulator, &filter->windowList, scanInterval);
+
+    // [Role D] windowList 스캔 결과를 blacklistMask에 반영 (video_render에서 최우선 차단에 사용)
+    {
+        std::lock_guard<std::mutex> lock(filter->blacklistMutex);
+        filter->blacklistMask.rectCount = (filter->windowList.count > SC_MAX_BLUR_RECTS)
+                                              ? SC_MAX_BLUR_RECTS : filter->windowList.count;
+        for (int i = 0; i < filter->blacklistMask.rectCount; ++i) {
+            filter->blacklistMask.rects[i] = {
+                (int)filter->windowList.items[i].bounds.left,
+                (int)filter->windowList.items[i].bounds.top,
+                (int)(filter->windowList.items[i].bounds.right  - filter->windowList.items[i].bounds.left),
+                (int)(filter->windowList.items[i].bounds.bottom - filter->windowList.items[i].bounds.top),
+                0
+            };
+        }
+        if (filter->windowList.count > 0 && filter->logScanThrottle++ % 10 == 0)
+            blog(LOG_INFO, "[SecureCast] %d blacklisted windows in blacklistMask.", filter->windowList.count);
+    }
 
     // recentlySeenList 유지: windowList 항목을 upsert, 완전히 닫힌 HWND 제거.
     // recentlySeenList는 앱이 다시 등장했을 때 quick restore의 소스가 된다.
@@ -1681,6 +1695,10 @@ static void securecast_mouse_move(void* data,
     }
 }
 #endif
+
+    blog(LOG_INFO, "[SecureCast][D] Settings updated — blur=%.1f sensitivity=%.2f",
+         filter->blurIntensity, filter->sensitivity);
+}
 
 // ================================================================
 // Source Info Dispatch Table
