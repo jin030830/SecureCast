@@ -50,3 +50,16 @@ technique GrayDownsample {
         pixel_shader  = PSGrayDownsample(v);
     }
 }
+
+// 1-G: BGRA 텍스처를 bilinear 2× 다운샘플하여 BGRA8로 출력.
+// 1440p+ OCR readback 8 MB → 2 MB 절감용 (GPU 에서 다운샘플 후 CPU readback).
+float4 PSBGRADownsample2x(VertData v) : TARGET {
+    return image.Sample(linearSampler, v.uv);
+}
+
+technique BGRADownsample2x {
+    pass {
+        vertex_shader = VSDefault(v);
+        pixel_shader  = PSBGRADownsample2x(v);
+    }
+}
