@@ -1,6 +1,7 @@
 #include "visual-tracker.h"
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -453,6 +454,9 @@ void VisualTrackerManager::update_one_pyramid(Tracker &tr, const uint8_t *gray,
   int bestQX = qcx - qtw / 2;
   int bestQY = qcy - qth / 2;
 
+  // quarterGray / gray는 tight-packed(stride == width) 전제. row pitch가 정렬된
+  // 버퍼가 들어오면 OOB read 발생하므로 호출자 책임으로 명시.
+  assert(quarterGray != nullptr && qw > 0 && qh > 0);
   for (int sy = qsy0; sy <= qsy1; sy += 2) {
     for (int sx = qsx0; sx <= qsx1; sx += 2) {
       const float sc = ncc_at(quarterGray, qw, qw, qh, qtmpl, qtw, qth, sx, sy);

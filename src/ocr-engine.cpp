@@ -213,7 +213,7 @@ SecureCastOcrEngine::analyze_bgra_frame(const uint8_t *pixels, int width,
   // hamming_distance ≤ 2 → 안티앨리어싱·압축 노이즈 허용 → OCR 생략.
   if (sameRes && hasLastRoiDhash_) {
     const uint64_t roiHash =
-        compute_roi_dhash(pixels, stride, width, height, lastBoxes_);
+        compute_roi_dhash(pixels, stride, width, height);
     if (hamming_distance(roiHash, lastRoiDhash_) <= 2) {
       if (++consecutiveSkips_ < kMaxConsecutiveSkips)
         return lastBoxes_; // L1 hit
@@ -284,8 +284,10 @@ SecureCastOcrEngine::analyze_bgra_frame(const uint8_t *pixels, int width,
           }
         }
       }
-      lastRoiDhash_ = compute_roi_dhash(pixels, stride, width, height, merged);
+      lastRoiDhash_ = compute_roi_dhash(pixels, stride, width, height);
       lastBoxes_ = merged;
+      // L2 hit이지만 부분 OCR을 실제로 실행했으므로 L1 skip 카운터는 리셋한다.
+      consecutiveSkips_ = 0;
       return merged; // L2 hit (partial)
     }
     // 모든 라인 불변이지만 L1 실패 → ROI 외부에 새 텍스트 가능 → full OCR
@@ -311,7 +313,7 @@ SecureCastOcrEngine::analyze_bgra_frame(const uint8_t *pixels, int width,
   auto boxes = detect_pii(updatedLines);
 
   // L1 캐시 갱신 (VisualTracker가 좌표 추적 담당, OCR은 탐지/확인만 수행)
-  lastRoiDhash_ = compute_roi_dhash(pixels, stride, width, height, boxes);
+  lastRoiDhash_ = compute_roi_dhash(pixels, stride, width, height);
   hasLastRoiDhash_ = true;
   impl_->lastFrameWidth = width;
   impl_->lastFrameHeight = height;
@@ -380,10 +382,8 @@ uint64_t SecureCastOcrEngine::compute_dhash_region(const uint8_t *px,
 // P0-C: 항상 전체 프레임 dHash 사용.
 // 기존 ROI-only dHash는 박스 밖에서 새 PII가 나타났을 때 변화를 감지하지 못해
 // 최대 kMaxConsecutiveSkips 사이클(≈250ms) 동안 탐지 지연이 발생했다.
-uint64_t SecureCastOcrEngine::compute_roi_dhash(
-    const uint8_t *px, int stride, int width, int height,
-    const std::vector<SecureCastOcrBox> &boxes) const {
-  (void)boxes;
+uint64_t SecureCastOcrEngine::compute_roi_dhash(const uint8_t *px, int stride,
+                                                int width, int height) const {
   return compute_dhash_region(px, stride, 0, 0, width, height);
 }
 
@@ -1040,8 +1040,20 @@ static bool lines_visually_adjacent(const SecureCastOcrLine &a,
 
 // === STEP 2-0: OCR 오류 보정 ===
 // OCR이 숫자 0을 O/o로, 숫자 1을 I/l로 잘못 읽는 경우를 보정한다.
+// 가드: 입력에 숫자가 1개도 없으면 알파벳-only 토큰(예: "USB", "ZONE")으로 보고
+// 변환을 건너뛴다. "USB"→"U58", "BOSS"→"8055" 같은 오탐 방지.
 std::string
 SecureCastOcrEngine::normalize_numeric_candidate(const std::string &text) {
+  bool hasDigit = false;
+  for (char c : text) {
+    if (c >= '0' && c <= '9') {
+      hasDigit = true;
+      break;
+    }
+  }
+  if (!hasDigit)
+    return text;
+
   std::string out = text;
 
   for (char &c : out) {

@@ -390,7 +390,4 @@ struct SecureCastFilter {
   // 원본 해상도로 복원해야 한다.
   // 1.0f = full-res 모드(기본), 2.0f = half-res OCR 최적화 모드.
   float trackerCoordScale_ = 1.0f;
-
-  // filter 인스턴스별 OCR throttle counter (다중 인스턴스 공유 방지)
-  uint32_t ocrFrameCounter = 0;
 };

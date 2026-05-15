@@ -129,13 +129,12 @@ private:
   // OCR 워커 주기 포함 시 최대 ~250ms stale.
   static constexpr int kMaxConsecutiveSkips = 2;
 
-  // 8×8 구역 dHash: 9×8 샘플 격자 → 인접 밝기 비교 → 64비트
+  // dHash: 9×8 샘플 격자 → 행별 인접 밝기 비교(8비트 × 8행) → 64비트
   uint64_t compute_dhash_region(const uint8_t *px, int stride, int x, int y,
                                 int w, int h) const;
-  // ROI 합산 dHash: 박스 있으면 각 박스 영역 FNV 혼합, 없으면 전체 coarse dHash
+  // P0-C: 박스 밖 새 PII를 놓치지 않도록 항상 전체 프레임 coarse dHash 사용.
   uint64_t compute_roi_dhash(const uint8_t *px, int stride, int width,
-                             int height,
-                             const std::vector<SecureCastOcrBox> &boxes) const;
+                             int height) const;
   // 해밍 거리 (XOR 후 set bit 수)
   static int hamming_distance(uint64_t a, uint64_t b);
   // L2용: crop 영역만 OCR 실행, 반환 좌표는 원본 프레임 기준
