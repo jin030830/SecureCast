@@ -241,6 +241,9 @@ struct SecureCastFilter {
     FILETIME prevUserTime         = {};
 #endif
 
+    // destroy 진입 즉시 true — 진행 중인 핫키 콜백이 해제된 멤버에 접근하지 못하도록
+    std::atomic<bool> isDestroying{false};
+
     // ----- [Panic Button] Ctrl+Shift+F12 -----
     std::atomic<bool> panicMode{false};
     obs_hotkey_id     panicHotkeyId = OBS_INVALID_HOTKEY_ID;

@@ -189,6 +189,9 @@ void SelectionOverlay::messageLoop()
 {
     HINSTANCE hInst = GetModuleHandle(nullptr);
 
+    // 다중 필터 인스턴스 간 Win32 클래스 이름 충돌 방지
+    swprintf_s(m_className, L"SecureCastSelectionOverlay_%p", static_cast<void*>(this));
+
     // Primary monitor 정보 (좌표 변환용)
     HMONITOR hmon = MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
     MONITORINFO mi{};
@@ -206,14 +209,14 @@ void SelectionOverlay::messageLoop()
     wc.lpfnWndProc   = WndProc;
     wc.hInstance     = hInst;
     wc.hCursor       = LoadCursor(nullptr, IDC_CROSS);
-    wc.lpszClassName = kClassName;
+    wc.lpszClassName = m_className;
     HBRUSH bgBrush   = CreateSolidBrush(RGB(10, 10, 10));
     wc.hbrBackground = bgBrush;
     RegisterClassEx(&wc);
 
     HWND hwnd = CreateWindowEx(
         WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
-        kClassName,
+        m_className,
         L"SecureCast Selection",
         WS_POPUP | WS_VISIBLE,
         m_monLeft, m_monTop, monW, monH,
@@ -223,7 +226,7 @@ void SelectionOverlay::messageLoop()
         blog(LOG_WARNING, "[SecureCast][D] SelectionOverlay: CreateWindowEx failed (%lu)",
              GetLastError());
         m_running.store(false, std::memory_order_release);
-        UnregisterClass(kClassName, hInst);
+        UnregisterClass(m_className, hInst);
         DeleteObject(bgBrush);
         return;
     }
@@ -240,7 +243,6 @@ void SelectionOverlay::messageLoop()
     // ESC 폴링 타이머 (포커스 없어도 동작)
     SetTimer(hwnd, 1, 50, nullptr);
 
-    m_ready.store(true);
     blog(LOG_INFO, "[SecureCast][D] Selection overlay active. Drag to select, ESC to cancel.");
 
     MSG msg;
@@ -249,7 +251,7 @@ void SelectionOverlay::messageLoop()
         DispatchMessage(&msg);
     }
 
-    UnregisterClass(kClassName, hInst);
+    UnregisterClass(m_className, hInst);
     DeleteObject(bgBrush);
     m_hwnd = NULL;
     m_running.store(false, std::memory_order_release);
@@ -263,15 +265,16 @@ void SelectionOverlay::start(DoneCallback cb)
     if (m_running.exchange(true, std::memory_order_acq_rel))
         return;
 
-    // 이전 스레드가 종료됐지만 아직 join되지 않은 경우 std::terminate() 방지
+    // m_running이 false였으므로 이전 스레드는 이미 종료 완료.
+    // join은 wait_and_join()/소멸자 전용 — 여기서 호출하면 핫키 콜백 스레드가 블로킹됨.
+    // 핸들만 남아 있는 경우 detach로 즉시 반환 후 새 스레드 생성.
     if (m_thread.joinable())
-        m_thread.join();
+        m_thread.detach();
 
     m_callback = std::move(cb);
     m_dragging = false;
 
     m_thread = std::thread(&SelectionOverlay::messageLoop, this);
-    // OBS 핫키 콜백 스레드 블로킹 방지 — 오버레이는 비동기로 생성됨
 }
 
 void SelectionOverlay::cancel()

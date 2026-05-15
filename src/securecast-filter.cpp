@@ -685,6 +685,8 @@ static void panic_hotkey_cb(void* data, obs_hotkey_id, obs_hotkey_t*, bool press
     if (!pressed)
         return;
     auto* filter = static_cast<SecureCastFilter*>(data);
+    if (filter->isDestroying.load(std::memory_order_acquire))
+        return;
     bool next = !filter->panicMode.load(std::memory_order_relaxed);
     filter->panicMode.store(next, std::memory_order_relaxed);
     blog(LOG_INFO, "[SecureCast] Panic mode %s.", next ? "ON" : "OFF");
@@ -765,6 +767,7 @@ static void* securecast_create(obs_data_t* settings, obs_source_t* context)
         [](void* data, obs_hotkey_id, obs_hotkey_t*, bool pressed) {
             if (!pressed) return;
             auto* f = static_cast<SecureCastFilter*>(data);
+            if (f->isDestroying.load(std::memory_order_acquire)) return;
             if (f->selectionOverlay.isActive()) {
                 f->selectionOverlay.cancel(); // 두 번 누르면 취소
                 return;
@@ -834,6 +837,9 @@ static void securecast_destroy(void* data)
     SecureCastFilter* filter = static_cast<SecureCastFilter*>(data);
 
     blog(LOG_INFO, "Destroying filter...");
+
+    // 진행 중인 핫키 콜백이 filter 멤버에 접근하지 못하도록 즉시 플래그 설정
+    filter->isDestroying.store(true, std::memory_order_release);
 
     // 핫키 먼저 해제 — 콜백이 해제된 filter에 접근하지 못하도록
     if (filter->panicHotkeyId != OBS_INVALID_HOTKEY_ID) {
@@ -1228,10 +1234,13 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
 
 #ifdef _WIN32
     // [Role D] 알림 영역 자동 블러 — 쿨다운 중이면 rect를 합산
-    if (filter->notifBlurActive &&
-        filter->notifBlurRect.width > 0 && filter->notifBlurRect.height > 0 &&
-        all_count < (int)(sizeof(all_rects) / sizeof(all_rects[0]))) {
-        all_rects[all_count++] = filter->notifBlurRect;
+    {
+        std::lock_guard<std::mutex> lock(filter->settingsMutex);
+        if (filter->notifBlurActive &&
+            filter->notifBlurRect.width > 0 && filter->notifBlurRect.height > 0 &&
+            all_count < (int)(sizeof(all_rects) / sizeof(all_rects[0]))) {
+            all_rects[all_count++] = filter->notifBlurRect;
+        }
     }
 
     // [Role D] 수동 드래그 블러 — 확정 rects + 드래그 중 미리보기
@@ -1559,12 +1568,15 @@ static void securecast_video_tick(void* data, float seconds)
     }
 
     // [Role D] 알림 영역 자동 블러 쿨다운 카운트다운 (3초 경과 시 해제)
-    if (filter->notifBlurActive) {
-        filter->notifBlurCooldown -= seconds;
-        if (filter->notifBlurCooldown <= 0.0f) {
-            filter->notifBlurActive   = false;
-            filter->notifBlurCooldown = 0.0f;
-            blog(LOG_INFO, "[SecureCast][D] Notification blur expired.");
+    {
+        std::lock_guard<std::mutex> lock(filter->settingsMutex);
+        if (filter->notifBlurActive) {
+            filter->notifBlurCooldown -= seconds;
+            if (filter->notifBlurCooldown <= 0.0f) {
+                filter->notifBlurActive   = false;
+                filter->notifBlurCooldown = 0.0f;
+                blog(LOG_INFO, "[SecureCast][D] Notification blur expired.");
+            }
         }
     }
 #endif
