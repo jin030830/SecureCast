@@ -357,6 +357,11 @@ struct SecureCastFilter {
   // back-pressure: idle이면 즉시 새 프레임 수용, busy면 GPU readback 건너뜀
   std::atomic<bool> ocrWorkerIdle{true};
 
+  // dHash 캐시 무효화 요청 — GUI 스레드가 set, OCR 워커가 다음 사이클 진입 시 clear.
+  // clearDHashCache()를 GUI 스레드에서 직접 호출하면 data race 발생하므로
+  // 이 플래그를 경유해 워커 스레드에서 안전하게 실행한다.
+  std::atomic<bool> ocrClearCachePending{false};
+
   // 직전 OCR 사이클의 박스 수. 변경 시에만 LOG_INFO, 매 사이클은 LOG_DEBUG.
   int lastLoggedOcrCount = -1;
 

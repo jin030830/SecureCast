@@ -510,6 +510,8 @@ static bool read_texture_bgra_half_gpu(SecureCastFilter *filter,
                                        int &outStride) {
   if (!filter || !srcTex)
     return false;
+  if (!filter->trackerGrayEffect_)
+    return false;
   if (!ensure_ocr_down_stage(filter, fullW, fullH))
     return false;
 
@@ -884,8 +886,25 @@ static void ocr_worker_loop(SecureCastFilter *filter) {
       filter->ocrFramePending = false;
     }
 
-    if (!ocrReady || pixels.empty() || width <= 0 || height <= 0 || stride <= 0)
+    // dHash 캐시 무효화 요청 처리 — GUI 스레드(securecast_update)가 플래그를 세우고,
+    // 워커 스레드가 여기서 안전하게 소비한다. ocrReady 여부와 무관하게 실행한다.
+    if (filter->ocrClearCachePending.exchange(false,
+                                              std::memory_order_acq_rel)) {
+      if (filter->ocrEngine)
+        filter->ocrEngine->clearDHashCache();
+    }
+
+    if (!ocrReady) {
+      // init 영구 실패: 회복 불가능. idle 복원 후 스레드 종료.
+      // continue를 쓰면 렌더-워커 간 4fps 공회전이 영원히 반복된다.
+      filter->ocrWorkerIdle.store(true, std::memory_order_release);
+      break;
+    }
+    if (pixels.empty() || width <= 0 || height <= 0 || stride <= 0) {
+      // 일시적 빈 프레임: idle 복원 후 다음 프레임 대기.
+      filter->ocrWorkerIdle.store(true, std::memory_order_release);
       continue;
+    }
 
     // 2-C: 적응형 스케일 — 직전 사이클 평균 라인 높이를 14~20px 대역으로 맞춤.
     // 첫 사이클(avgH=0): fallback 정책(1440p+ 0.5×, 1080p- 2×).
@@ -1511,6 +1530,10 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
   }
 
   // Phase 1: Collect (이전 프레임 결과 수확 — delayedSlot 없어도 무조건 시도)
+  // [DORMANT] enqueueCopy / submitFrame을 호출하는 경로가 없어 m_pendingCount=0
+  // 고착 → tryCollectPreviousFrame()은 항상 PENDING을 반환하므로
+  // OK / SOFT_RECOVERED 분기는 실행되지 않는다.
+  // 활성화하려면 video_render에서 enqueueCopy → submitFrame 호출 경로를 연결해야 한다.
   CollectResult sc_collected = filter->readback.tryCollectPreviousFrame();
   if (sc_collected == CollectResult::OK ||
       sc_collected == CollectResult::SOFT_RECOVERED) {
@@ -1533,25 +1556,6 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
           gridBox = {0, 0, 64, 64, 0};
         blog(LOG_INFO, "[SecureCast] Change detected! BBox:(%d,%d %dx%d)",
              gridBox.x, gridBox.y, gridBox.width, gridBox.height);
-        float scaleX = (float)ocrW / 64.0f, scaleY = (float)ocrH / 64.0f;
-        BlurRect finalBox = {
-            (int)(gridBox.x * scaleX), (int)(gridBox.y * scaleY),
-            (int)(gridBox.width * scaleX), (int)(gridBox.height * scaleY), 0};
-        uint8_t *ocrBuf = filter->readbackBuffer.data() + (64 * 64 * 4);
-        if (filter->readback.readStagingBuffer(1, ocrBuf, ocrW * 4, ocrH)) {
-          // [F7 Fix] feedFrame 비활성화 중 무의미한 8.3MB alloc + memcpy + free
-          // 방지
-          /*
-          ReadbackResult result;
-          result.ownedData.assign(ocrBuf, ocrBuf + (size_t)(ocrW * ocrH * 4));
-          result.hashData   = result.ownedData.data();
-          result.hashSize   = (size_t)(ocrW * ocrH * 4);
-          result.bbox       = finalBox;
-          result.frameIndex = filter->frameCounter;
-          */
-          // [Role B 연계 포인트]
-          // filter->aiWorker.feedFrame(result);
-        }
       } else {
         // [C2-3 수정] static → 멤버 변수 사용 (다중 인스턴스 공유 방지)
         if (++filter->logUnchangedFrames >= 120) {
@@ -1602,6 +1606,10 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
   if (filter->trackerFrameSkip_ >= 2) {
     filter->trackerFrameSkip_ = 0;
 
+    // ocrWorkerIdle: 단일 소비자(렌더 스레드)가 load→조건부 store(false),
+    //               단일 생산자(OCR 워커 또는 렌더 실패 경로)가 store(true).
+    // 이 구조상 load와 store(false) 사이의 원자성 갭은 race를 일으키지 않는다.
+    // 멀티 제출 경로가 추가될 경우 compare_exchange_strong으로 교체 필요.
     const bool ocrIdle = filter->ocrWorkerIdle.load(std::memory_order_acquire);
     if (ocrIdle)
       filter->ocrWorkerIdle.store(false, std::memory_order_release);
@@ -2127,6 +2135,11 @@ static void securecast_update(void *data, obs_data_t *settings) {
       (float)obs_data_get_double(settings, SC_SETTING_SENSITIVITY);
   blog(LOG_INFO, "[SecureCast][D] Settings updated — blur=%.1f sensitivity=%.2f",
        filter->blurIntensity, filter->sensitivity);
+
+  // 소스/설정 전환 시 dHash 캐시 무효화 요청.
+  // clearDHashCache()를 여기서 직접 호출하면 GUI 스레드↔OCR 워커 data race 발생.
+  // 플래그만 세우고 워커 스레드가 다음 사이클에 안전하게 처리한다.
+  filter->ocrClearCachePending.store(true, std::memory_order_release);
 }
 
 

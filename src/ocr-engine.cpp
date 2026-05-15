@@ -134,6 +134,13 @@ void SecureCastOcrEngine::cancel_current() {
   }
 }
 
+void SecureCastOcrEngine::clearDHashCache() {
+  hasLastRoiDhash_ = false;
+  lastRoiDhash_ = 0;
+  lastLineDhashes_.clear();
+  consecutiveSkips_ = 0;
+}
+
 SecureCastOcrEngine::~SecureCastOcrEngine() = default;
 
 // === STEP 1: OCR 엔진 생성 (초기화 시 1회) ===

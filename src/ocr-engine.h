@@ -74,6 +74,10 @@ public:
   // 완료된 op에 Cancel()은 no-op이므로 경쟁 조건 없이 안전하다.
   void cancel_current();
 
+  // dHash 캐시 무효화 — 소스/창 전환 시 호출하여 오탐 방지.
+  // OCR worker thread에서만 호출해야 한다.
+  void clearDHashCache();
+
   // ========================================================
   // 전체 파이프라인 실행
   // Dirty Skip → OCR → RE2 PII 탐지
