@@ -10,7 +10,6 @@
 #include <windowsx.h>  // GET_X_LPARAM, GET_Y_LPARAM
 #include <algorithm>
 
-std::atomic<SelectionOverlay*> SelectionOverlay::s_active{nullptr};
 
 // =============================================================================
 // WndProc
@@ -106,7 +105,6 @@ LRESULT CALLBACK SelectionOverlay::WndProc(HWND hwnd, UINT msg,
     case WM_DESTROY:
         KillTimer(hwnd, 1);
         PostQuitMessage(0);
-        s_active.store(nullptr, std::memory_order_release);
         return 0;
 
     default:
@@ -135,16 +133,15 @@ void SelectionOverlay::paintSelection(HWND hwnd, POINT start, POINT cur, bool dr
     // 2. 안내 문구 (항상 표시)
     SetBkMode(hdc, TRANSPARENT);
     SetTextColor(hdc, RGB(255, 255, 255));
-    HFONT font = CreateFont(
+    static HFONT s_font = CreateFont(
         22, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
         CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
-    HFONT oldFont = static_cast<HFONT>(SelectObject(hdc, font));
+    HFONT oldFont = static_cast<HFONT>(SelectObject(hdc, s_font));
     RECT textRect = {0, 16, rc.right, 52};
     DrawText(hdc, L"Drag to select blur area    ESC = cancel",
              -1, &textRect, DT_CENTER | DT_SINGLELINE);
     SelectObject(hdc, oldFont);
-    DeleteObject(font);
 
     if (dragging) {
         int x  = std::min(start.x, cur.x);
@@ -172,15 +169,14 @@ void SelectionOverlay::paintSelection(HWND hwnd, POINT start, POINT cur, bool dr
         wchar_t sizeText[64];
         swprintf_s(sizeText, L" %d x %d ", x2 - x, y2 - y);
         SetTextColor(hdc, RGB(255, 255, 100));
-        HFONT smallFont = CreateFont(
+        static HFONT s_smallFont = CreateFont(
             16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
             CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
-        HFONT oldSmall = static_cast<HFONT>(SelectObject(hdc, smallFont));
+        HFONT oldSmall = static_cast<HFONT>(SelectObject(hdc, s_smallFont));
         RECT sizeRect = {x + 4, y + 4, x2, y + 24};
         DrawText(hdc, sizeText, -1, &sizeRect, DT_LEFT | DT_SINGLELINE);
         SelectObject(hdc, oldSmall);
-        DeleteObject(smallFont);
     }
 
     EndPaint(hwnd, &ps);
@@ -211,7 +207,8 @@ void SelectionOverlay::messageLoop()
     wc.hInstance     = hInst;
     wc.hCursor       = LoadCursor(nullptr, IDC_CROSS);
     wc.lpszClassName = kClassName;
-    wc.hbrBackground = CreateSolidBrush(RGB(10, 10, 10));
+    HBRUSH bgBrush   = CreateSolidBrush(RGB(10, 10, 10));
+    wc.hbrBackground = bgBrush;
     RegisterClassEx(&wc);
 
     HWND hwnd = CreateWindowEx(
@@ -225,7 +222,9 @@ void SelectionOverlay::messageLoop()
     if (!hwnd) {
         blog(LOG_WARNING, "[SecureCast][D] SelectionOverlay: CreateWindowEx failed (%lu)",
              GetLastError());
-        m_ready.store(true);
+        m_running.store(false, std::memory_order_release);
+        UnregisterClass(kClassName, hInst);
+        DeleteObject(bgBrush);
         return;
     }
 
@@ -251,6 +250,7 @@ void SelectionOverlay::messageLoop()
     }
 
     UnregisterClass(kClassName, hInst);
+    DeleteObject(bgBrush);
     m_hwnd = NULL;
     m_running.store(false, std::memory_order_release);
 }
@@ -269,8 +269,6 @@ void SelectionOverlay::start(DoneCallback cb)
 
     m_callback = std::move(cb);
     m_dragging = false;
-    m_ready.store(false);
-    s_active.store(this, std::memory_order_release);
 
     m_thread = std::thread(&SelectionOverlay::messageLoop, this);
     // OBS 핫키 콜백 스레드 블로킹 방지 — 오버레이는 비동기로 생성됨
@@ -283,7 +281,12 @@ void SelectionOverlay::cancel()
 
     if (m_hwnd)
         PostMessage(m_hwnd, WM_CLOSE, 0, 0);
-    // join은 소멸자에서 처리 — 여기서 blocking하면 OBS 핫키 콜백 스레드를 막아 크래시 발생
+}
+
+void SelectionOverlay::wait_and_join()
+{
+    if (m_thread.joinable())
+        m_thread.join();
 }
 
 #endif // _WIN32

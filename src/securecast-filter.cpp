@@ -778,20 +778,23 @@ static void* securecast_create(obs_data_t* settings, obs_source_t* context)
                 int monH = mi.rcMonitor.bottom - mi.rcMonitor.top;
                 int monL = mi.rcMonitor.left;
                 int monT = mi.rcMonitor.top;
-                uint32_t srcW = f->lastSourceW.load(std::memory_order_relaxed);
-                uint32_t srcH = f->lastSourceH.load(std::memory_order_relaxed);
+                uint32_t srcW = f->lastSourceW.load(std::memory_order_acquire);
+                uint32_t srcH = f->lastSourceH.load(std::memory_order_acquire);
                 if (monW > 0 && monH > 0 && srcW > 0 && srcH > 0) {
                     rect.x      = (int)((float)(rect.x - monL)    / monW * srcW);
                     rect.y      = (int)((float)(rect.y - monT)    / monH * srcH);
                     rect.width  = (int)((float)rect.width          / monW * srcW);
                     rect.height = (int)((float)rect.height         / monH * srcH);
+                    std::lock_guard<std::mutex> lock(f->settingsMutex);
+                    // 새 드래그 시 기존 수동 블러 교체 (누적 아님)
+                    f->manualRectCount = 0;
+                    f->manualRects[f->manualRectCount++] = rect;
+                    blog(LOG_INFO, "[SecureCast][D] Manual rect replaced. scaled=(%d,%d %dx%d)",
+                         rect.x, rect.y, rect.width, rect.height);
+                } else {
+                    blog(LOG_WARNING, "[SecureCast][D] Manual rect skipped: source dimensions unavailable (srcW=%u, srcH=%u)",
+                         srcW, srcH);
                 }
-                std::lock_guard<std::mutex> lock(f->settingsMutex);
-                // 새 드래그 시 기존 수동 블러 교체 (누적 아님)
-                f->manualRectCount = 0;
-                f->manualRects[f->manualRectCount++] = rect;
-                blog(LOG_INFO, "[SecureCast][D] Manual rect replaced. scaled=(%d,%d %dx%d)",
-                     rect.x, rect.y, rect.width, rect.height);
             });
         }, filter);
     if (filter->selectHotkeyId != OBS_INVALID_HOTKEY_ID) {
@@ -843,6 +846,7 @@ static void securecast_destroy(void* data)
         filter->selectHotkeyId = OBS_INVALID_HOTKEY_ID;
     }
     filter->selectionOverlay.cancel();
+    filter->selectionOverlay.wait_and_join();
 #endif
 
 #ifdef _WIN32
@@ -916,8 +920,8 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
         obs_source_skip_video_filter(filter->context);
         return;
     }
-    filter->lastSourceW.store(w, std::memory_order_relaxed);
-    filter->lastSourceH.store(h, std::memory_order_relaxed);
+    filter->lastSourceW.store(w, std::memory_order_release);
+    filter->lastSourceH.store(h, std::memory_order_release);
 
     // --- Step 1: 링 버퍼 지연 초기화 또는 해상도 변경 대응 ---
     if (!filter->ringBuffer.isInitialized()) {
@@ -1056,9 +1060,10 @@ static void securecast_video_render(void* data, gs_effect_t* effect)
     SecurityState newState;
     {
         std::lock_guard<std::mutex> lock(filter->settingsMutex);
+        bool manualOrNotifActive = filter->manualRectCount > 0 || filter->notifBlurActive;
         if (filter->health.isCritical()) {
             filter->currentState = SecurityState::RISK;
-        } else if (ocrSnapshot.rectCount > 0 || blacklistSnapshot.rectCount > 0) {
+        } else if (ocrSnapshot.rectCount > 0 || blacklistSnapshot.rectCount > 0 || manualOrNotifActive) {
             filter->currentState = SecurityState::PARTIAL;
         } else {
             filter->currentState = SecurityState::SAFE;

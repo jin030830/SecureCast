@@ -41,6 +41,9 @@ public:
     // 선택 모드 강제 종료 (ESC와 동일 효과).
     void cancel();
 
+    // cancel() 후 메시지 루프 스레드가 완전히 종료될 때까지 블로킹 대기.
+    void wait_and_join();
+
     bool isActive() const { return m_running.load(std::memory_order_acquire); }
 
 private:
@@ -55,7 +58,6 @@ private:
     HWND             m_hwnd = NULL;
     std::thread      m_thread;
     std::atomic<bool> m_running{false};
-    std::atomic<bool> m_ready{false};
 
     DoneCallback m_callback;
 
@@ -67,9 +69,6 @@ private:
     // 모니터 원점 (좌표 변환용)
     int m_monLeft = 0;
     int m_monTop  = 0;
-
-    // 콜백에서 this 접근용 (인스턴스 1개 가정)
-    static std::atomic<SelectionOverlay*> s_active;
 };
 
 #endif // _WIN32
