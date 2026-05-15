@@ -1722,7 +1722,10 @@ struct obs_source_info securecast_filter_info = []() {
     struct obs_source_info info = {};
     info.id           = "securecast_filter";
     info.type         = OBS_SOURCE_TYPE_FILTER;
-    info.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_INTERACTION;
+    info.output_flags = OBS_SOURCE_VIDEO;
+#ifdef _WIN32
+    info.output_flags |= OBS_SOURCE_INTERACTION;
+#endif
     info.get_name       = securecast_get_name;
     info.create         = securecast_create;
     info.destroy        = securecast_destroy;
