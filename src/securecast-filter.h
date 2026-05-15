@@ -25,9 +25,11 @@
 #include <stdint.h>
 #include <thread>
 #include <vector>
+#include <string>
 
 #ifdef _WIN32
 #include "gpu-readback.h"
+#include "overlay-window.h"
 #endif
 #include "pipeline-health.h"
 #include "pixel-hash.h"
@@ -64,8 +66,8 @@ class SecureCastOcrEngine;
 constexpr int SC_MAX_BLUR_RECTS =
     32; // 한 프레임에 동시에 마스킹 가능한 최대 영역 수
 constexpr int SC_RING_BUFFER_SLOTS =
-    3; // Bounded Exposure: AI 검증을 위해 N프레임만큼 송출 지연 슬롯 수 (P0-D:
-       // 5→3, 50ms 기저 지연 단축)
+    15; // Bounded Exposure: OCR 레이턴시(≈250ms) / 프레임(16.7ms@60fps) = 15슬롯.
+        // 이 값 미만이면 새 PII가 OCR 탐지 전에 스트림에 출력된다 (보안 원시 위반).
 
 // ----------------------------------------------------
 // Shared Types (Types) - Moved to securecast-types.h
@@ -156,11 +158,6 @@ private:
 
 // ----------------------------------------------------
 // [Role C] Mock AI Worker Thread
-//
-// 실제 AI/OCR 모듈이 완성되기 전까지 동작을 시뮬레이션한다.
-// - 50ms sleep(AI 처리 시간 모의) 후
-// - 화면 한가운데 고정 BlurRect를 MaskPayload에 담아 콜백으로 전달
-// Role B의 실제 AI Worker로 교체될 예정
 // ----------------------------------------------------
 class MockAIWorker {
 public:
@@ -196,14 +193,6 @@ private:
 
 // ----------------------------------------------------
 // [Role C] Lock-Free Result Slot
-//
-// MockAIWorker(AI Thread) → Render Thread 단방향 채널.
-// 단일 producer / 단일 consumer 구조이므로
-// std::atomic으로 충분히 data-race-free를 보장한다.
-//
-// 상태 전이:
-//   AI Thread: 결과 계산 완료 → write pending payload → m_ready.store(true)
-//   Render Thread: m_ready.load() == true → 읽고 → m_ready.store(false)
 // ----------------------------------------------------
 class AtomicMaskChannel {
 public:
@@ -221,8 +210,6 @@ private:
 
 // ----------------------------------------------------
 // Core Filter Context
-// ----------------------------------------------------
-// 모든 Role이 협업하며 참조하는 메인 필터 인스턴스 구조체
 // ----------------------------------------------------
 struct SecureCastFilter {
   SecureCastFilter();
@@ -252,6 +239,7 @@ struct SecureCastFilter {
 #ifdef _WIN32
   GpuReadback readback; // GPU 텍스처를 CPU 메모리로 지연 없이 복사하는 다중
                         // 슬롯 텍스처 풀
+  OverlayWindow overlay; // [Role D] 스트리머 전용 보안 상태 HUD (OBS 캡처에서 제외됨)
 #endif
   PixelHashCache fullScreenHash; // FNV-1a 기반으로 화면 변화(Smart Grid)를
                                  // 감지하여 AI 동작을 제어하는 객체
@@ -263,6 +251,12 @@ struct SecureCastFilter {
   PipelineHealth health; // GPU 스톨 또는 쿼리 실패 감지 시 자가 치유(Reset)를
                          // 담당하는 헬스 매니저
 
+  // ----- [Role D] UI 설정 -----
+  mutable std::mutex settingsMutex; // GUI 스레드(update)와 렌더 스레드 간 data race 방지
+  std::string blacklistApps = ""; // 줄바꿈 구분 앱 이름 목록
+  float blurIntensity = 5.0f;
+  float sensitivity = 0.5f;
+
   // [C2-3 수정] 함수-scope static → 멤버 변수로 이동 (다중 필터 인스턴스 간
   // 공유 방지)
   int logUnchangedFrames =
@@ -270,6 +264,7 @@ struct SecureCastFilter {
   int logStallCount =
       0; // 파이프라인 포화 경고 로그 주기 카운터 (30프레임마다 1회)
   int logEnqueueCount = 0; // enqueue 성공 로그 주기 카운터 (300프레임마다 1회)
+  int logScanThrottle = 0; // 블랙리스트 윈도우 스캔 로그 주기 카운터 (10틱 = 1.5초 주기)
 
   // ----- [Role A 담당: 윈도우 추적 및 블랙리스트] -----
   float trackerAccumulator =
@@ -390,4 +385,7 @@ struct SecureCastFilter {
   // 원본 해상도로 복원해야 한다.
   // 1.0f = full-res 모드(기본), 2.0f = half-res OCR 최적화 모드.
   float trackerCoordScale_ = 1.0f;
+
+  // filter 인스턴스별 OCR throttle counter (다중 인스턴스 공유 방지)
+  uint32_t ocrFrameCounter = 0;
 };

@@ -15,6 +15,10 @@
 
 #include <obs-module.h>
 
+#ifndef _WIN32
+#error "SecureCast requires Windows. See CMakeLists.txt for details."
+#endif
+
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Globalization.h>
@@ -28,10 +32,6 @@
 // 담당 기능: ② 위험 키워드 블러
 // 구성: OCR + Google RE2 정규식 + Dirty Rect Skip
 // ============================================================
-
-#ifndef _WIN32
-#error "SecureCast requires Windows. See CMakeLists.txt for details."
-#endif
 
 struct SecureCastOcrEngine::Impl {
   winrt::Windows::Media::Ocr::OcrEngine engine{nullptr};
