@@ -1,10 +1,12 @@
 name: Build Project
+
 on:
   workflow_call:
     outputs:
       pluginName:
         description: Project name detected by parsing build spec file
         value: ${{ jobs.check-event.outputs.pluginName }}
+
 jobs:
   check-event:
     name: Check GitHub Event Data 🔎
@@ -23,6 +25,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
       - name: Check Event Data ☑️
         id: setup
         env:
@@ -60,6 +63,7 @@ jobs:
             IFS=':' read -r key value <<< "${config}"
             echo "${key}=${value}" >> $GITHUB_OUTPUT
           done
+
           echo "commitHash=${GITHUB_SHA:0:9}" >> $GITHUB_OUTPUT
 
           plugin_name="$(grep 'name' buildspec.json | sed -E -e 's/^.+"name":[^"]+"(.+)",?$/\1/g')"
@@ -99,11 +103,33 @@ jobs:
           "pluginName=${ProductName}" >> $env:GITHUB_OUTPUT
           "pluginVersion=${ProductVersion}" >> $env:GITHUB_OUTPUT
 
+      - name: Install RE2
+        run: |
+          vcpkg install re2:x64-windows
+
       - name: Build Plugin 🧱
         uses: ./.github/actions/build-plugin
         with:
           target: x64
           config: ${{ needs.check-event.outputs.config }}
+
+      - name: Copy RE2 runtime DLLs
+        run: |
+          $vcpkgRoot = $env:VCPKG_INSTALLATION_ROOT
+          if (-not $vcpkgRoot) {
+            $vcpkgRoot = "C:\vcpkg"
+          }
+
+          $srcBin = Join-Path $vcpkgRoot "installed\x64-windows\bin"
+          $buildBin = "${{ github.workspace }}\build_x64\${{ needs.check-event.outputs.config }}"
+
+          Write-Host "Copying RE2 runtime DLLs from $srcBin to $buildBin"
+
+          Copy-Item (Join-Path $srcBin "re2.dll") $buildBin -Force
+          Copy-Item (Join-Path $srcBin "absl_*.dll") $buildBin -Force
+
+          Get-ChildItem $buildBin -Filter "*.dll" | Select-Object Name
+
 
       - name: Package Plugin 📀
         uses: ./.github/actions/package-plugin
