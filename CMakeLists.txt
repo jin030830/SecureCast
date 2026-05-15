@@ -209,6 +209,8 @@ if(WIN32)
       src/gpu-readback.h
       src/overlay-window.cpp      # Role D: 스트리머 전용 보안 상태 HUD (캡처 제외)
       src/overlay-window.h
+      src/selection-overlay.cpp   # Role D: 드래그 블러 선택 오버레이
+      src/selection-overlay.h
   )
 endif()
 

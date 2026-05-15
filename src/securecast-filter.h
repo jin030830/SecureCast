@@ -29,6 +29,7 @@
 #ifdef _WIN32
 #include "gpu-readback.h"
 #include "overlay-window.h"
+#include "selection-overlay.h"
 #endif
 #include "pixel-hash.h"
 #include "pipeline-health.h"
@@ -191,8 +192,8 @@ struct SecureCastFilter {
 
     obs_source_t* context = nullptr; // OBS 필터 컨텍스트 포인터
 
-    bool          isActive    = true;
-    bool          isGameMode  = false;
+    bool          isActive     = true;
+    std::atomic<bool> isGameMode{false};               // CPU 임계값 기반 자동 전환 (render/tick 크로스 스레드)
     SecurityState currentState = SecurityState::SAFE;
 
     // ----- [Role C] -----
@@ -206,7 +207,6 @@ struct SecureCastFilter {
     OverlayWindow overlay;   // [Role D] 스트리머 전용 보안 상태 HUD (OBS 캡처에서 제외됨)
 #endif
     PixelHashCache       fullScreenHash;   // FNV-1a 기반으로 화면 변화(Smart Grid)를 감지하여 AI 동작을 제어하는 객체
-
     std::vector<uint8_t> readbackBuffer;  // Readback을 통해 수확한 픽셀 데이터를 저장하는 CPU 버퍼 (Slot 0 + Slot 1)
     uint64_t             frameCounter = 0; // GPU와 CPU 간의 프레임 정합성을 맞추기 위한 카운터
     PipelineHealth       health;           // GPU 스톨 또는 쿼리 실패 감지 시 자가 치유(Reset)를 담당하는 헬스 매니저
@@ -218,65 +218,93 @@ struct SecureCastFilter {
     int  logScanThrottle    = 0;  // 블랙리스트 윈도우 스캔 로그 주기 카운터 (10틱 = 1.5초 주기)
 
     // ----- [Role A 담당: 윈도우 추적 및 블랙리스트] -----
-    float         trackerAccumulator = 0.0f; // 윈도우 스캔 틱 조절(0.15초 단위)용 시간 누산기
+    float         trackerAccumulator = 0.0f;
     gs_effect_t*  blurEffect = nullptr;      // 컴파일된 HLSL 셰이더
-    std::mutex    blacklistMutex;            // video_tick(비디오)과 video_render(렌더) 간의 동시 접근을 막는 뮤텍스
-    MaskPayload   blacklistMask{};           // [우선순위 1] Role A가 추적한 블랙리스트 앱 좌표 (AI 처리 전에 최상단에 덮어씌움)
+    std::mutex    blacklistMutex;
+    MaskPayload   blacklistMask{};
 #ifdef _WIN32
     WinEventListener  winListener;
-    TrackedWindowList windowList{};          // 현재 추적 중인 창 목록
-    TrackedWindowList captureWindowList{};   // pushFrame 스냅샷: 직전 프레임 DWM 좌표 (캡처 레이턴시 보정)
-    TrackedWindowList prevWindowList{};      // lingering 감지용 직전 스캔 결과
-    TrackedWindowList recentlySeenList{};    // 과거에 추적했던 창 목록 (quick restore용, 닫힐 때까지 유지)
+    TrackedWindowList windowList{};
+    TrackedWindowList captureWindowList{};
+    TrackedWindowList prevWindowList{};
+    TrackedWindowList recentlySeenList{};
     LingeringWindow   lingeringWindows[SC_MAX_LINGERING]{};
     int               lingeringCount = 0;
 
     // ----- [Game Mode] CPU 사용률 기반 자동 전환 -----
-    float    cpuSampleAccumulator = 0.0f; // 1초 샘플링 누산기
-    float    cpuUsage             = 0.0f; // 최근 측정 시스템 CPU 사용률 (0~100)
-    float    gameModeEntryTimer   = 0.0f; // ≥40% 지속 시간 누산 (3초 도달 시 진입)
-    float    gameModeExitTimer    = 0.0f; // <30% 지속 시간 누산 (10초 도달 시 해제)
-    FILETIME prevIdleTime         = {};   // GetSystemTimes 이전 샘플
+    float    cpuSampleAccumulator = 0.0f;
+    float    cpuUsage             = 0.0f;
+    float    gameModeEntryTimer   = 0.0f;
+    float    gameModeExitTimer    = 0.0f;
+    FILETIME prevIdleTime         = {};
     FILETIME prevKernelTime       = {};
     FILETIME prevUserTime         = {};
 #endif
+
+    // destroy 진입 즉시 true — 진행 중인 핫키 콜백이 해제된 멤버에 접근하지 못하도록
+    std::atomic<bool> isDestroying{false};
 
     // ----- [Panic Button] Ctrl+Shift+F12 -----
     std::atomic<bool> panicMode{false};
     obs_hotkey_id     panicHotkeyId = OBS_INVALID_HOTKEY_ID;
 
+#ifdef _WIN32
+    // ----- [Role D] 수동 드래그 블러 선택 오버레이 -----
+    SelectionOverlay  selectionOverlay;
+    obs_hotkey_id     selectHotkeyId = OBS_INVALID_HOTKEY_ID;
+#endif
+
+    // ----- [Role D] UI 설정 -----
+    mutable std::mutex settingsMutex;
+    std::string  blacklistApps  = "";
+    float        blurIntensity  = 5.0f;
+    float        sensitivity    = 0.5f;
+
+    // ----- [Role D] 알림 영역 자동 블러 -----
+    // screenChanged 감지 시 우하단 알림 영역에 변화가 있으면 3초간 블러를 유지.
+    // video_tick에서 쿨다운 카운트다운, video_render에서 all_rects에 주입.
+    bool     notifBlurActive   = false;
+    float    notifBlurCooldown = 0.0f;   // 3.0f에서 카운트다운, 0에 도달하면 해제
+    BlurRect notifBlurRect{};            // 소스 픽셀 좌표 (변화 감지 시 갱신)
+
+    // ----- [Role D] 수동 드래그 블러 -----
+    // OBS 소스 프리뷰에서 좌클릭 드래그로 영역 지정 → 영구 블러.
+    // 우클릭 또는 Properties의 "Clear" 버튼으로 전체 초기화.
+    // settingsMutex로 UI 스레드(mouse 콜백) ↔ Render 스레드(video_render) 보호.
+    static constexpr int SC_MAX_MANUAL_RECTS = 8;
+    BlurRect manualRects[SC_MAX_MANUAL_RECTS]{};
+    int      manualRectCount = 0;
+
+    bool     dragActive  = false;  // 드래그 진행 중
+    int32_t  dragStartX  = 0;
+    int32_t  dragStartY  = 0;
+    int32_t  dragCurX    = 0;
+    int32_t  dragCurY    = 0;
+
+    // 모니터→소스 좌표 변환용 캐시 (video_render에서 갱신, 원자적 접근)
+    std::atomic<uint32_t> lastSourceW{0};
+    std::atomic<uint32_t> lastSourceH{0};
+
     // ----- [Role B] OCR 엔진 -----
-    // OCR 엔진은 render thread가 아니라 OCR worker thread 내부에서 init()한다.
-    // forward declaration을 위해 unique_ptr로 보관하여 ocr-engine.h 의존성을 분리한다.
     std::unique_ptr<SecureCastOcrEngine> ocrEngine;
 
     // ----- [Role B/C] OCR용 GPU readback 재사용 리소스 -----
-    // 매 OCR마다 gs_stagesurface_create/destroy를 반복하지 않기 위해 보관한다.
     gs_stagesurf_t* ocrStageSurface = nullptr;
     uint32_t        ocrStageWidth   = 0;
     uint32_t        ocrStageHeight  = 0;
 
     // ----- [Role B] Async OCR worker 상태 -----
-    // OCR은 RecognizeAsync(...).get()으로 블로킹될 수 있으므로 video_render에서 직접 실행하지 않는다.
     std::thread             ocrWorkerThread;
     std::mutex              ocrWorkerMutex;
     std::condition_variable ocrWorkerCv;
     std::atomic<bool>       ocrWorkerRunning{false};
 
-    // OCR 입력 프레임은 최신 1장만 유지한다. OCR이 render보다 느릴 때 큐 누적을 막기 위함이다.
     bool                 ocrFramePending = false;
     std::vector<uint8_t> ocrPendingPixels;
     int                  ocrPendingWidth  = 0;
     int                  ocrPendingHeight = 0;
     int                  ocrPendingStride = 0;
 
-    // filter 인스턴스별 OCR throttle counter.
-    // render 함수 내부 static counter를 쓰면 여러 filter 인스턴스가 값을 공유하므로 사용하지 않는다.
     uint32_t ocrFrameCounter = 0;
 
-    // ----- [Role D] UI 설정 -----
-    mutable std::mutex settingsMutex;        // GUI 스레드(update)와 렌더 스레드 간 data race 방지
-    std::string        blacklistApps  = "";  // 줄바꿈 구분 앱 이름 목록
-    float              blurIntensity  = 5.0f;
-    float              sensitivity    = 0.5f;
 };
