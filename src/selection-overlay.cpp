@@ -23,7 +23,7 @@ LRESULT CALLBACK SelectionOverlay::WndProc(HWND hwnd, UINT msg,
         auto* cs = reinterpret_cast<CREATESTRUCT*>(lParam);
         self = static_cast<SelectionOverlay*>(cs->lpCreateParams);
         SetWindowLongPtr(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
-        self->m_hwnd = hwnd;
+        self->m_hwnd.store(hwnd, std::memory_order_release);
     } else {
         self = reinterpret_cast<SelectionOverlay*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
     }
@@ -253,7 +253,7 @@ void SelectionOverlay::messageLoop()
 
     UnregisterClass(m_className, hInst);
     DeleteObject(bgBrush);
-    m_hwnd = NULL;
+    m_hwnd.store(NULL, std::memory_order_release);
     m_running.store(false, std::memory_order_release);
 }
 
@@ -282,8 +282,8 @@ void SelectionOverlay::cancel()
     if (!m_running.load(std::memory_order_acquire))
         return;
 
-    if (m_hwnd)
-        PostMessage(m_hwnd, WM_CLOSE, 0, 0);
+    if (HWND h = m_hwnd.load(std::memory_order_acquire))
+        PostMessage(h, WM_CLOSE, 0, 0);
 }
 
 void SelectionOverlay::wait_and_join()

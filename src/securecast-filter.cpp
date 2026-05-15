@@ -1713,10 +1713,6 @@ static void securecast_mouse_move(void* data,
 }
 #endif
 
-    blog(LOG_INFO, "[SecureCast][D] Settings updated — blur=%.1f sensitivity=%.2f",
-         filter->blurIntensity, filter->sensitivity);
-}
-
 // ================================================================
 // Source Info Dispatch Table
 // ================================================================

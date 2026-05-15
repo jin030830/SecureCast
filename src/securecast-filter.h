@@ -307,9 +307,4 @@ struct SecureCastFilter {
 
     uint32_t ocrFrameCounter = 0;
 
-    // ----- [Role D] UI 설정 -----
-    mutable std::mutex settingsMutex;        // GUI 스레드(update)와 렌더 스레드 간 data race 방지
-    std::string        blacklistApps  = "";  // 줄바꿈 구분 앱 이름 목록
-    float              blurIntensity  = 5.0f;
-    float              sensitivity    = 0.5f;
 };

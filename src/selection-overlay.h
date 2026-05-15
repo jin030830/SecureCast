@@ -53,9 +53,9 @@ private:
     // 선택 사각형 그리기 (WM_PAINT)
     static void paintSelection(HWND hwnd, POINT start, POINT cur, bool dragging);
 
-    wchar_t          m_className[64]{};   // 인스턴스별 고유 이름 (다중 필터 충돌 방지)
+    wchar_t              m_className[64]{};   // 인스턴스별 고유 이름 (다중 필터 충돌 방지)
 
-    HWND             m_hwnd = NULL;
+    std::atomic<HWND>    m_hwnd{NULL};
     std::thread      m_thread;
     std::atomic<bool> m_running{false};
 
