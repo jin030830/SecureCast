@@ -123,13 +123,9 @@ jobs:
           $srcBin = Join-Path $vcpkgRoot "installed\x64-windows\bin"
           $buildBin = "${{ github.workspace }}\build_x64\${{ needs.check-event.outputs.config }}"
           $pluginName = "${{ steps.setup.outputs.pluginName }}"
-          
+
           # Define full path to release binary folder
           $releaseBin = Join-Path "${{ github.workspace }}" "release\${{ needs.check-event.outputs.config }}\${pluginName}\bin\64bit"
-
-          Write-Host "=== DEBUG: Listing all files in vcpkg srcBin ($srcBin) ==="
-          Get-ChildItem $srcBin | Select-Object Name, Length
-          Write-Host "==========================================================="
 
           Write-Host "Copying runtime DLLs from $srcBin to both build and release dirs"
 
@@ -138,12 +134,10 @@ jobs:
               New-Item -ItemType Directory -Force -Path $releaseBin | Out-Null
           }
 
-          # Force copying EVERYTHING with .dll from source bin directory just to be absolutely safe
-          Write-Host "Copying ALL DLL files to ensure no missing dependencies"
           Copy-Item (Join-Path $srcBin "*.dll") $buildBin -Force
           Copy-Item (Join-Path $srcBin "*.dll") $releaseBin -Force
 
-          Write-Host "Successfully copied to $releaseBin"
+          Write-Host "DLLs in release bin:"
           Get-ChildItem $releaseBin -Filter "*.dll" | Select-Object Name
 
 

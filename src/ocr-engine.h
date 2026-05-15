@@ -121,8 +121,8 @@ private:
   int consecutiveSkips_ = 0;
   // 2-C: 직전 full OCR 사이클의 라인 평균 높이. 적응형 스케일 계산에 사용.
   float avgLineHeight_ = 0.0f;
-  // 연속 L1 히트 허용 횟수: 2 = 정적 화면 OCR ~1.3 fps, 최대 ~500 ms stale
-  // 허용.
+  // 연속 L1 히트 허용 횟수: 2 = 실제 1회 스킵(++후 1<2=true, 이후 full OCR).
+  // OCR 워커 주기 포함 시 최대 ~250ms stale.
   static constexpr int kMaxConsecutiveSkips = 2;
 
   // 8×8 구역 dHash: 9×8 샘플 격자 → 인접 밝기 비교 → 64비트

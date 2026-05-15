@@ -141,6 +141,7 @@ bool SecureCastOcrEngine::init() {
   try {
     hasLastRoiDhash_ = false;
     consecutiveSkips_ = 0;
+    avgLineHeight_ = 0.0f;
     lastBoxes_.clear();
     lastLineDhashes_.clear();
     impl_->lastFrameWidth = -1;
@@ -286,7 +287,11 @@ SecureCastOcrEngine::analyze_bgra_frame(const uint8_t *pixels, int width,
   // ── Full OCR ──────────────────────────────────────────────────
   auto lines = recognize_text(pixels, width, height, stride);
 
-  // 2-C: 라인 평균 높이 갱신 (다음 사이클 적응형 스케일 계산에 사용)
+  // 2-C: 라인 평균 높이 갱신 (다음 사이클 적응형 스케일 계산에 사용).
+  // NOTE: 이 값은 현재 pixels의 좌표계(스케일된 공간)에서의 높이다.
+  // caller(securecast-filter.cpp)가 adaptScale을 적용한 ocrPx를 넘기므로,
+  // 다음 사이클의 adaptScale = kOcrTargetH / avgLineHeight_가 역방향 스케일
+  // 을 적용해 2-사이클 진동이 발생할 수 있다(#TODO: coordScale로 정규화 필요).
   if (!lines.empty()) {
     float sumH = 0.0f;
     for (const auto &l : lines)
@@ -367,11 +372,10 @@ uint64_t SecureCastOcrEngine::compute_dhash_region(const uint8_t *px,
 
 // P0-C: 항상 전체 프레임 dHash 사용.
 // 기존 ROI-only dHash는 박스 밖에서 새 PII가 나타났을 때 변화를 감지하지 못해
-// 최대 kMaxConsecutiveSkips 사이클(≈500ms) 동안 탐지 지연이 발생했다.
+// 최대 kMaxConsecutiveSkips 사이클(≈250ms) 동안 탐지 지연이 발생했다.
 uint64_t SecureCastOcrEngine::compute_roi_dhash(
     const uint8_t *px, int stride, int width, int height,
     const std::vector<SecureCastOcrBox> &boxes) const {
-  PhaseTimer t_dhash(&profile_.acc.dhash);
   (void)boxes;
   return compute_dhash_region(px, stride, 0, 0, width, height);
 }
@@ -716,8 +720,9 @@ static bool has_adjacent_name_label(const std::vector<SecureCastOcrLine> &lines,
 
 static bool looks_like_korean_address_text(const std::string &text) {
   // 방향·이동 표현이 포함된 경우 주소가 아님 ("서울 쪽으로", "서울 방향")
+  // "쪽" 단독은 "양쪽", "이쪽" 등 정상 주소 컨텍스트를 억압하므로 제외.
   if (contains_any(text, {"쪽으로", "방향으로", "방면으로", "쪽방향", "가는 길",
-                           "오는 길", "방향", "근처", "부근", "쪽"}))
+                           "오는 길", "방향", "근처", "부근"}))
     return false;
 
   // 명시 라벨 → 단독으로 충분
