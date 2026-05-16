@@ -30,6 +30,7 @@
 #ifdef _WIN32
 #include "gpu-readback.h"
 #include "overlay-window.h"
+#include "selection-overlay.h"
 #endif
 #include "pipeline-health.h"
 #include "pixel-hash.h"
@@ -221,8 +222,9 @@ struct SecureCastFilter {
   obs_source_t *context = nullptr; // OBS 필터 컨텍스트 포인터
 
   // UI 및 운영 토글 상태
-  bool isActive = true;    // 필터 활성화 여부
-  bool isGameMode = false; // 게임 모드 활성화 여부
+  bool isActive = true; // 필터 활성화 여부
+  std::atomic<bool> isGameMode{
+      false}; // CPU 임계값 기반 자동 전환 (render/tick 크로스 스레드)
   SecurityState currentState =
       SecurityState::SAFE; // 현재 보안 등급 (SAFE/PARTIAL/RISK)
 
@@ -264,7 +266,8 @@ struct SecureCastFilter {
   int logStallCount =
       0; // 파이프라인 포화 경고 로그 주기 카운터 (30프레임마다 1회)
   int logEnqueueCount = 0; // enqueue 성공 로그 주기 카운터 (300프레임마다 1회)
-  int logScanThrottle = 0; // 블랙리스트 윈도우 스캔 로그 주기 카운터 (10틱 = 1.5초 주기)
+  int logScanThrottle =
+      0; // 블랙리스트 윈도우 스캔 로그 주기 카운터 (10틱 = 1.5초 주기)
 
   // ----- [Role A 담당: 윈도우 추적 및 블랙리스트] -----
   float trackerAccumulator =
@@ -295,9 +298,43 @@ struct SecureCastFilter {
   FILETIME prevUserTime = {};
 #endif
 
+  // destroy 진입 즉시 true — 진행 중인 핫키 콜백이 해제된 멤버에 접근하지 못하도록
+  std::atomic<bool> isDestroying{false};
+
   // ----- [Panic Button] Ctrl+Shift+F12 -----
   std::atomic<bool> panicMode{false};
   obs_hotkey_id panicHotkeyId = OBS_INVALID_HOTKEY_ID;
+
+#ifdef _WIN32
+  // ----- [Role D] 수동 드래그 블러 선택 오버레이 -----
+  SelectionOverlay selectionOverlay;
+  obs_hotkey_id selectHotkeyId = OBS_INVALID_HOTKEY_ID;
+#endif
+
+  // ----- [Role D] 알림 영역 자동 블러 -----
+  // screenChanged 감지 시 우하단 알림 영역에 변화가 있으면 3초간 블러를 유지.
+  // video_tick에서 쿨다운 카운트다운, video_render에서 all_rects에 주입.
+  bool notifBlurActive = false;
+  float notifBlurCooldown = 0.0f; // 3.0f에서 카운트다운, 0에 도달하면 해제
+  BlurRect notifBlurRect{};       // 소스 픽셀 좌표 (변화 감지 시 갱신)
+
+  // ----- [Role D] 수동 드래그 블러 -----
+  // OBS 소스 프리뷰에서 좌클릭 드래그로 영역 지정 → 영구 블러.
+  // 우클릭 또는 Properties의 "Clear" 버튼으로 전체 초기화.
+  // settingsMutex로 UI 스레드(mouse 콜백) ↔ Render 스레드(video_render) 보호.
+  static constexpr int SC_MAX_MANUAL_RECTS = 8;
+  BlurRect manualRects[SC_MAX_MANUAL_RECTS]{};
+  int manualRectCount = 0;
+
+  bool dragActive = false; // 드래그 진행 중
+  int32_t dragStartX = 0;
+  int32_t dragStartY = 0;
+  int32_t dragCurX = 0;
+  int32_t dragCurY = 0;
+
+  // 모니터→소스 좌표 변환용 캐시 (video_render에서 갱신, 원자적 접근)
+  std::atomic<uint32_t> lastSourceW{0};
+  std::atomic<uint32_t> lastSourceH{0};
 
   // ----- [Role B] Visual Tracker -----
   // OCR("what": ~250ms) 과 Tracker("where": render rate) 분리.
