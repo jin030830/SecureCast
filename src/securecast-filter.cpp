@@ -2260,8 +2260,8 @@ static obs_properties_t *securecast_get_properties(void *data) {
         blog(LOG_INFO,
              "[SecureCast][D] Manual blur rects cleared (Properties button).");
         return true;
-      },
-      data);
+      });
+  (void)data;
 #else
   (void)data;
 #endif
