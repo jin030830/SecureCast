@@ -759,6 +759,9 @@ static void* securecast_create(obs_data_t* settings, obs_source_t* context)
         blog(LOG_INFO, "[SecureCast] Panic hotkey registered (Ctrl+Shift+F12).");
     }
 
+// forward declaration — 정의는 Properties/Settings 섹션에 있음
+static void save_manual_rects(SecureCastFilter* filter, const MaskPayload& mask);
+
 #ifdef _WIN32
     // [Role D] 드래그 블러 선택 핫키 등록 (Ctrl+Shift+B)
     filter->selectHotkeyId = obs_hotkey_register_frontend(
