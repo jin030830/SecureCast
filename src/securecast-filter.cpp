@@ -44,6 +44,9 @@ SecureCastFilter::~SecureCastFilter() = default;
 
 // trackerAccumulator에 이 값을 대입하면 다음 sc_tracker_tick 호출 시 임계를 즉시 초과 → 강제 스캔 트리거.
 
+// forward declaration — 정의는 Properties/Settings 섹션에 있음
+static void save_manual_rects(SecureCastFilter* filter, const MaskPayload& mask);
+
 static constexpr float SCAN_INTERVAL_FORCE    = 1.0f;
 static constexpr float SCAN_INTERVAL_NORMAL   = 0.15f; // 일반 모드 스캔 주기
 static constexpr float SCAN_INTERVAL_GAME     = 0.5f;  // 게임 모드 스캔 주기
@@ -758,9 +761,6 @@ static void* securecast_create(obs_data_t* settings, obs_source_t* context)
         obs_data_release(combo);
         blog(LOG_INFO, "[SecureCast] Panic hotkey registered (Ctrl+Shift+F12).");
     }
-
-// forward declaration — 정의는 Properties/Settings 섹션에 있음
-static void save_manual_rects(SecureCastFilter* filter, const MaskPayload& mask);
 
 #ifdef _WIN32
     // [Role D] 드래그 블러 선택 핫키 등록 (Ctrl+Shift+B)
