@@ -18,11 +18,6 @@
 #include <obs-module.h>      // blog
 #include <winternl.h>        // RTL_OSVERSIONINFOW (RtlGetVersion용)
 
-// WDA_EXCLUDEFROMCAPTURE: Windows 10 2004+ (build 19041+) 에서 정의.
-// 구버전 SDK로 빌드할 때를 대비해 직접 정의해둠.
-#ifndef WDA_EXCLUDEFROMCAPTURE
-#define WDA_EXCLUDEFROMCAPTURE 0x00000011
-#endif
 
 // =============================================================================
 // isExcludeFromCaptureSupported — WDA_EXCLUDEFROMCAPTURE 지원 여부 반환

@@ -26,7 +26,7 @@
 #include "securecast-types.h"  // SecurityState
 
 // WDA_EXCLUDEFROMCAPTURE: Windows 10 2004 (build 19041)+ 에서 지원
-// 구버전에서는 WDA_NONE fallback
+// 구버전에서는 WDA_MONITOR fallback
 #ifndef WDA_EXCLUDEFROMCAPTURE
 #define WDA_EXCLUDEFROMCAPTURE 0x00000011
 #endif
