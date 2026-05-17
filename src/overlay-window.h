@@ -83,6 +83,9 @@ private:
     static constexpr int kWidth  = 200;
     static constexpr int kHeight =  48;
 
+    // WDA_EXCLUDEFROMCAPTURE 지원 여부 (create()에서 판단, messageLoop()에서 사용)
+    bool               m_useExcludeFromCapture{false};
+
     // WndProc ↔ messageLoop 초기화 완료 신호
     std::atomic<bool> m_ready{false};
 
