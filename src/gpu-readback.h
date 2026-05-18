@@ -86,18 +86,6 @@ public:
     bool readStagingBuffer(int idx, uint8_t* out, size_t expectedPitch, int targetH);
 
     /**
-     * @brief 텍스처 복사 요청 예약 (GPU-side Copy)
-     * [Role A 연계] Role A가 추적한 window/bbox 좌표를 이 함수의 bbox 인자로 넘겨주세요.
-     * @param targetW, targetH 예약할 스테이징 텍스처의 해상도 (Slot 0: 64x64 해시, Slot 1: OCR 고해상도)
-     */
-    void enqueueCopy(gs_texture_t* src, const BlurRect& bbox, int idx, int targetW, int targetH);
-
-    /**
-     * @brief 프레임 단위 제출 (비동기 쿼리 시작)
-     */
-    void submitFrame();
-
-    /**
      * @brief BBox 개수에 맞춰 리소스 풀 리사이징
      */
     void resizePool(const std::vector<std::pair<int, int>>& slotSizes);
