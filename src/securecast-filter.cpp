@@ -895,8 +895,11 @@ static void ocr_worker_loop(SecureCastFilter *filter) {
     }
 
     if (!ocrReady) {
-      // init 영구 실패: 회복 불가능. idle 복원 후 스레드 종료.
+      // init 영구 실패: 회복 불가능. 상태 전파 및 idle 복원 후 스레드 종료.
       // continue를 쓰면 렌더-워커 간 4fps 공회전이 영원히 반복된다.
+      filter->ocrWorkerRunning.store(false, std::memory_order_release);
+      filter->ocrIsDown.store(true, std::memory_order_release);
+      blog(LOG_WARNING, "[SecureCast] OCR engine init failed permanently — worker terminating");
       filter->ocrWorkerIdle.store(true, std::memory_order_release);
       break;
     }
@@ -1577,7 +1580,8 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
     // [Role D] 수동/알림 블러 활성도 PARTIAL 판정에 포함
     bool manualOrNotifActive =
         filter->manualRectCount > 0 || filter->notifBlurActive;
-    if (filter->health.isCritical()) {
+    if (filter->health.isCritical() ||
+        filter->ocrIsDown.load(std::memory_order_acquire)) {
       filter->currentState = SecurityState::RISK;
     } else if (hasTrackerBoxes || filter->lastMask.rectCount > 0 ||
                blacklistSnapshot.rectCount > 0 || manualOrNotifActive) {
@@ -2062,6 +2066,8 @@ static void securecast_video_tick(void *data, float seconds) {
   // 의해 게임 모드가 즉시 끊겼다가 3초 후 재진입하는 깜빡임이 발생한다.
   if (filter->winListener.checkAndClearRescan()) {
     filter->trackerAccumulator = SCAN_INTERVAL_FORCE;
+    // M5: 창/소스 전환 시 dHash 캐시 무효화 (방어적)
+    filter->ocrClearCachePending.store(true, std::memory_order_release);
 
     // Quick restore: foreground 전환 이벤트 직후 recentlySeenList 조회 → 즉시
     // 복원. EnumWindows 스캔(느림) 전에 captureWindowList를 채워 이번 render의

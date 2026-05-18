@@ -399,6 +399,9 @@ struct SecureCastFilter {
   // 이 플래그를 경유해 워커 스레드에서 안전하게 실행한다.
   std::atomic<bool> ocrClearCachePending{false};
 
+  // M8: OCR 엔진 초기화 영구 실패 여부. 렌더 루프에서 확인 후 RISK 상태로 전환.
+  std::atomic<bool> ocrIsDown{false};
+
   // 직전 OCR 사이클의 박스 수. 변경 시에만 LOG_INFO, 매 사이클은 LOG_DEBUG.
   int lastLoggedOcrCount = -1;
 
