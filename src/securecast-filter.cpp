@@ -1114,10 +1114,7 @@ static void stop_ocr_worker(SecureCastFilter *filter) {
   if (!filter)
     return;
 
-  bool wasRunning =
-      filter->ocrWorkerRunning.exchange(false, std::memory_order_acq_rel);
-  if (!wasRunning)
-    return;
+  filter->ocrWorkerRunning.store(false, std::memory_order_release);
 
   // 진행 중인 RecognizeAsync를 취소하여 .get() 블로킹을 즉시 해제한다.
   if (filter->ocrEngine)
