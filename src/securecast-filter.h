@@ -67,9 +67,7 @@ class SecureCastOcrEngine;
 constexpr int SC_MAX_BLUR_RECTS =
     32; // 한 프레임에 동시에 마스킹 가능한 최대 영역 수
 constexpr int SC_RING_BUFFER_SLOTS =
-    15; // Bounded Exposure: OCR 레이턴시(≈250ms) / 프레임(16.7ms@60fps) =
-        // 15슬롯. 이 값 미만이면 새 PII가 OCR 탐지 전에 스트림에 출력된다 (보안
-        // 원시 위반).
+    60; // Bounded Exposure: OCR 최대 레이턴시(≈1000ms) 대비 여유 확보를 위해 60슬롯으로 증가 (1초 지연)
 
 // ----------------------------------------------------
 // Shared Types (Types) - Moved to securecast-types.h
