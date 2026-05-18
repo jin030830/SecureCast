@@ -46,6 +46,13 @@ option(ENABLE_FRONTEND_API "Use obs-frontend-api for UI functionality" ON)
 # 현재 미사용이라 OFF. OBS Properties API는 Qt와 무관하다.
 option(ENABLE_QT "Use Qt functionality" OFF)
 
+# 1080p OCR을 1280×720 다운스케일(2/3×) 경로로 처리할지 결정.
+# ON  → 1080p+ 입력에 downsample_ocr.effect (Mitchell + USM)를 사용해
+#        1280×720 BGRA를 OCR에 제출. 픽셀 ~44% 감소로 OCR 처리시간 단축.
+# OFF → 1080p는 풀해상도 OCR로 복귀 (인식 정확도 보수적 기본값).
+option(SECURECAST_ENABLE_OCR_TWOTHIRDS
+       "Enable 0.667x OCR downscale (1280x720) for 1080p inputs" ON)
+
 # 표준 OBS 플러그인 템플릿의 빌드 도우미들.
 #   compilerconfig : 경고 수준, MSVC/Clang 별 플래그 등 컴파일러 공통 설정
 #   defaults       : 플랫폼별 default include/lib 경로
@@ -231,6 +238,11 @@ if(WIN32)
   )
 endif()
 
+
+# 1080p TwoThirds OCR 경로 활성화 (Mitchell + USM 셰이더 사용).
+if(SECURECAST_ENABLE_OCR_TWOTHIRDS)
+  target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE SECURECAST_OCR_TWOTHIRDS=1)
+endif()
 
 # OBS 표준 매크로: 출력 파일명을 "${_name}.dll" 로 강제, install 타겟 자동 생성.
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})

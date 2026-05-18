@@ -610,7 +610,7 @@ static void destroy_ocr_stage_surface(SecureCastFilter *filter) {
 }
 
 #ifdef _WIN32
-// 1-G: half-size BGRA GPU 다운스케일 리소스 해제
+// 1-G: half-size BGRA GPU 다운스케일 리소스 해제 (+ ocrMidRender_ 정리)
 static void destroy_ocr_down_stage(SecureCastFilter *filter) {
   if (!filter)
     return;
@@ -622,21 +622,26 @@ static void destroy_ocr_down_stage(SecureCastFilter *filter) {
     gs_texrender_destroy(filter->ocrDownRender_);
     filter->ocrDownRender_ = nullptr;
   }
+  if (filter->ocrMidRender_) {
+    gs_texrender_destroy(filter->ocrMidRender_);
+    filter->ocrMidRender_ = nullptr;
+  }
   filter->ocrDownW_ = 0;
   filter->ocrDownH_ = 0;
 }
 
-// 1-G: 1440p+ OCR용 half-size BGRA stagesurf 확보. 해상도 변경 시 재생성.
-static bool ensure_ocr_down_stage(SecureCastFilter *filter, uint32_t fullW,
-                                  uint32_t fullH) {
+// OCR 다운스케일 stagesurf + 중간 렌더타겟 확보.
+// dstW × dstH 텍스처 + stagesurf + ocrMidRender_ 일괄 재생성.
+// Mitchell+USM 2-pass 사용 시 ocrMidRender_ 필요. bilinear 단일 pass도 호환.
+static bool ensure_ocr_down_stage(SecureCastFilter *filter, uint32_t dstW,
+                                  uint32_t dstH) {
   if (!filter)
     return false;
-  const uint32_t dw = fullW / 2, dh = fullH / 2;
-  if (dw == 0 || dh == 0)
+  if (dstW == 0 || dstH == 0)
     return false;
 
-  if (filter->ocrDownRender_ && filter->ocrDownW_ == dw &&
-      filter->ocrDownH_ == dh)
+  if (filter->ocrDownRender_ && filter->ocrDownW_ == dstW &&
+      filter->ocrDownH_ == dstH)
     return true;
 
   destroy_ocr_down_stage(filter);
@@ -645,53 +650,149 @@ static bool ensure_ocr_down_stage(SecureCastFilter *filter, uint32_t fullW,
   if (!filter->ocrDownRender_)
     return false;
 
-  filter->ocrDownStage_ = gs_stagesurface_create(dw, dh, GS_BGRA);
+  filter->ocrDownStage_ = gs_stagesurface_create(dstW, dstH, GS_BGRA);
   if (!filter->ocrDownStage_) {
     gs_texrender_destroy(filter->ocrDownRender_);
     filter->ocrDownRender_ = nullptr;
     return false;
   }
 
-  filter->ocrDownW_ = dw;
-  filter->ocrDownH_ = dh;
+  // Mitchell + USM 2-pass용 중간 텍스처. 1-pass(bilinear) 경로에서는 사용 안 됨.
+  filter->ocrMidRender_ = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
+  if (!filter->ocrMidRender_) {
+    gs_stagesurface_destroy(filter->ocrDownStage_);
+    filter->ocrDownStage_ = nullptr;
+    gs_texrender_destroy(filter->ocrDownRender_);
+    filter->ocrDownRender_ = nullptr;
+    return false;
+  }
+
+  filter->ocrDownW_ = dstW;
+  filter->ocrDownH_ = dstH;
   return true;
 }
 
-// 1-G: GPU에서 srcTex를 절반 크기 BGRA로 다운샘플 후 CPU 버퍼로 readback.
-// 반환: true = outPixels에 dw×dh BGRA 기록됨, outStride = dw*4.
-static bool read_texture_bgra_half_gpu(SecureCastFilter *filter,
-                                       gs_texture_t *srcTex, uint32_t fullW,
-                                       uint32_t fullH,
-                                       std::vector<uint8_t> &outPixels,
-                                       int &outStride) {
-  if (!filter || !srcTex)
-    return false;
-  if (!filter->trackerGrayEffect_)
-    return false;
-  if (!ensure_ocr_down_stage(filter, fullW, fullH))
-    return false;
-
-  const uint32_t dw = filter->ocrDownW_, dh = filter->ocrDownH_;
-
-  gs_texrender_reset(filter->ocrDownRender_);
-  if (!gs_texrender_begin(filter->ocrDownRender_, static_cast<int>(dw),
-                          static_cast<int>(dh)))
+// GPU에서 srcTex를 임의 비율로 다운샘플 후 CPU 버퍼로 readback.
+// tier == Half      : 0.5× bilinear (기존 BGRADownsample2x 셰이더, 1-pass)
+// tier == TwoThirds : 0.667× Mitchell + USM (downsample_ocr.effect, 2-pass)
+// tier == Full      : 호출 금지 (Full은 readback 자체를 하지 않음)
+// 반환: outPixels에 dstW×dstH BGRA 기록, outStride = dstW*4.
+//       outDstW/H에 실제 다운스케일 크기를 기록한다.
+static bool read_texture_bgra_scaled_gpu(SecureCastFilter *filter,
+                                         gs_texture_t *srcTex, uint32_t fullW,
+                                         uint32_t fullH, OcrScaleTier tier,
+                                         std::vector<uint8_t> &outPixels,
+                                         int &outStride, uint32_t *outDstW,
+                                         uint32_t *outDstH) {
+  if (!filter || !srcTex || tier == OcrScaleTier::Full)
     return false;
 
-  gs_effect_t *eff = filter->trackerGrayEffect_; // downsample.effect 재사용
-  gs_eparam_t *pImg = gs_effect_get_param_by_name(eff, "image");
-  gs_eparam_t *pUV = gs_effect_get_param_by_name(eff, "uv_bounds");
-
-  gs_effect_set_texture(pImg, srcTex);
-  if (pUV) {
-    struct vec4 bounds = {0.0f, 0.0f, 1.0f, 1.0f};
-    gs_effect_set_vec4(pUV, &bounds);
+  // 목표 크기 결정 — 1080p TwoThirds는 1280×720으로 하드 매칭.
+  uint32_t dw = 0, dh = 0;
+  if (tier == OcrScaleTier::Half) {
+    dw = fullW / 2;
+    dh = fullH / 2;
+  } else { // TwoThirds
+    if (fullW == 1920 && fullH == 1080) {
+      dw = 1280;
+      dh = 720;
+    } else {
+      const float r = 2.0f / 3.0f;
+      dw = static_cast<uint32_t>(std::lround(fullW * r));
+      dh = static_cast<uint32_t>(std::lround(fullH * r));
+    }
   }
-  while (gs_effect_loop(eff, "BGRADownsample2x"))
-    gs_draw_sprite(srcTex, 0, dw, dh);
+  if (dw == 0 || dh == 0)
+    return false;
 
-  gs_texrender_end(filter->ocrDownRender_);
+  if (!ensure_ocr_down_stage(filter, dw, dh))
+    return false;
 
+  // Half: 기존 bilinear 1-pass 경로 (trackerGrayEffect_ 필요).
+  // TwoThirds: Mitchell + USM 2-pass (ocrDownsampleEffect_ 필요).
+  const bool useMitchell = (tier == OcrScaleTier::TwoThirds) &&
+                           (filter->ocrDownsampleEffect_ != nullptr);
+
+  if (useMitchell) {
+    // pass1: src → ocrMidRender_ (Mitchell)
+    gs_effect_t *eff = filter->ocrDownsampleEffect_;
+    gs_eparam_t *pImg = gs_effect_get_param_by_name(eff, "image");
+    gs_eparam_t *pUV = gs_effect_get_param_by_name(eff, "uv_bounds");
+    gs_eparam_t *pSrcTexel =
+        gs_effect_get_param_by_name(eff, "src_texel_size");
+    gs_eparam_t *pMidTexel =
+        gs_effect_get_param_by_name(eff, "mid_texel_size");
+    gs_eparam_t *pAmount = gs_effect_get_param_by_name(eff, "usm_amount");
+
+    gs_texrender_reset(filter->ocrMidRender_);
+    if (!gs_texrender_begin(filter->ocrMidRender_, static_cast<int>(dw),
+                            static_cast<int>(dh)))
+      return false;
+
+    gs_effect_set_texture(pImg, srcTex);
+    if (pUV) {
+      struct vec4 bounds = {0.0f, 0.0f, 1.0f, 1.0f};
+      gs_effect_set_vec4(pUV, &bounds);
+    }
+    if (pSrcTexel) {
+      struct vec2 ts = {1.0f / static_cast<float>(fullW),
+                        1.0f / static_cast<float>(fullH)};
+      gs_effect_set_vec2(pSrcTexel, &ts);
+    }
+    while (gs_effect_loop(eff, "BGRADownsampleMitchell"))
+      gs_draw_sprite(srcTex, 0, dw, dh);
+    gs_texrender_end(filter->ocrMidRender_);
+
+    // pass2: ocrMidRender_ → ocrDownRender_ (3×3 USM)
+    gs_texture_t *midTex = gs_texrender_get_texture(filter->ocrMidRender_);
+    if (!midTex)
+      return false;
+
+    gs_texrender_reset(filter->ocrDownRender_);
+    if (!gs_texrender_begin(filter->ocrDownRender_, static_cast<int>(dw),
+                            static_cast<int>(dh)))
+      return false;
+
+    gs_effect_set_texture(pImg, midTex);
+    if (pUV) {
+      struct vec4 bounds = {0.0f, 0.0f, 1.0f, 1.0f};
+      gs_effect_set_vec4(pUV, &bounds);
+    }
+    if (pMidTexel) {
+      struct vec2 ts = {1.0f / static_cast<float>(dw),
+                        1.0f / static_cast<float>(dh)};
+      gs_effect_set_vec2(pMidTexel, &ts);
+    }
+    if (pAmount) {
+      gs_effect_set_float(pAmount, 0.5f);
+    }
+    while (gs_effect_loop(eff, "BGRAUnsharp3x3"))
+      gs_draw_sprite(midTex, 0, dw, dh);
+    gs_texrender_end(filter->ocrDownRender_);
+  } else {
+    // Half(또는 Mitchell 미로드 폴백): 기존 bilinear 1-pass.
+    if (!filter->trackerGrayEffect_)
+      return false;
+    gs_effect_t *eff = filter->trackerGrayEffect_;
+    gs_eparam_t *pImg = gs_effect_get_param_by_name(eff, "image");
+    gs_eparam_t *pUV = gs_effect_get_param_by_name(eff, "uv_bounds");
+
+    gs_texrender_reset(filter->ocrDownRender_);
+    if (!gs_texrender_begin(filter->ocrDownRender_, static_cast<int>(dw),
+                            static_cast<int>(dh)))
+      return false;
+
+    gs_effect_set_texture(pImg, srcTex);
+    if (pUV) {
+      struct vec4 bounds = {0.0f, 0.0f, 1.0f, 1.0f};
+      gs_effect_set_vec4(pUV, &bounds);
+    }
+    while (gs_effect_loop(eff, "BGRADownsample2x"))
+      gs_draw_sprite(srcTex, 0, dw, dh);
+    gs_texrender_end(filter->ocrDownRender_);
+  }
+
+  // staging copy + map → CPU
   gs_texture_t *downTex = gs_texrender_get_texture(filter->ocrDownRender_);
   if (!downTex)
     return false;
@@ -710,6 +811,10 @@ static bool read_texture_bgra_half_gpu(SecureCastFilter *filter,
   gs_stagesurface_unmap(filter->ocrDownStage_);
 
   outStride = static_cast<int>(tightStride);
+  if (outDstW)
+    *outDstW = dw;
+  if (outDstH)
+    *outDstH = dh;
   return true;
 }
 #endif // _WIN32
@@ -974,11 +1079,20 @@ static void clear_pending_ocr_frame(SecureCastFilter *filter) {
   filter->ocrPendingWidth = 0;
   filter->ocrPendingHeight = 0;
   filter->ocrPendingStride = 0;
+  filter->ocrPendingTrackerGray.clear();
+  filter->ocrPendingTrackerW = 0;
+  filter->ocrPendingTrackerH = 0;
+  filter->ocrPendingTier = OcrScaleTier::Full;
 }
 
+// OCR 워커에 한 프레임 제출. pixels(OCR 입력 BGRA) + trackerGray(트래커
+// 등록용 gray) + tier를 모두 같은 lock 안에서 push해 워커가 pop 시 한 번에
+// 가져가도록 한다.
 static void submit_ocr_frame(SecureCastFilter *filter,
                              std::vector<uint8_t> &&pixels, int width,
-                             int height, int stride, uint64_t frameId) {
+                             int height, int stride, uint64_t frameId,
+                             std::vector<uint8_t> &&trackerGray, int trackerW,
+                             int trackerH, OcrScaleTier tier) {
   if (!filter || pixels.empty() || width <= 0 || height <= 0 || stride <= 0 ||
       frameId == 0)
     return;
@@ -993,6 +1107,11 @@ static void submit_ocr_frame(SecureCastFilter *filter,
     filter->ocrPendingWidth = width;
     filter->ocrPendingHeight = height;
     filter->ocrPendingStride = stride;
+    filter->ocrPendingTrackerGray = std::move(trackerGray);
+    filter->ocrPendingTrackerW = trackerW;
+    filter->ocrPendingTrackerH = trackerH;
+    filter->ocrPendingTier = tier;
+    filter->ocrPendingEnqueueTs = std::chrono::steady_clock::now();
     filter->ocrFramePending = true;
   }
 
@@ -1018,10 +1137,15 @@ static void ocr_worker_loop(SecureCastFilter *filter) {
 
   while (true) {
     std::vector<uint8_t> pixels;
+    std::vector<uint8_t> trackerGray;
     int width = 0;
     int height = 0;
     int stride = 0;
+    int trackerW = 0;
+    int trackerH = 0;
     uint64_t frameId = 0;
+    OcrScaleTier tier = OcrScaleTier::Full;
+    std::chrono::steady_clock::time_point enqueueTs{};
 
     {
       std::unique_lock<std::mutex> lock(filter->ocrWorkerMutex);
@@ -1036,15 +1160,23 @@ static void ocr_worker_loop(SecureCastFilter *filter) {
       }
 
       pixels.swap(filter->ocrPendingPixels);
+      trackerGray.swap(filter->ocrPendingTrackerGray);
       frameId = filter->ocrPendingFrameId;
       width = filter->ocrPendingWidth;
       height = filter->ocrPendingHeight;
       stride = filter->ocrPendingStride;
+      trackerW = filter->ocrPendingTrackerW;
+      trackerH = filter->ocrPendingTrackerH;
+      tier = filter->ocrPendingTier;
+      enqueueTs = filter->ocrPendingEnqueueTs;
 
       filter->ocrPendingFrameId = 0;
       filter->ocrPendingWidth = 0;
       filter->ocrPendingHeight = 0;
       filter->ocrPendingStride = 0;
+      filter->ocrPendingTrackerW = 0;
+      filter->ocrPendingTrackerH = 0;
+      filter->ocrPendingTier = OcrScaleTier::Full;
       filter->ocrFramePending = false;
     }
 
@@ -1074,21 +1206,27 @@ static void ocr_worker_loop(SecureCastFilter *filter) {
     }
 
     // 2-C: 적응형 스케일 — 직전 사이클 평균 라인 높이를 14~20px 대역으로 맞춤.
-    // 첫 사이클(avgH=0): fallback 정책(1440p+ 0.5×, 1080p- 2×).
+    // 첫 사이클(avgH=0): 1440p+ 0.5× 다운, 그 외엔 1.0×(풀해상도)로 안전.
+    //   ※ 이전엔 1080p- 2× 업스케일 → 3840×2160 폭주 → adaptScale 진동.
     constexpr float kOcrTargetH = 16.0f; // Windows.Media.Ocr 최적 구간 중간값
     constexpr float kScaleMin = 0.5f;
     constexpr float kScaleMax = 2.5f;
     const float avgLineH =
         filter->ocrEngine ? filter->ocrEngine->averageLineHeight() : 0.0f;
 
-    // fallback: 1440p+ → 0.5×, 1080p- → 2×
     const bool is1440p = (width >= 2560 && height >= 1440);
-    float adaptScale;
-    if (avgLineH > 0.0f) {
-      adaptScale =
-          std::max(kScaleMin, std::min(kOcrTargetH / avgLineH, kScaleMax));
-    } else {
-      adaptScale = is1440p ? 0.5f : 2.0f;
+    // preScaled: GPU가 이미 OCR-목표 해상도로 다운한 입력. CPU adaptScale 금지.
+    const bool preScaled = (tier != OcrScaleTier::Full);
+    float adaptScale = 1.0f;
+    if (!preScaled) {
+      if (avgLineH > 0.0f) {
+        adaptScale =
+            std::max(kScaleMin, std::min(kOcrTargetH / avgLineH, kScaleMax));
+      } else {
+        // 첫 사이클 fallback. 1440p+만 GPU 다운 없을 때 CPU 0.5× 시도, 그 외는
+        // 풀해상도 그대로 (2× 업스케일 폭주 차단).
+        adaptScale = is1440p ? 0.5f : 1.0f;
+      }
     }
 
     // 스케일 적용 (0.5× 다운 or 2× 업만 SIMD; 그 외 스칼라 bilinear)
@@ -1163,11 +1301,30 @@ static void ocr_worker_loop(SecureCastFilter *filter) {
       }
     }
 
-    auto ocrBoxes =
+    OcrAnalysisResult result =
         filter->ocrEngine->analyze_bgra_frame(ocrPx, ocrW2, ocrH2, ocrStride2);
+    auto &ocrBoxes = result.boxes;
 
-    // 좌표를 원본 해상도로 복원 (coordScale = 1/adaptScale)
-    if (coordScale != 1.0f) {
+    // 좌표 복원 — tier별 정책:
+    //   TwoThirds: OCR 박스(1280×720 좌표)를 원본 1920×1080 좌표로 복원하여
+    //              트래커에 넘김. 트래커는 원본 gray 공간에서 동작.
+    //   Half:      OCR 박스(half 좌표)를 그대로 유지. 트래커도 half gray 공간.
+    //              렌더 시 trackerCoordScale_=2.0f로 복원.
+    //   Full + adaptScale(coordScale!=1): 기존 CPU adaptScale 보정 그대로.
+    if (tier == OcrScaleTier::TwoThirds) {
+      // trackerGray가 원본 해상도이므로 OCR 박스를 원본 좌표로 올림.
+      const float scaleX =
+          static_cast<float>(trackerW) / static_cast<float>(width);
+      const float scaleY =
+          static_cast<float>(trackerH) / static_cast<float>(height);
+      for (auto &b : ocrBoxes) {
+        b.x = std::round(b.x * scaleX);
+        b.y = std::round(b.y * scaleY);
+        b.w = std::round(b.w * scaleX);
+        b.h = std::round(b.h * scaleY);
+      }
+    } else if (!preScaled && coordScale != 1.0f) {
+      // Full tier에서 CPU adaptScale을 사용한 경우만 역변환.
       for (auto &b : ocrBoxes) {
         b.x = std::round(b.x * coordScale);
         b.y = std::round(b.y * coordScale);
@@ -1176,20 +1333,27 @@ static void ocr_worker_loop(SecureCastFilter *filter) {
       }
     }
 
-    // OCR worker가 자신의 픽셀로 직접 register_or_update_gray 호출.
-    // (render thread 경유 시 프레임 불일치로 garbage template → ghost tracker
-    // 발생) 1-E: BGRA→gray 1회만 수행, register_or_update_gray로 중복 변환
-    // 제거.
+    // 트래커 등록: 워커 pop에서 이미 받은 trackerGray를 사용.
+    //   - Full / TwoThirds: 원본 해상도 gray
+    //   - Half: half 해상도 gray
+    // trackerGray가 비어있으면(렌더 스레드 실패) BGRA→gray 폴백 변환.
     {
       std::vector<VtOcrBox> vtBoxes;
       vtBoxes.reserve(ocrBoxes.size());
       for (const auto &b : ocrBoxes)
         vtBoxes.push_back({b.type, b.x, b.y, b.w, b.h});
-      std::vector<uint8_t> grayForTracker;
-      VisualTrackerManager::bgra_to_gray(pixels.data(), width, height, stride,
-                                         grayForTracker);
-      filter->trackerMgr.register_or_update_gray(vtBoxes, grayForTracker.data(),
-                                                 width, height);
+
+      if (!trackerGray.empty() && trackerW > 0 && trackerH > 0) {
+        filter->trackerMgr.register_or_update_gray(vtBoxes, trackerGray.data(),
+                                                   trackerW, trackerH);
+      } else {
+        // 폴백: trackerGray 미전달 시 OCR 입력에서 직접 gray 변환.
+        std::vector<uint8_t> grayForTracker;
+        VisualTrackerManager::bgra_to_gray(pixels.data(), width, height, stride,
+                                           grayForTracker);
+        filter->trackerMgr.register_or_update_gray(
+            vtBoxes, grayForTracker.data(), width, height);
+      }
     }
 
     const int boxCount = static_cast<int>(ocrBoxes.size());
@@ -1198,6 +1362,83 @@ static void ocr_worker_loop(SecureCastFilter *filter) {
       blog(LOG_INFO, "[securecast][ocr] mask count changed: %d -> %d",
            filter->lastLoggedOcrCount, boxCount);
       filter->lastLoggedOcrCount = boxCount;
+    }
+
+    // 셀프힐링 — fullRecognitionRan==true일 때만 escalate 판정.
+    // L1/L2 캐시 히트는 OCR 마비가 아니므로 streak 변경 없음.
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now().time_since_epoch())
+                           .count();
+    if (result.fullRecognitionRan) {
+      if (result.effectiveLineCount == 0) {
+        const int s = filter->ocrZeroLineStreak_.fetch_add(
+                          1, std::memory_order_acq_rel) +
+                      1;
+        const OcrTierOverride curOv =
+            filter->ocrOverrideTier_.load(std::memory_order_acquire);
+        const OcrScaleTier curPolicy =
+            filter->ocrPolicyTier_.load(std::memory_order_acquire);
+        const OcrScaleTier curEff =
+            SecureCastFilter::ocr_effective_tier(curPolicy, curOv);
+        if (s >= 3 && curEff != OcrScaleTier::Full) {
+          // 한 단계 더 안전한 override 설정: Half→TwoThirds, TwoThirds→Full.
+          const OcrTierOverride next = (curEff == OcrScaleTier::Half)
+                                           ? OcrTierOverride::TwoThirds
+                                           : OcrTierOverride::Full;
+          filter->ocrOverrideTier_.store(next, std::memory_order_release);
+          filter->ocrZeroLineStreak_.store(0, std::memory_order_release);
+          filter->ocrLastEscalateMs_.store(nowMs, std::memory_order_release);
+          blog(LOG_WARNING,
+               "[SC-ocr] self-heal escalate eff=%d ov->%d (3 cycles zero lines)",
+               static_cast<int>(curEff), static_cast<int>(next));
+        }
+      } else {
+        // 정상 인식: streak 즉시 리셋.
+        filter->ocrZeroLineStreak_.store(0, std::memory_order_release);
+      }
+    }
+
+    // 60초 경과 시 override를 policy 방향으로 한 단계 완화.
+    {
+      const OcrTierOverride curOv =
+          filter->ocrOverrideTier_.load(std::memory_order_acquire);
+      const OcrScaleTier curPolicy =
+          filter->ocrPolicyTier_.load(std::memory_order_acquire);
+      const int64_t last =
+          filter->ocrLastEscalateMs_.load(std::memory_order_acquire);
+      if (curOv != OcrTierOverride::Auto && last > 0 &&
+          nowMs - last > 60000) {
+        const OcrTierOverride relaxed =
+            SecureCastFilter::relax_override(curOv, curPolicy);
+        filter->ocrOverrideTier_.store(relaxed, std::memory_order_release);
+        filter->ocrLastEscalateMs_.store(nowMs, std::memory_order_release);
+        blog(LOG_INFO,
+             "[SC-ocr] self-heal relax override %d->%d after 60s",
+             static_cast<int>(curOv), static_cast<int>(relaxed));
+      }
+    }
+
+    // 진단 로깅: enqueue→완료까지 소요 ms를 누적, 100사이클마다 평균 출력.
+    if (enqueueTs.time_since_epoch().count() != 0) {
+      const auto procMs =
+          std::chrono::duration<double, std::milli>(
+              std::chrono::steady_clock::now() - enqueueTs)
+              .count();
+      filter->ocrEnqueueLatencyAccumMs_ += procMs;
+      if (++filter->ocrEnqueueLatencyCount_ >= 100) {
+        const double avgMs = filter->ocrEnqueueLatencyAccumMs_ /
+                             filter->ocrEnqueueLatencyCount_;
+        const OcrTierOverride curOv2 =
+            filter->ocrOverrideTier_.load(std::memory_order_acquire);
+        blog(LOG_INFO,
+             "[SC-ocr] avg_ms=%.1f tier=%d(ov=%d) input=%dx%d effLines=%d "
+             "boxes=%zu fullRan=%d",
+             avgMs, static_cast<int>(tier), static_cast<int>(curOv2), ocrW2,
+             ocrH2, result.effectiveLineCount, ocrBoxes.size(),
+             static_cast<int>(result.fullRecognitionRan));
+        filter->ocrEnqueueLatencyAccumMs_ = 0.0;
+        filter->ocrEnqueueLatencyCount_ = 0;
+      }
     }
 
     // 이 프레임은 OCR + tracker registration까지 완료됨. 렌더 스레드가
@@ -1464,6 +1705,16 @@ static void *securecast_create(obs_data_t *settings, obs_source_t *context) {
       bfree(ds_path);
     }
   }
+  {
+    // OCR 전용 Mitchell+USM 다운스케일 셰이더. 미로드 시 compute_policy()가
+    // Full을 반환해 풀해상도 OCR로 안전 폴백.
+    char *ocr_ds_path = obs_module_file("downsample_ocr.effect");
+    if (ocr_ds_path) {
+      filter->ocrDownsampleEffect_ =
+          gs_effect_create_from_file(ocr_ds_path, nullptr);
+      bfree(ocr_ds_path);
+    }
+  }
   obs_leave_graphics();
   if (!filter->blurEffect)
     blog(LOG_WARNING, "[SecureCast] blur effect load failed; falling back to "
@@ -1476,6 +1727,12 @@ static void *securecast_create(obs_data_t *settings, obs_source_t *context) {
   else
     blog(LOG_INFO,
          "[SecureCast] downsample effect loaded (Tier 1 GPU gray active).");
+  if (!filter->ocrDownsampleEffect_)
+    blog(LOG_WARNING, "[SecureCast] downsample_ocr.effect load failed; OCR "
+                      "uses full-res input.");
+  else
+    blog(LOG_INFO, "[SecureCast] downsample_ocr.effect loaded (Mitchell+USM "
+                   "OCR path active).");
 
   return filter;
 }
@@ -1529,6 +1786,10 @@ static void securecast_destroy(void *data) {
   if (filter->trackerGrayEffect_) {
     gs_effect_destroy(filter->trackerGrayEffect_);
     filter->trackerGrayEffect_ = nullptr;
+  }
+  if (filter->ocrDownsampleEffect_) {
+    gs_effect_destroy(filter->ocrDownsampleEffect_);
+    filter->ocrDownsampleEffect_ = nullptr;
   }
   destroy_last_safe_render(filter);
 #ifdef _WIN32
@@ -1884,18 +2145,55 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
   if (analysisTex && filter->trackerFrameSkip_ >= 2) {
     filter->trackerFrameSkip_ = 0;
 
-    // ocrWorkerIdle: 단일 소비자(렌더 스레드)가 load→조건부 store(false),
-    //               단일 생산자(OCR 워커 또는 렌더 실패 경로)가 store(true).
-    // 이 구조상 load와 store(false) 사이의 원자성 갭은 race를 일으키지 않는다.
-    // 멀티 제출 경로가 추가될 경우 compare_exchange_strong으로 교체 필요.
-    const bool ocrIdle = filter->ocrWorkerIdle.load(std::memory_order_acquire);
-    const bool ocrCanSubmit =
-        ocrIdle && filter->ocrWorkerRunning.load(std::memory_order_acquire);
-    if (ocrCanSubmit) {
-      filter->ocrWorkerIdle.store(false, std::memory_order_release);
-      filter->lastSubmittedOcrFrameId.store(analysisSlot->frameId, std::memory_order_relaxed);
-      // analysisSlot은 방금 제출되었으므로, 자신을 대표 ID로 삼음 (const cast 필요)
-      const_cast<FrameRingBuffer::Slot*>(analysisSlot)->dependentOcrFrameId = analysisSlot->frameId;
+    // --- [OCR 다운스케일 tier 결정] ---
+    // policyTier: 해상도 + 로드된 effect에 따라 결정.
+    //   Half      : ≥1440p (downsample.effect bilinear 필요)
+    //   TwoThirds : ≥1080p AND SECURECAST_OCR_TWOTHIRDS AND ocrDownsampleEffect_
+    //   Full      : 그 외 또는 effect 미로드 시 안전 폴백.
+    // overrideTier: 셀프힐링이 강제하는 안전 모드.
+    // effective = min(policy, override)로 더 안전한 쪽 선택.
+#ifdef _WIN32
+    auto compute_policy = [&]() -> OcrScaleTier {
+      if (w >= 2560 && h >= 1440 && filter->trackerGrayEffect_)
+        return OcrScaleTier::Half;
+#ifdef SECURECAST_OCR_TWOTHIRDS
+      if (w >= 1920 && h >= 1080 && filter->ocrDownsampleEffect_)
+        return OcrScaleTier::TwoThirds;
+#endif
+      return OcrScaleTier::Full;
+    };
+    const OcrScaleTier policyTier = compute_policy();
+    filter->ocrPolicyTier_.store(policyTier, std::memory_order_release);
+    const OcrTierOverride ov =
+        filter->ocrOverrideTier_.load(std::memory_order_acquire);
+    const OcrScaleTier ocrTier =
+        SecureCastFilter::ocr_effective_tier(policyTier, ov);
+
+    // tier 전환 감지 → trackerMgr.clear() (이전 tier 박스의 좌표계 불일치 차단)
+    const OcrScaleTier prevTier =
+        filter->lastEffectiveTier_.exchange(ocrTier, std::memory_order_acq_rel);
+    if (prevTier != ocrTier) {
+      filter->trackerMgr.clear();
+      blog(LOG_INFO,
+           "[SC-ocr] tier transition %d->%d -> trackerMgr cleared",
+           static_cast<int>(prevTier), static_cast<int>(ocrTier));
+    }
+#else
+    constexpr OcrScaleTier ocrTier = OcrScaleTier::Full;
+#endif
+
+    // OCR 슬롯 claim. exchange(false): 이전 값이 true(idle)면 claim 성공.
+    const bool claimedOcr =
+        filter->ocrWorkerRunning.load(std::memory_order_acquire) &&
+        filter->ocrWorkerIdle.exchange(false, std::memory_order_acq_rel);
+    if (claimedOcr) {
+      filter->lastSubmittedOcrFrameId.store(analysisSlot->frameId,
+                                            std::memory_order_relaxed);
+      // analysisSlot은 방금 제출 예정이므로 자신을 대표 ID로 설정.
+      // OCR readback이 실패해도 dependentOcrFrameId가 살아있으면 render는
+      // last-safe로 freeze. 새 PII가 무방비로 송출되는 일은 없음.
+      const_cast<FrameRingBuffer::Slot *>(analysisSlot)->dependentOcrFrameId =
+          analysisSlot->frameId;
     }
 
     std::vector<uint8_t> bgraPixels;
@@ -1915,92 +2213,93 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
       }
     }
 
-    // --- [좌표계 동기화] use1GPath 활성 여부 사전 판별 ---
-    // 트래커 gray 제출 전에 결정해야 트래커와 OCR이 동일 해상도 공간을 공유함.
-    // ⚠️ 1080p(1920px)에서는 절반(960×540)이 OCR 인식 한계 이하이므로
-    //    2K(2560×1440) 이상에서만 활성화. 1080p는 full-res OCR 사용.
-#ifdef _WIN32
-    const bool use1GPath =
-        (w >= 2560 && h >= 1440) && filter->trackerGrayEffect_;
-#else
-    constexpr bool use1GPath = false;
-#endif
-
+    // tier별 트래커 입력 + 워커용 trackerGray 준비.
+    //   Half(≥1440p): 트래커도 half 공간. trackerCoordScale_=2.0f.
+    //   TwoThirds(1080p) / Full: 트래커는 원본 공간. trackerCoordScale_=1.0f.
+    // copy 먼저, swap 나중 — swap 후 빈 벡터 복사를 방지.
+    std::vector<uint8_t> trackerGrayForWorker;
+    int trkW = 0, trkH = 0;
     if (grayOk) {
-      // [좌표계 동기화] use1GPath 시: 트래커도 half-res 공간에서 추적해야
-      // OCR이 넘겨준 박스 좌표(half-res)와 공간이 일치한다.
-      // trackerCoordScale_=2.0f로 저장해두어 렌더 시 원본 해상도로 복원.
-      if (use1GPath) {
+      if (ocrTier == OcrScaleTier::Half) {
         std::vector<uint8_t> halfGray;
         int hw = 0, hh = 0;
         VisualTrackerManager::downsample_2x_into(grayPixels.data(), (int)w,
                                                  (int)h, halfGray, hw, hh);
+        if (claimedOcr)
+          trackerGrayForWorker = halfGray; // [1] copy 먼저
         filter->trackerCoordScale_ = 2.0f;
-        std::lock_guard<std::mutex> lock(filter->trackerInputMutex_);
-        filter->trackerInputGray_.swap(halfGray);
-        filter->trackerInputW_ = hw;
-        filter->trackerInputH_ = hh;
-        filter->trackerInputReady_ = true;
+        {
+          std::lock_guard<std::mutex> lock(filter->trackerInputMutex_);
+          filter->trackerInputGray_.swap(halfGray); // [2] swap 나중
+          filter->trackerInputW_ = hw;
+          filter->trackerInputH_ = hh;
+          filter->trackerInputReady_ = true;
+        }
+        trkW = hw;
+        trkH = hh;
       } else {
-        // full-res 모드: 스케일 복원 불필요
+        if (claimedOcr)
+          trackerGrayForWorker = grayPixels; // [1] copy 먼저
         filter->trackerCoordScale_ = 1.0f;
-        std::lock_guard<std::mutex> lock(filter->trackerInputMutex_);
-        filter->trackerInputGray_.swap(grayPixels);
-        filter->trackerInputW_ = (int)w;
-        filter->trackerInputH_ = (int)h;
-        filter->trackerInputReady_ = true;
+        {
+          std::lock_guard<std::mutex> lock(filter->trackerInputMutex_);
+          filter->trackerInputGray_.swap(grayPixels); // [2] swap 나중
+          filter->trackerInputW_ = (int)w;
+          filter->trackerInputH_ = (int)h;
+          filter->trackerInputReady_ = true;
+        }
+        trkW = (int)w;
+        trkH = (int)h;
       }
       filter->trackerInputCv_.notify_one();
     }
 
-    // OCR 제출: ocrIdle일 때만 (~4fps)
-    // 1-G: 1280px+ → GPU 2× 다운샘플 readback으로 속도 최적화.
-    //      트래커도 동일 half-res 공간을 사용하므로 좌표계 불일치 없음.
-    if (ocrCanSubmit) {
+    // OCR 픽셀 확보 → submit_ocr_frame.
+    if (claimedOcr) {
       std::vector<uint8_t> ocrPixels;
-      int ocrW = static_cast<int>(w), ocrH = static_cast<int>(h), ocrStride = 0;
-      bool ocrSubmit = false;
+      int ocrW = static_cast<int>(w), ocrH = static_cast<int>(h),
+          ocrStride = 0;
+      bool ocrSubmitted = false;
 
 #ifdef _WIN32
-      if (use1GPath) {
-        // 1-G: GPU BGRADownsample2x → half-size BGRA readback
-        if (read_texture_bgra_half_gpu(filter, analysisTex, w, h, ocrPixels,
-                                       ocrStride)) {
-          ocrW = static_cast<int>(filter->ocrDownW_);
-          ocrH = static_cast<int>(filter->ocrDownH_);
-          ocrSubmit = true;
+      if (ocrTier != OcrScaleTier::Full) {
+        uint32_t outDw = 0, outDh = 0;
+        if (read_texture_bgra_scaled_gpu(filter, analysisTex, w, h, ocrTier,
+                                         ocrPixels, ocrStride, &outDw,
+                                         &outDh)) {
+          ocrW = static_cast<int>(outDw);
+          ocrH = static_cast<int>(outDh);
+          ocrSubmitted = true;
         }
       }
 #endif
-      if (!ocrSubmit) {
-        // 폴백: 전체 BGRA readback (use1GPath 미활성 또는 GPU 다운스케일 실패)
+      if (!ocrSubmitted) {
+        // Full tier 또는 scaled readback 실패: 풀해상도 BGRA로 제출.
         if (!bgraPixels.empty()) {
           ocrPixels = bgraPixels;
           ocrStride = static_cast<int>(w) * 4;
-          ocrSubmit = true;
+          ocrSubmitted = true;
         } else if (read_texture_bgra_to_cpu(filter, analysisTex, w, h,
                                             ocrPixels, ocrStride)) {
-          ocrSubmit = true;
+          ocrSubmitted = true;
         }
       }
 
-      if (ocrSubmit) {
-        // markAnalysisSubmitted 호출 삭제됨
+      if (ocrSubmitted) {
         submit_ocr_frame(filter, std::move(ocrPixels), ocrW, ocrH, ocrStride,
-                         analysisSlot->frameId);
-
+                         analysisSlot->frameId,
+                         std::move(trackerGrayForWorker), trkW, trkH, ocrTier);
         if (++filter->trackerLogCounter >= 150) {
           filter->trackerLogCounter = 0;
           blog(LOG_INFO, "[SC-tracker] active=%zu",
                filter->trackerMgr.active_boxes().size());
         }
       } else {
+        // 본 pass가 claim 했지만 픽셀 확보 실패 → idle 복원 (다음 pass가 시도).
         filter->ocrWorkerIdle.store(true, std::memory_order_release);
       }
-    } else if (ocrIdle && !grayOk) {
-      // gray도 실패, OCR도 건너뜀 → ocrIdle 복원
-      filter->ocrWorkerIdle.store(true, std::memory_order_release);
     }
+    // claimedOcr==false인 경우: 워커가 점유 중이므로 idle 슬롯을 건드리지 않음.
   }
 
   // --- Step 5b: 분석 완료 프레임만 그리기 ---
@@ -2078,8 +2377,9 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
   }
 #endif
   // OCR 박스 — Visual Tracker가 제공하는 NCC 추적 위치
-  // [좌표계 동기화] use1GPath 모드에서는 트래커가 half-res 공간에서 추적하므로
+  // [좌표계 동기화] Half tier 모드에서는 트래커가 half-res 공간에서 추적하므로
   // trackerCoordScale_(=2.0f)를 곱해 원본 해상도로 좌표를 복원한다.
+  // TwoThirds tier는 워커에서 미리 원본 좌표로 올렸으므로 tScale=1.0f.
   {
     const float tScale = filter->trackerCoordScale_;
     const auto trackerBoxes = filter->trackerMgr.active_boxes();

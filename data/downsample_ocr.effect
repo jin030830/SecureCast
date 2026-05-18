@@ -1,0 +1,151 @@
+// =============================================================================
+// downsample_ocr.effect — OCR 전용 고품질 다운스케일 셰이더
+//
+// 목적:
+//   1080p/1440p 입력을 1280×720으로 줄여 OCR에 넘길 때 한국어 가는 획이
+//   살아남도록 Mitchell-Netravali bicubic(B=C=1/3) + 약한 USM 샤프닝을 적용.
+//
+// 사용 패턴:
+//   pass1 (BGRADownsampleMitchell): srcTex(원본) → midRender (목표 크기)
+//     - uniform src_texel_size = (1/srcW, 1/srcH)
+//   pass2 (BGRAUnsharp3x3): midRender → dstRender (목표 크기, 동일)
+//     - uniform mid_texel_size = (1/midW, 1/midH)
+//     - uniform usm_amount     = ~0.5
+//
+// 주의:
+//   - pointSampler + SampleLevel(..., 0) 으로 mip 보간을 차단.
+//   - Mitchell-Netravali B=C=1/3은 ringing 최소 + 가는 획 보존 균형이 좋음.
+// =============================================================================
+
+uniform float4x4 ViewProj;
+uniform texture2d image;
+uniform float4 uv_bounds;       // {left, top, right, bottom} 정규화 좌표
+
+// pass1(Mitchell): source 텍셀 크기 (1/srcW, 1/srcH)
+uniform float2 src_texel_size;
+
+// pass2(USM): mid 텍셀 크기 (1/midW, 1/midH). 출력은 동일 크기이므로 dst==mid.
+uniform float2 mid_texel_size;
+
+// USM 강도. 0.0 = 패스스루, 0.5 = 가벼운 샤프닝 (기본값).
+uniform float usm_amount;
+
+sampler_state pointSampler {
+    Filter   = Point;
+    AddressU = Clamp;
+    AddressV = Clamp;
+};
+
+struct VertData {
+    float4 pos : POSITION;
+    float2 uv  : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v) {
+    v.pos = mul(float4(v.pos.xyz, 1.0), ViewProj);
+    v.uv  = uv_bounds.xy + v.uv * (uv_bounds.zw - uv_bounds.xy);
+    return v;
+}
+
+// Mitchell-Netravali B=C=1/3 가중치.
+// |x| < 1 :  ( 7|x|^3 - 12|x|^2 + 16/3) / 6
+// 1<=|x|<2:  (-7/3|x|^3 + 12|x|^2 - 20|x| + 32/3) / 6
+// |x| >= 2:  0
+float mitchell_w(float x) {
+    float ax  = abs(x);
+    float ax2 = ax * ax;
+    float ax3 = ax2 * ax;
+    float inner = (7.0 * ax3 - 12.0 * ax2 + 16.0 / 3.0) / 6.0;
+    float outer = (-7.0 / 3.0 * ax3 + 12.0 * ax2 - 20.0 * ax + 32.0 / 3.0) / 6.0;
+    return (ax < 1.0) ? inner : ((ax < 2.0) ? outer : 0.0);
+}
+
+// 16-tap Mitchell-Netravali bicubic downsample.
+// dst의 v.uv를 source UV로 변환하여 srcFloor 주변 4×4 명시 샘플.
+float4 PSMitchell(VertData v) : TARGET {
+    // dst v.uv → source pixel coordinate (center 기준)
+    float2 srcPos   = v.uv / src_texel_size - 0.5;
+    float2 srcFloor = floor(srcPos);
+    float2 t        = srcPos - srcFloor;
+
+    float wx0 = mitchell_w(-1.0 - t.x);
+    float wx1 = mitchell_w( 0.0 - t.x);
+    float wx2 = mitchell_w( 1.0 - t.x);
+    float wx3 = mitchell_w( 2.0 - t.x);
+
+    float wy0 = mitchell_w(-1.0 - t.y);
+    float wy1 = mitchell_w( 0.0 - t.y);
+    float wy2 = mitchell_w( 1.0 - t.y);
+    float wy3 = mitchell_w( 2.0 - t.y);
+
+    // 위상별 가중치 합 보정(Mitchell은 partition-of-unity 아님)
+    float wxSum = wx0 + wx1 + wx2 + wx3;
+    float wySum = wy0 + wy1 + wy2 + wy3;
+    float norm  = max(wxSum * wySum, 1e-5);
+
+    // 4×4 = 16 tap 명시 샘플. SampleLevel(..., 0) 으로 mip 차단.
+    float2 base = (srcFloor + 0.5) * src_texel_size;
+    float2 dx   = float2(src_texel_size.x, 0.0);
+    float2 dy   = float2(0.0, src_texel_size.y);
+
+    float4 r0 =
+        wx0 * image.SampleLevel(pointSampler, base + (-1.0)*dx + (-1.0)*dy, 0.0) +
+        wx1 * image.SampleLevel(pointSampler, base +   0.0 *dx + (-1.0)*dy, 0.0) +
+        wx2 * image.SampleLevel(pointSampler, base +   1.0 *dx + (-1.0)*dy, 0.0) +
+        wx3 * image.SampleLevel(pointSampler, base +   2.0 *dx + (-1.0)*dy, 0.0);
+    float4 r1 =
+        wx0 * image.SampleLevel(pointSampler, base + (-1.0)*dx +   0.0 *dy, 0.0) +
+        wx1 * image.SampleLevel(pointSampler, base +   0.0 *dx +   0.0 *dy, 0.0) +
+        wx2 * image.SampleLevel(pointSampler, base +   1.0 *dx +   0.0 *dy, 0.0) +
+        wx3 * image.SampleLevel(pointSampler, base +   2.0 *dx +   0.0 *dy, 0.0);
+    float4 r2 =
+        wx0 * image.SampleLevel(pointSampler, base + (-1.0)*dx +   1.0 *dy, 0.0) +
+        wx1 * image.SampleLevel(pointSampler, base +   0.0 *dx +   1.0 *dy, 0.0) +
+        wx2 * image.SampleLevel(pointSampler, base +   1.0 *dx +   1.0 *dy, 0.0) +
+        wx3 * image.SampleLevel(pointSampler, base +   2.0 *dx +   1.0 *dy, 0.0);
+    float4 r3 =
+        wx0 * image.SampleLevel(pointSampler, base + (-1.0)*dx +   2.0 *dy, 0.0) +
+        wx1 * image.SampleLevel(pointSampler, base +   0.0 *dx +   2.0 *dy, 0.0) +
+        wx2 * image.SampleLevel(pointSampler, base +   1.0 *dx +   2.0 *dy, 0.0) +
+        wx3 * image.SampleLevel(pointSampler, base +   2.0 *dx +   2.0 *dy, 0.0);
+
+    float4 sum = wy0 * r0 + wy1 * r1 + wy2 * r2 + wy3 * r3;
+    return clamp(sum / norm, 0.0, 1.0);
+}
+
+// 3×3 unsharp mask: dst = clamp(center + amount * (center - blur), 0, 1).
+// 가벼운 블러 보정으로 한국어 획 대비 회복.
+float4 PSUnsharp(VertData v) : TARGET {
+    float4 center = image.SampleLevel(pointSampler, v.uv, 0.0);
+
+    float2 dx = float2(mid_texel_size.x, 0.0);
+    float2 dy = float2(0.0, mid_texel_size.y);
+
+    float4 sum =
+        image.SampleLevel(pointSampler, v.uv + (-1.0)*dx + (-1.0)*dy, 0.0) +
+        image.SampleLevel(pointSampler, v.uv +   0.0 *dx + (-1.0)*dy, 0.0) +
+        image.SampleLevel(pointSampler, v.uv +   1.0 *dx + (-1.0)*dy, 0.0) +
+        image.SampleLevel(pointSampler, v.uv + (-1.0)*dx +   0.0 *dy, 0.0) +
+        center +
+        image.SampleLevel(pointSampler, v.uv +   1.0 *dx +   0.0 *dy, 0.0) +
+        image.SampleLevel(pointSampler, v.uv + (-1.0)*dx +   1.0 *dy, 0.0) +
+        image.SampleLevel(pointSampler, v.uv +   0.0 *dx +   1.0 *dy, 0.0) +
+        image.SampleLevel(pointSampler, v.uv +   1.0 *dx +   1.0 *dy, 0.0);
+
+    float4 blur = sum / 9.0;
+    return clamp(center + usm_amount * (center - blur), 0.0, 1.0);
+}
+
+technique BGRADownsampleMitchell {
+    pass {
+        vertex_shader = VSDefault(v);
+        pixel_shader  = PSMitchell(v);
+    }
+}
+
+technique BGRAUnsharp3x3 {
+    pass {
+        vertex_shader = VSDefault(v);
+        pixel_shader  = PSUnsharp(v);
+    }
+}

@@ -17,8 +17,10 @@
 // ----------------------------------------------------
 // C++ Standard Library Headers (MUST be included before OBS headers)
 // ----------------------------------------------------
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <mutex>
@@ -68,6 +70,31 @@ constexpr int SC_MAX_BLUR_RECTS =
     32; // 한 프레임에 동시에 마스킹 가능한 최대 영역 수
 constexpr int SC_RING_BUFFER_SLOTS =
     60; // Bounded Exposure: OCR 최대 레이턴시(≈1000ms) 대비 여유 확보를 위해 60슬롯으로 증가 (1초 지연)
+
+// ----------------------------------------------------
+// OCR 다운스케일 정책 tier
+//
+// 입력 해상도에 따라 OCR 워커에 넘기는 BGRA 크기를 결정한다.
+//   Full       : 원본 그대로 (≤1080p 기본 또는 셀프힐링 강등 시)
+//   TwoThirds  : 1080p에서 1280×720 (0.667×) — Mitchell+USM 셰이더
+//   Half       : 1440p+에서 절반 (0.5×) — 기존 bilinear 다운샘플
+//
+// enum 값이 작을수록 OCR 입력 해상도가 크다 = 더 안전한 인식.
+// ocr_effective_tier()는 policy와 override 중 더 안전한 쪽(값이 작은 쪽)을
+// 선택한다.
+// ----------------------------------------------------
+enum class OcrScaleTier : int8_t { Full = 0, TwoThirds = 1, Half = 2 };
+
+// 셀프힐링 override.
+//   Auto(-1)   : override 없음 → policy 그대로 사용
+//   Full/TwoThirds/Half : policy를 무시하고 이 값과 policy 중 더 안전한 쪽을
+//                        선택 (`ocr_effective_tier()` 참조).
+enum class OcrTierOverride : int8_t {
+  Auto = -1,
+  Full = 0,
+  TwoThirds = 1,
+  Half = 2,
+};
 
 // ----------------------------------------------------
 // Shared Types (Types) - Moved to securecast-types.h
@@ -385,6 +412,12 @@ struct SecureCastFilter {
   uint32_t ocrDownW_ = 0;
   uint32_t ocrDownH_ = 0;
 
+  // OCR 전용 Mitchell+USM 다운스케일 셰이더 + 중간 텍스처.
+  // 1080p TwoThirds(1280×720) 및 1440p Half 경로에서 사용.
+  // 미로드 시 compute_policy()가 Full 반환으로 안전 폴백.
+  gs_effect_t *ocrDownsampleEffect_ = nullptr;
+  gs_texrender_t *ocrMidRender_ = nullptr; // pass1(Mitchell) → pass2(USM) 입력
+
   // ----- [Role B] Async OCR worker 상태 -----
   // OCR은 RecognizeAsync(...).get()으로 블로킹될 수 있으므로 video_render에서
   // 직접 실행하지 않는다.
@@ -401,6 +434,18 @@ struct SecureCastFilter {
   int ocrPendingWidth = 0;
   int ocrPendingHeight = 0;
   int ocrPendingStride = 0;
+
+  // OCR 워커 큐에 함께 실리는 트래커 등록용 데이터.
+  // 1080p TwoThirds: ocrPendingPixels는 1280×720 BGRA, trackerGray는 원본
+  //                  1920×1080 gray (좌표계 분리, 추가 readback 없음).
+  // 1440p Half: ocrPendingPixels는 1280×720 BGRA, trackerGray는 half 1280×720.
+  // Full: ocrPendingPixels는 원본 BGRA, trackerGray는 원본 gray.
+  // ocrWorkerMutex로 ocrPendingPixels 등과 함께 한 lock으로 push/pop된다.
+  std::vector<uint8_t> ocrPendingTrackerGray;
+  int ocrPendingTrackerW = 0;
+  int ocrPendingTrackerH = 0;
+  OcrScaleTier ocrPendingTier = OcrScaleTier::Full;
+  std::chrono::steady_clock::time_point ocrPendingEnqueueTs;
 
   // back-pressure: idle이면 즉시 새 프레임 수용, busy면 GPU readback 건너뜀
   std::atomic<bool> ocrWorkerIdle{true};
@@ -442,6 +487,52 @@ struct SecureCastFilter {
   // use1GPath(OCR 절반 크기 제출)가 활성화된 경우, 트래커도 절반 해상도
   // 공간에서 추적하므로 렌더 시 박스 좌표를 trackerCoordScale_ 배율로
   // 원본 해상도로 복원해야 한다.
-  // 1.0f = full-res 모드(기본), 2.0f = half-res OCR 최적화 모드.
+  // 1.0f = full-res 모드(기본 / TwoThirds 트래커는 원본 공간 추적),
+  // 2.0f = half-res OCR 최적화 모드.
   float trackerCoordScale_ = 1.0f;
+
+  // ----- [OCR 다운스케일 tier + 셀프힐링] -----
+  // policyTier : 해상도에서 결정되는 기본 정책 (compute_policy 결과).
+  // overrideTier: 셀프힐링이 정책 위에 강제하는 안전 모드.
+  //               Auto면 policy 그대로 사용. 그 외엔 policy와 min() 비교로
+  //               더 안전한(더 큰 OCR 입력 해상도 = enum 값 작은) 쪽 채택.
+  // zeroLineStreak: full OCR에서 effectiveLineCount==0이 연속된 사이클 수.
+  // lastEscalateMs: 마지막 셀프힐링 발동 시각 (60초 후 자동 완화).
+  std::atomic<OcrScaleTier> ocrPolicyTier_{OcrScaleTier::Full};
+  std::atomic<OcrTierOverride> ocrOverrideTier_{OcrTierOverride::Auto};
+  std::atomic<int> ocrZeroLineStreak_{0};
+  std::atomic<int64_t> ocrLastEscalateMs_{0};
+  // tier 전환 감지용 — 변경 시 trackerMgr.clear() 호출.
+  std::atomic<OcrScaleTier> lastEffectiveTier_{OcrScaleTier::Full};
+
+  // OCR 처리시간 누적 진단 로그용 (Step 9).
+  double ocrEnqueueLatencyAccumMs_ = 0.0;
+  int ocrEnqueueLatencyCount_ = 0;
+
+  // ----- [OCR tier 헬퍼] -----
+  static constexpr float ocr_scale_ratio(OcrScaleTier t) {
+    return (t == OcrScaleTier::Half)        ? 0.5f
+           : (t == OcrScaleTier::TwoThirds) ? (2.0f / 3.0f)
+                                            : 1.0f;
+  }
+  static OcrScaleTier ocr_effective_tier(OcrScaleTier policy,
+                                         OcrTierOverride ov) {
+    if (ov == OcrTierOverride::Auto)
+      return policy;
+    int a = static_cast<int>(policy);
+    int b = static_cast<int>(ov);
+    // 값이 작을수록 안전(다운스케일 약함). 둘 중 더 안전한 쪽 선택.
+    return static_cast<OcrScaleTier>(std::min(a, b));
+  }
+  // override를 policy 방향으로 한 단계 완화. policy 이상에 도달하면 Auto로
+  // 전환. (+1 방향이 "덜 보수적": Full(0)→TwoThirds(1)→Half(2)→Auto(-1))
+  static OcrTierOverride relax_override(OcrTierOverride ov,
+                                        OcrScaleTier policy) {
+    if (ov == OcrTierOverride::Auto)
+      return ov;
+    int next = static_cast<int>(ov) + 1;
+    if (next >= static_cast<int>(policy))
+      return OcrTierOverride::Auto;
+    return static_cast<OcrTierOverride>(next);
+  }
 };

@@ -31,6 +31,21 @@ struct SecureCastOcrLine {
   float h;
 };
 
+// analyze_bgra_frame()의 확장 반환 — 셀프힐링용 진단 정보 포함.
+// fullRecognitionRan==true 일 때만 effectiveLineCount==0 판정으로 셀프힐링
+// 에스컬레이션이 발동한다 (L1/L2 캐시 히트 경로의 오발동 차단).
+struct OcrAnalysisResult {
+  std::vector<SecureCastOcrBox> boxes; // PII로 매칭된 박스만
+  // 이번 결과의 effective text lines:
+  //   full OCR  → recognize_text() 결과 라인 수
+  //   L2 partial → cached + 새로 인식한 라인 수 합
+  //   L1 hit    → 캐시 라인 수 (변경 없음)
+  int effectiveLineCount = 0;
+  // **full-frame** recognize_text()가 실제로 실행되었을 때만 true.
+  // L2 partial(crop OCR)이나 L1 hit(완전 캐시)에서는 false.
+  bool fullRecognitionRan = false;
+};
+
 struct ProfileEMA {
   double bgra_ms = 0, recog_ms = 0, multipass_ms = 0;
   double dhash_ms = 0, detect_ms = 0, total_ms = 0;
@@ -86,8 +101,8 @@ public:
   // video_render thread에서 직접 동기 호출하면 프레임 드랍이 발생할 수 있다.
   // render thread가 아니라 별도 OCR worker thread에서 호출해야 한다.
   // ========================================================
-  std::vector<SecureCastOcrBox>
-  analyze_bgra_frame(const uint8_t *pixels, int width, int height, int stride);
+  OcrAnalysisResult analyze_bgra_frame(const uint8_t *pixels, int width,
+                                       int height, int stride);
 
 private:
   struct Impl;

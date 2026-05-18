@@ -188,7 +188,7 @@ bool SecureCastOcrEngine::available() const { return available_; }
 // 현재 구현: FNV-1a 전체 픽셀 해시 기반 Dirty Skip
 // ============================================================
 
-std::vector<SecureCastOcrBox>
+OcrAnalysisResult
 SecureCastOcrEngine::analyze_bgra_frame(const uint8_t *pixels, int width,
                                         int height, int stride) {
   FrameTimer frame_timer(&profile_);
@@ -202,11 +202,13 @@ SecureCastOcrEngine::analyze_bgra_frame(const uint8_t *pixels, int width,
   const bool sameRes =
       impl_->lastFrameWidth == width && impl_->lastFrameHeight == height;
 
-  // 해상도 변경 시 모든 캐시 상태 초기화
+  // 해상도/스케일 tier 변경 시 모든 캐시 상태 초기화.
+  // dHash 64-bit perceptual hash는 좌표계가 바뀌면 의미 없는 값과 비교되어
+  // 우연히 hamming≤2로 L1 hit이 나면 셀프힐링이 발동조차 못한다.
+  // avgLineHeight_도 구 해상도 기준이라 다음 사이클 adaptScale을 오염시킨다.
   if (!sameRes) {
-    lastLineDhashes_.clear();
-    hasLastRoiDhash_ = false;
-    consecutiveSkips_ = 0;
+    clearDHashCache();
+    avgLineHeight_ = 0.0f;
   }
 
   // ── L1: ROI dHash ─────────────────────────────────────────────
@@ -215,8 +217,13 @@ SecureCastOcrEngine::analyze_bgra_frame(const uint8_t *pixels, int width,
   if (sameRes && hasLastRoiDhash_) {
     const uint64_t roiHash = compute_roi_dhash(pixels, stride, width, height);
     if (hamming_distance(roiHash, lastRoiDhash_) <= 2) {
-      if (++consecutiveSkips_ < kMaxConsecutiveSkips)
-        return lastBoxes_; // L1 hit
+      if (++consecutiveSkips_ < kMaxConsecutiveSkips) {
+        OcrAnalysisResult res;
+        res.boxes = lastBoxes_;
+        res.effectiveLineCount = static_cast<int>(lastLineDhashes_.size());
+        res.fullRecognitionRan = false;
+        return res; // L1 hit
+      }
       // kMaxConsecutiveSkips 연속 히트: 새 텍스트 발견용 주기적 full OCR
     }
   }
@@ -288,7 +295,12 @@ SecureCastOcrEngine::analyze_bgra_frame(const uint8_t *pixels, int width,
       lastBoxes_ = merged;
       // L2 hit이지만 부분 OCR을 실제로 실행했으므로 L1 skip 카운터는 리셋한다.
       consecutiveSkips_ = 0;
-      return merged; // L2 hit (partial)
+      OcrAnalysisResult res;
+      res.boxes = std::move(merged);
+      // cached + 새로 인식한 라인 합. crop OCR이 0줄 반환해도 cached로 보호 중.
+      res.effectiveLineCount = static_cast<int>(allLines.size());
+      res.fullRecognitionRan = false;
+      return res; // L2 hit (partial)
     }
     // 모든 라인 불변이지만 L1 실패 → ROI 외부에 새 텍스트 가능 → full OCR
   }
@@ -344,7 +356,11 @@ SecureCastOcrEngine::analyze_bgra_frame(const uint8_t *pixels, int width,
     lastLineDhashes_.push_back(lc);
   }
 
-  return boxes;
+  OcrAnalysisResult res;
+  res.boxes = std::move(boxes);
+  res.effectiveLineCount = static_cast<int>(lines.size());
+  res.fullRecognitionRan = true;
+  return res;
 }
 
 // ============================================================
