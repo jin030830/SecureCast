@@ -322,9 +322,9 @@ struct SecureCastFilter {
   // OBS 소스 프리뷰에서 좌클릭 드래그로 영역 지정 → 영구 블러.
   // 우클릭 또는 Properties의 "Clear" 버튼으로 전체 초기화.
   // settingsMutex로 UI 스레드(mouse 콜백) ↔ Render 스레드(video_render) 보호.
+  // sc_manual_rects 키로 OBS 씬 컬렉션에 자동 저장/로드됨.
   static constexpr int SC_MAX_MANUAL_RECTS = 8;
-  BlurRect manualRects[SC_MAX_MANUAL_RECTS]{};
-  int manualRectCount = 0;
+  MaskPayload manualBlurMask{};
 
   bool dragActive = false; // 드래그 진행 중
   int32_t dragStartX = 0;

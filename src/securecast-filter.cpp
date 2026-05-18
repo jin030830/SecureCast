@@ -58,6 +58,9 @@ SecureCastFilter::~SecureCastFilter() = default;
 // trackerAccumulator에 이 값을 대입하면 다음 sc_tracker_tick 호출 시 임계를
 // 즉시 초과 → 강제 스캔 트리거.
 
+// forward declaration — 정의는 Properties/Settings 섹션에 있음
+static void save_manual_rects(SecureCastFilter *filter, const MaskPayload &mask);
+
 static constexpr float SCAN_INTERVAL_FORCE = 1.0f;
 static constexpr float SCAN_INTERVAL_NORMAL = 0.15f; // 일반 모드 스캔 주기
 static constexpr float SCAN_INTERVAL_GAME = 0.5f;    // 게임 모드 스캔 주기
@@ -1242,10 +1245,14 @@ static void *securecast_create(obs_data_t *settings, obs_source_t *context) {
             rect.y = (int)((float)(rect.y - monT) / monH * srcH);
             rect.width = (int)((float)rect.width / monW * srcW);
             rect.height = (int)((float)rect.height / monH * srcH);
-            std::lock_guard<std::mutex> lock(f->settingsMutex);
-            // 새 드래그 시 기존 수동 블러 교체 (누적 아님)
-            f->manualRectCount = 0;
-            f->manualRects[f->manualRectCount++] = rect;
+            MaskPayload snapshot{};
+            {
+              std::lock_guard<std::mutex> lock(f->settingsMutex);
+              f->manualBlurMask.rectCount = 0;
+              f->manualBlurMask.rects[f->manualBlurMask.rectCount++] = rect;
+              snapshot = f->manualBlurMask;
+            }
+            save_manual_rects(f, snapshot);
             blog(LOG_INFO,
                  "[SecureCast][D] Manual rect replaced. scaled=(%d,%d %dx%d)",
                  rect.x, rect.y, rect.width, rect.height);
@@ -1576,7 +1583,7 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
     std::lock_guard<std::mutex> lock(filter->settingsMutex);
     // [Role D] 수동/알림 블러 활성도 PARTIAL 판정에 포함
     bool manualOrNotifActive =
-        filter->manualRectCount > 0 || filter->notifBlurActive;
+        filter->manualBlurMask.rectCount > 0 || filter->notifBlurActive;
     if (filter->health.isCritical() ||
         filter->ocrIsDown.load(std::memory_order_acquire)) {
       filter->currentState = SecurityState::RISK;
@@ -1884,10 +1891,10 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
   {
     std::lock_guard<std::mutex> lock(filter->settingsMutex);
     for (int i = 0;
-         i < filter->manualRectCount &&
+         i < filter->manualBlurMask.rectCount &&
          all_count < (int)(sizeof(all_rects) / sizeof(all_rects[0]));
          i++) {
-      all_rects[all_count++] = filter->manualRects[i];
+      all_rects[all_count++] = filter->manualBlurMask.rects[i];
     }
     if (filter->dragActive) {
       int px = std::min(filter->dragStartX, filter->dragCurX);
@@ -2235,11 +2242,39 @@ static void securecast_video_tick(void *data, float seconds) {
 #define SC_SETTING_BLUR_INTENSITY "sc_blur_intensity"
 // #define SC_SETTING_GAME_MODE   "sc_game_mode"  // [v2] 게임 모드 — 현재 스코프 외
 #define SC_SETTING_SENSITIVITY    "sc_sensitivity"
+#define SC_SETTING_MANUAL_RECTS   "sc_manual_rects"
+
+// manualBlurMask → obs_data_array 직렬화 후 source settings에 write-back.
+// settingsMutex 밖에서 호출해야 함 — obs_source_get_settings가 OBS 내부 락을 잡을 수 있음.
+// mask는 락 안에서 복사한 스냅샷을 전달한다.
+static void save_manual_rects(SecureCastFilter* filter, const MaskPayload& mask)
+{
+    obs_data_array_t* arr = obs_data_array_create();
+    for (int i = 0; i < mask.rectCount; ++i) {
+        const BlurRect& r = mask.rects[i];
+        obs_data_t* item = obs_data_create();
+        obs_data_set_int(item, "x",      r.x);
+        obs_data_set_int(item, "y",      r.y);
+        obs_data_set_int(item, "width",  r.width);
+        obs_data_set_int(item, "height", r.height);
+        obs_data_set_int(item, "type",   r.type);
+        obs_data_array_push_back(arr, item);
+        obs_data_release(item);
+    }
+    obs_data_t* settings = obs_source_get_settings(filter->context);
+    obs_data_set_array(settings, SC_SETTING_MANUAL_RECTS, arr);
+    obs_data_release(settings);
+    obs_data_array_release(arr);
+}
 
 static void securecast_get_defaults(obs_data_t *settings) {
   obs_data_set_default_string(settings, SC_SETTING_BLACKLIST, "");
   obs_data_set_default_double(settings, SC_SETTING_BLUR_INTENSITY, 5.0);
   obs_data_set_default_double(settings, SC_SETTING_SENSITIVITY, 0.5);
+
+  obs_data_array_t *emptyArr = obs_data_array_create();
+  obs_data_set_default_array(settings, SC_SETTING_MANUAL_RECTS, emptyArr);
+  obs_data_array_release(emptyArr);
 }
 
 static obs_properties_t *securecast_get_properties(void *data) {
@@ -2257,9 +2292,14 @@ static obs_properties_t *securecast_get_properties(void *data) {
       props, "sc_clear_manual", "Clear Manual Blurs",
       [](obs_properties_t *, obs_property_t *, void *btn_data) -> bool {
         auto *filter = static_cast<SecureCastFilter *>(btn_data);
-        std::lock_guard<std::mutex> lock(filter->settingsMutex);
-        filter->manualRectCount = 0;
-        filter->dragActive = false;
+        MaskPayload snapshot{};
+        {
+          std::lock_guard<std::mutex> lock(filter->settingsMutex);
+          filter->manualBlurMask.rectCount = 0;
+          filter->dragActive = false;
+          snapshot = filter->manualBlurMask;
+        }
+        save_manual_rects(filter, snapshot);
         blog(LOG_INFO,
              "[SecureCast][D] Manual blur rects cleared (Properties button).");
         return true;
@@ -2285,6 +2325,28 @@ static void securecast_update(void *data, obs_data_t *settings) {
        "[SecureCast][D] Settings updated — blur=%.1f sensitivity=%.2f",
        filter->blurIntensity, filter->sensitivity);
 
+  // 수동 블러 rect 역직렬화
+  obs_data_array_t *arr = obs_data_get_array(settings, SC_SETTING_MANUAL_RECTS);
+  if (arr) {
+    size_t count = std::min(obs_data_array_count(arr),
+                            (size_t)SecureCastFilter::SC_MAX_MANUAL_RECTS);
+    filter->manualBlurMask.rectCount = 0;
+    for (size_t i = 0; i < count; ++i) {
+      obs_data_t *item = obs_data_array_item(arr, i);
+      BlurRect &r =
+          filter->manualBlurMask.rects[filter->manualBlurMask.rectCount++];
+      r.x = (int)obs_data_get_int(item, "x");
+      r.y = (int)obs_data_get_int(item, "y");
+      r.width = (int)obs_data_get_int(item, "width");
+      r.height = (int)obs_data_get_int(item, "height");
+      r.type = (int)obs_data_get_int(item, "type");
+      obs_data_release(item);
+    }
+    obs_data_array_release(arr);
+    blog(LOG_INFO, "[SecureCast][D] Manual rects loaded: %d rect(s).",
+         filter->manualBlurMask.rectCount);
+  }
+
   // 소스/설정 전환 시 dHash 캐시 무효화 요청.
   // clearDHashCache()를 여기서 직접 호출하면 GUI 스레드↔OCR 워커 data race 발생.
   // 플래그만 세우고 워커 스레드가 다음 사이클에 안전하게 처리한다.
@@ -2306,40 +2368,50 @@ static void securecast_mouse_click(void* data,
     int32_t type, bool mouse_up, uint32_t /*click_count*/)
 {
     auto* filter = static_cast<SecureCastFilter*>(data);
-    std::lock_guard<std::mutex> lock(filter->settingsMutex);
 
-    // 우클릭 DOWN: 수동 블러 전체 초기화
-    if (type == MOUSE_RIGHT && !mouse_up) {
-        filter->manualRectCount = 0;
-        filter->dragActive      = false;
-        blog(LOG_INFO, "[SecureCast][D] Manual blur rects cleared (right-click).");
-        return;
-    }
+    MaskPayload snapshot{};
+    bool save = false;
 
-    if (type != MOUSE_LEFT)
-        return;
+    {
+        std::lock_guard<std::mutex> lock(filter->settingsMutex);
 
-    if (!mouse_up) {
-        // 좌클릭 DOWN: 드래그 시작
-        filter->dragActive = true;
-        filter->dragStartX = event->x;
-        filter->dragStartY = event->y;
-        filter->dragCurX   = event->x;
-        filter->dragCurY   = event->y;
-    } else if (filter->dragActive) {
-        // 좌클릭 UP: 드래그 완료 -> BlurRect 확정
-        filter->dragActive = false;
-        int x  = std::min(filter->dragStartX, event->x);
-        int y  = std::min(filter->dragStartY, event->y);
-        int bw = std::abs(event->x - filter->dragStartX);
-        int bh = std::abs(event->y - filter->dragStartY);
-        if (bw > 8 && bh > 8 &&
-            filter->manualRectCount < filter->SC_MAX_MANUAL_RECTS) {
-            filter->manualRects[filter->manualRectCount++] = {x, y, bw, bh, 0};
-            blog(LOG_INFO, "[SecureCast][D] Manual blur added: (%d,%d %dx%d) total=%d",
-                 x, y, bw, bh, filter->manualRectCount);
+        if (type == MOUSE_RIGHT && !mouse_up) {
+            // 우클릭 DOWN: 수동 블러 전체 초기화
+            filter->manualBlurMask.rectCount = 0;
+            filter->dragActive               = false;
+            snapshot = filter->manualBlurMask;
+            save     = true;
+            blog(LOG_INFO, "[SecureCast][D] Manual blur rects cleared (right-click).");
+
+        } else if (type == MOUSE_LEFT) {
+            if (!mouse_up) {
+                // 좌클릭 DOWN: 드래그 시작
+                filter->dragActive = true;
+                filter->dragStartX = event->x;
+                filter->dragStartY = event->y;
+                filter->dragCurX   = event->x;
+                filter->dragCurY   = event->y;
+            } else if (filter->dragActive) {
+                // 좌클릭 UP: 드래그 완료 -> BlurRect 확정
+                filter->dragActive = false;
+                int x  = std::min(filter->dragStartX, event->x);
+                int y  = std::min(filter->dragStartY, event->y);
+                int bw = std::abs(event->x - filter->dragStartX);
+                int bh = std::abs(event->y - filter->dragStartY);
+                if (bw > 8 && bh > 8 &&
+                    filter->manualBlurMask.rectCount < SecureCastFilter::SC_MAX_MANUAL_RECTS) {
+                    filter->manualBlurMask.rects[filter->manualBlurMask.rectCount++] = {x, y, bw, bh, 0};
+                    snapshot = filter->manualBlurMask;
+                    save     = true;
+                    blog(LOG_INFO, "[SecureCast][D] Manual blur added: (%d,%d %dx%d) total=%d",
+                         x, y, bw, bh, filter->manualBlurMask.rectCount);
+                }
+            }
         }
-    }
+    }  // settingsMutex 해제 후 OBS API 호출
+
+    if (save)
+        save_manual_rects(filter, snapshot);
 }
 
 static void securecast_mouse_move(void* data,

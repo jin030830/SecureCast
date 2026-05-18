@@ -26,7 +26,7 @@
 #include "securecast-types.h"  // SecurityState
 
 // WDA_EXCLUDEFROMCAPTURE: Windows 10 2004 (build 19041)+ 에서 지원
-// 구버전에서는 WDA_NONE fallback
+// 구버전에서는 WDA_MONITOR fallback
 #ifndef WDA_EXCLUDEFROMCAPTURE
 #define WDA_EXCLUDEFROMCAPTURE 0x00000011
 #endif
@@ -82,6 +82,9 @@ private:
     // 배지 크기 (픽셀)
     static constexpr int kWidth  = 200;
     static constexpr int kHeight =  48;
+
+    // WDA_EXCLUDEFROMCAPTURE 지원 여부 (create()에서 판단, messageLoop()에서 사용)
+    bool               m_useExcludeFromCapture{false};
 
     // WndProc ↔ messageLoop 초기화 완료 신호
     std::atomic<bool> m_ready{false};

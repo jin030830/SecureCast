@@ -16,6 +16,37 @@
 #include "plugin-support.h"  // blog / LOG_INFO / LOG_WARNING
 
 #include <obs-module.h>      // blog
+#include <winternl.h>        // RTL_OSVERSIONINFOW (RtlGetVersion용)
+
+
+// =============================================================================
+// isExcludeFromCaptureSupported — WDA_EXCLUDEFROMCAPTURE 지원 여부 반환
+//
+// RtlGetVersion으로 실제 빌드 번호를 확인한다.
+// GetVersionEx는 Win 8.1+에서 매니페스트 없이 호출하면 6.2(Win8)를 반환하지만,
+// RtlGetVersion은 매니페스트와 무관하게 실제 버전을 반환한다.
+// WDA_EXCLUDEFROMCAPTURE는 Windows 10 2004 (build 19041) 이상에서만 지원된다.
+// =============================================================================
+static bool isExcludeFromCaptureSupported()
+{
+    typedef LONG (WINAPI *RtlGetVersion_t)(PRTL_OSVERSIONINFOW);
+
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (!ntdll)
+        return false;
+
+    auto fnRtlGetVersion = reinterpret_cast<RtlGetVersion_t>(
+        GetProcAddress(ntdll, "RtlGetVersion"));
+    if (!fnRtlGetVersion)
+        return false;
+
+    RTL_OSVERSIONINFOW vi{};
+    vi.dwOSVersionInfoSize = sizeof(vi);
+    if (fnRtlGetVersion(&vi) != 0 /* STATUS_SUCCESS = 0 */)
+        return false;
+
+    return vi.dwBuildNumber >= 19041;
+}
 
 // ---- 색상 상수 ----
 static constexpr COLORREF kBgColor      = RGB(1, 1, 1);   // 투명 처리용 배경 (colorkey)
@@ -211,18 +242,35 @@ void OverlayWindow::messageLoop()
     }
 
     // --- SetWindowDisplayAffinity: 캡처 소프트웨어에서 보이지 않게 ---
-    // WDA_EXCLUDEFROMCAPTURE(0x11): Windows 10 2004+ 에서 지원.
-    // 구버전(WDA_NONE fallback)에서는 캡처 제외 불가지만 오버레이 자체는 동작함.
-    BOOL affOk = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
-    if (!affOk) {
-        // WDA_MONITOR(1) 로 재시도 (Windows 7+)
-        affOk = SetWindowDisplayAffinity(hwnd, WDA_MONITOR);
-        blog(LOG_INFO,
-             "[SecureCast][D] WDA_EXCLUDEFROMCAPTURE 미지원, WDA_MONITOR fallback: %s",
-             affOk ? "OK" : "FAIL");
-    } else {
-        blog(LOG_INFO,
-             "[SecureCast][D] OverlayWindow created — WDA_EXCLUDEFROMCAPTURE applied.");
+    // 지원 여부는 create()에서 isExcludeFromCaptureSupported()로 판단해 m_useExcludeFromCapture에 저장됨.
+    {
+        BOOL affOk = FALSE;
+
+        if (m_useExcludeFromCapture) {
+            affOk = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
+            if (affOk) {
+                blog(LOG_INFO, "[SecureCast][D] WDA_EXCLUDEFROMCAPTURE 적용.");
+            } else {
+                blog(LOG_WARNING,
+                     "[SecureCast][D] WDA_EXCLUDEFROMCAPTURE 실패 (err=%lu) → WDA_MONITOR 시도.",
+                     GetLastError());
+                affOk = SetWindowDisplayAffinity(hwnd, WDA_MONITOR);
+                if (affOk)
+                    blog(LOG_INFO, "[SecureCast][D] WDA_MONITOR fallback 적용.");
+            }
+        } else {
+            // Windows 10 1909 이하: WDA_MONITOR 직행
+            affOk = SetWindowDisplayAffinity(hwnd, WDA_MONITOR);
+            if (affOk)
+                blog(LOG_INFO, "[SecureCast][D] WDA_MONITOR 적용 (build < 19041).");
+        }
+
+        if (!affOk) {
+            blog(LOG_WARNING,
+                 "[SecureCast][D] 캡처 제외 불가 (err=%lu). "
+                 "오버레이는 동작하지만 방송 화면에 노출될 수 있습니다.",
+                 GetLastError());
+        }
     }
 
     // --- SetLayeredWindowAttributes: colorkey(RGB 1,1,1)를 투명 처리 ---
@@ -252,6 +300,10 @@ bool OverlayWindow::create()
 {
     if (m_running.exchange(true))
         return true;  // 이미 실행 중
+
+    m_useExcludeFromCapture = isExcludeFromCaptureSupported();
+    blog(LOG_INFO, "[SecureCast][D] WDA_EXCLUDEFROMCAPTURE 지원: %s",
+         m_useExcludeFromCapture ? "YES (build >= 19041)" : "NO (build < 19041)");
 
     m_ready.store(false);
 
