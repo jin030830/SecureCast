@@ -15,6 +15,21 @@
 
 cmake_minimum_required(VERSION 3.28...3.30)
 
+# SecureCast는 Windows 전용 플러그인이다.
+# Windows.Media.Ocr(WinRT), DwmGetWindowAttribute(DWM), D3D11/DXGI, SetWinEventHook 등
+# Windows 전용 API에 직접 의존한다. 다른 플랫폼은 지원하지 않는다.
+if(NOT WIN32)
+  message(FATAL_ERROR
+    "SecureCast requires Windows.\n"
+    "The plugin depends on Windows-only APIs:\n"
+    "  - Windows.Media.Ocr  (WinRT OCR engine)\n"
+    "  - DwmGetWindowAttribute  (window tracking)\n"
+    "  - D3D11 / DXGI  (GPU readback)\n"
+    "  - SetWinEventHook  (foreground window events)\n"
+    "Other platforms are not supported in V1."
+  )
+endif()
+
 # bootstrap.cmake가 buildspec.json을 읽어 _name, _version, _author 등의 변수를 설정.
 # NO_POLICY_SCOPE: bootstrap이 설정한 cmake_policy를 이 파일에서도 그대로 쓰게 한다.
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/common/bootstrap.cmake" NO_POLICY_SCOPE)
@@ -195,6 +210,8 @@ target_sources(
     src/pipeline-health.h
     src/ocr-engine.cpp            # Role B: OCR + RE2 기반 PII 탐지
     src/ocr-engine.h              # Role B: OCR 엔진 인터페이스
+    src/visual-tracker.cpp        # Role B: NCC 기반 프레임별 박스 추적
+    src/visual-tracker.h
 )
 
 if(WIN32)
@@ -240,3 +257,17 @@ if(WIN32)
 endif()
 # [핵심 해결] downsample.effect 등 필수 리소스를 OBS가 인식하는 표준 데이터 폴더로 복사
 install(DIRECTORY data/ DESTINATION "data/obs-plugins/${CMAKE_PROJECT_NAME}")
+
+# =============================================================================
+# 단위 테스트 (BUILD_TESTING=ON 일 때만 빌드)
+#
+# 활성화 방법:
+#   cmake --preset windows-x64 -DBUILD_TESTING=ON
+#   cmake --build --preset windows-x64
+#   ctest --preset windows-x64 --output-on-failure
+# =============================================================================
+option(BUILD_TESTING "Build unit tests" OFF)
+if(BUILD_TESTING)
+  enable_testing()
+  add_subdirectory(test)
+endif()

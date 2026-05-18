@@ -52,67 +52,6 @@ bool GpuReadback::initialize() {
   return true;
 }
 
-void GpuReadback::enqueueCopy(gs_texture_t *src, const BlurRect &bbox, int idx,
-                              int targetW, int targetH) {
-  if (idx >= m_totalSlots || !m_downsampleEffect)
-    return;
-
-  // 현재 제출 준비 중인 풀(m_activeQuery)을 사용합니다.
-  PoolSlot &slot = m_pool[m_activeQuery][idx];
-  slot.unusedFrames = 0;
-
-  gs_texrender_reset(slot.rt);
-  if (gs_texrender_begin(slot.rt, targetW, targetH)) {
-    uint32_t srcW = gs_texture_get_width(src);
-    uint32_t srcH = gs_texture_get_height(src);
-
-    struct vec4 uvBounds = {(float)bbox.x / srcW, (float)bbox.y / srcH,
-                            (float)(bbox.x + bbox.width) / srcW,
-                            (float)(bbox.y + bbox.height) / srcH};
-
-    gs_ortho(0.0f, (float)targetW, 0.0f, (float)targetH, -100.0f, 100.0f);
-    gs_effect_set_texture(
-        gs_effect_get_param_by_name(m_downsampleEffect, "image"), src);
-    gs_effect_set_vec4(
-        gs_effect_get_param_by_name(m_downsampleEffect, "uv_bounds"),
-        &uvBounds);
-
-    while (gs_effect_loop(m_downsampleEffect, "Draw")) {
-      gs_draw_sprite(src, 0, targetW, targetH);
-    }
-
-    gs_texrender_end(slot.rt);
-  }
-
-  gs_texture_t *obsRT = gs_texrender_get_texture(slot.rt);
-  if (!obsRT)
-    return;
-
-  ID3D11Resource *nativeRT = (ID3D11Resource *)gs_texture_get_obj(obsRT);
-  if (!nativeRT || !slot.staging)
-    return;
-
-  m_context->CopyResource(slot.staging, nativeRT);
-}
-
-void GpuReadback::submitFrame() {
-  if (!m_queries[m_activeQuery] || !m_context)
-    return;
-
-  if (isPipelineFull()) {
-    m_context->Flush();
-    return;
-  }
-
-  m_context->End(m_queries[m_activeQuery]);
-  m_context->Flush();
-
-  m_querySubmitted[m_activeQuery] = true;
-  m_submitTime[m_activeQuery] = GetTickCount64();
-  m_activeQuery = (m_activeQuery + 1) % SLOT_COUNT;
-  m_pendingCount++;
-}
-
 CollectResult GpuReadback::tryCollectPreviousFrame() {
   if (m_pendingCount == 0)
     return CollectResult::PENDING;
@@ -268,15 +207,13 @@ void GpuReadback::resizePool(
              "(hr=0x%08X)",
              i, slotSizes[i].first, slotSizes[i].second, hr);
         // [C2-6 수정] 실패한 슬롯도 push하되 staging=nullptr로 남겨둠.
-        // enqueueCopy/readStagingBuffer 둘 다 staging nullptr 가드가 있어
-        // 안전하게 스킵됨.
+        // readStagingBuffer에서 staging nullptr 가드가 있어 안전하게 스킵됨.
       }
       m_pool[p].push_back(slot);
     }
   }
   // [C2-6 수정] CreateTexture2D 실패 여부와 무관하게 newSize를 설정하되,
-  // 실패한 슬롯은 enqueueCopy 및 readStagingBuffer에서 nullptr 체크로 방어됨.
-  // (enqueueCopy line 81: if (!nativeRT || !slot.staging) return;)
+  // 실패한 슬롯은 readStagingBuffer에서 nullptr 체크로 방어됨.
   m_totalSlots = newSize;
   blog(
       LOG_INFO,

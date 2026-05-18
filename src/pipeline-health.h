@@ -35,13 +35,15 @@ public:
     int getForceReleaseCount() const { return m_forceReleaseCount; }
 
 private:
-    uint64_t m_lastSuccessTime = 0;   // 마지막으로 수확에 성공한 시각 (ms)
-    int      m_consecutiveFailures = 0; // 연속 수확 실패 횟수
-    int      m_forceReleaseCount = 0;   // 특정 시간 윈도우 내 강제 해제 발생 횟수
-    uint64_t m_windowStart = 0;       // 강제 해제 빈도 측정을 위한 윈도우 시작 시각
+    uint64_t m_lastSuccessTime = 0;
+    int      m_consecutiveFailures = 0;
+    int      m_forceReleaseCount = 0;
+    uint64_t m_windowStart = 0;
+    // enqueueCopy/submitFrame이 실제로 호출된 적 없으면 timeout CRITICAL을 발동하지 않는다.
+    // GpuReadback 파이프라인이 미연결 상태일 때 오탐 리셋 루프를 방지하기 위함.
+    bool     m_hasEverSucceeded = false;
 
-    // 헬스 체크 파라미터 (계획서 기준)
-    static constexpr uint64_t CRITICAL_TIMEOUT_MS = 1000;       // 1초 무응답 시 리셋
-    static constexpr uint64_t FORCE_RELEASE_WINDOW_MS = 3000;   // 3초 윈도우
-    static constexpr int      MAX_FORCE_RELEASES_PER_WINDOW = 10; // 3초 내 10회 발생 시 리셋
+    static constexpr uint64_t CRITICAL_TIMEOUT_MS = 1000;
+    static constexpr uint64_t FORCE_RELEASE_WINDOW_MS = 3000;
+    static constexpr int      MAX_FORCE_RELEASES_PER_WINDOW = 10;
 };

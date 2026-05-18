@@ -13,5 +13,5 @@ struct BlurRect {
     int y;
     int width;
     int height;
-    int type; // 0: Blur, 1: Blackout
+    int type;       // 0: Blur, 1: Blackout
 };

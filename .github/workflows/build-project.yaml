@@ -122,13 +122,23 @@ jobs:
 
           $srcBin = Join-Path $vcpkgRoot "installed\x64-windows\bin"
           $buildBin = "${{ github.workspace }}\build_x64\${{ needs.check-event.outputs.config }}"
+          $pluginName = "${{ steps.setup.outputs.pluginName }}"
 
-          Write-Host "Copying RE2 runtime DLLs from $srcBin to $buildBin"
+          # Define full path to release binary folder
+          $releaseBin = Join-Path "${{ github.workspace }}" "release\${{ needs.check-event.outputs.config }}\${pluginName}\bin\64bit"
 
-          Copy-Item (Join-Path $srcBin "re2.dll") $buildBin -Force
-          Copy-Item (Join-Path $srcBin "absl_*.dll") $buildBin -Force
+          Write-Host "Copying runtime DLLs from $srcBin to both build and release dirs"
 
-          Get-ChildItem $buildBin -Filter "*.dll" | Select-Object Name
+          # Ensure releaseBin exists just in case
+          if (-not (Test-Path $releaseBin)) {
+              New-Item -ItemType Directory -Force -Path $releaseBin | Out-Null
+          }
+
+          Copy-Item (Join-Path $srcBin "*.dll") $buildBin -Force
+          Copy-Item (Join-Path $srcBin "*.dll") $releaseBin -Force
+
+          Write-Host "DLLs in release bin:"
+          Get-ChildItem $releaseBin -Filter "*.dll" | Select-Object Name
 
 
       - name: Package Plugin 📀
