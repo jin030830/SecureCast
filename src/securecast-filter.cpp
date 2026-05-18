@@ -397,17 +397,19 @@ void FrameRingBuffer::destroy() {
   blog(LOG_INFO, "FrameRingBuffer destroyed.");
 }
 
-// 현재 OBS 소스 프레임을 HEAD 슬롯에 캡처하고, 창 좌표 스냅샷을 함께 저장한다.
-// HEAD를 한 칸 전진시켜 다음 pushFrame이 다음 슬롯에 쓰도록 한다.
+// 현재 OBS 소스 프레임을 HEAD 슬롯에 캡처하고, 창 좌표·OCR 박스 스냅샷을 함께
+// 저장한다. HEAD를 한 칸 전진시켜 다음 pushFrame이 다음 슬롯에 쓰도록 한다.
 #ifdef _WIN32
 void FrameRingBuffer::pushFrame(uint64_t timestamp,
                                 obs_source_t *filter_context,
                                 const TrackedWindowList *wlist,
-                                uint64_t dependentOcrFrameId)
+                                uint64_t dependentOcrFrameId,
+                                const OcrBoxSnapshot *ocrSnapshot)
 #else
 void FrameRingBuffer::pushFrame(uint64_t timestamp,
                                 obs_source_t *filter_context,
-                                uint64_t dependentOcrFrameId)
+                                uint64_t dependentOcrFrameId,
+                                const OcrBoxSnapshot *ocrSnapshot)
 #endif
 {
   if (!m_initialized)
@@ -423,6 +425,12 @@ void FrameRingBuffer::pushFrame(uint64_t timestamp,
   else
     slot.windowSnapshot = TrackedWindowList{};
 #endif
+
+  // OCR/Tracker 박스 스냅샷 — null 허용 (null이면 빈 snapshot으로 초기화)
+  if (ocrSnapshot)
+    slot.ocrBoxSnapshot = *ocrSnapshot;
+  else
+    slot.ocrBoxSnapshot = OcrBoxSnapshot{};
 
   gs_texrender_t *tr = slot.texrender;
   gs_texrender_reset(tr);
@@ -471,8 +479,6 @@ FrameRingBuffer::peekSlotAtOffset(int framesBack) const {
       SC_RING_BUFFER_SLOTS;
   return &m_slots[idx];
 }
-
-
 
 // ================================================================
 // [Role C] MockAIWorker 구현부
@@ -657,7 +663,8 @@ static bool ensure_ocr_down_stage(SecureCastFilter *filter, uint32_t dstW,
     return false;
   }
 
-  // Mitchell + USM 2-pass용 중간 텍스처. 1-pass(bilinear) 경로에서는 사용 안 됨.
+  // Mitchell + USM 2-pass용 중간 텍스처. 1-pass(bilinear) 경로에서는 사용 안
+  // 됨.
   filter->ocrMidRender_ = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
   if (!filter->ocrMidRender_) {
     gs_stagesurface_destroy(filter->ocrDownStage_);
@@ -718,10 +725,8 @@ static bool read_texture_bgra_scaled_gpu(SecureCastFilter *filter,
     gs_effect_t *eff = filter->ocrDownsampleEffect_;
     gs_eparam_t *pImg = gs_effect_get_param_by_name(eff, "image");
     gs_eparam_t *pUV = gs_effect_get_param_by_name(eff, "uv_bounds");
-    gs_eparam_t *pSrcTexel =
-        gs_effect_get_param_by_name(eff, "src_texel_size");
-    gs_eparam_t *pMidTexel =
-        gs_effect_get_param_by_name(eff, "mid_texel_size");
+    gs_eparam_t *pSrcTexel = gs_effect_get_param_by_name(eff, "src_texel_size");
+    gs_eparam_t *pMidTexel = gs_effect_get_param_by_name(eff, "mid_texel_size");
     gs_eparam_t *pAmount = gs_effect_get_param_by_name(eff, "usm_amount");
 
     gs_texrender_reset(filter->ocrMidRender_);
@@ -1369,11 +1374,13 @@ static void ocr_worker_loop(SecureCastFilter *filter) {
     const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                            std::chrono::steady_clock::now().time_since_epoch())
                            .count();
+    const bool hasActiveBoxes = !filter->trackerMgr.active_boxes().empty();
+
     if (result.fullRecognitionRan) {
       if (result.effectiveLineCount == 0) {
-        const int s = filter->ocrZeroLineStreak_.fetch_add(
-                          1, std::memory_order_acq_rel) +
-                      1;
+        const int s =
+            filter->ocrZeroLineStreak_.fetch_add(1, std::memory_order_acq_rel) +
+            1;
         const OcrTierOverride curOv =
             filter->ocrOverrideTier_.load(std::memory_order_acquire);
         const OcrScaleTier curPolicy =
@@ -1381,16 +1388,22 @@ static void ocr_worker_loop(SecureCastFilter *filter) {
         const OcrScaleTier curEff =
             SecureCastFilter::ocr_effective_tier(curPolicy, curOv);
         if (s >= 3 && curEff != OcrScaleTier::Full) {
-          // 한 단계 더 안전한 override 설정: Half→TwoThirds, TwoThirds→Full.
-          const OcrTierOverride next = (curEff == OcrScaleTier::Half)
-                                           ? OcrTierOverride::TwoThirds
-                                           : OcrTierOverride::Full;
-          filter->ocrOverrideTier_.store(next, std::memory_order_release);
-          filter->ocrZeroLineStreak_.store(0, std::memory_order_release);
-          filter->ocrLastEscalateMs_.store(nowMs, std::memory_order_release);
-          blog(LOG_WARNING,
-               "[SC-ocr] self-heal escalate eff=%d ov->%d (3 cycles zero lines)",
-               static_cast<int>(curEff), static_cast<int>(next));
+          if (!hasActiveBoxes) {
+            // 한 단계 더 안전한 override 설정: Half→TwoThirds, TwoThirds→Full.
+            const OcrTierOverride next = (curEff == OcrScaleTier::Half)
+                                             ? OcrTierOverride::TwoThirds
+                                             : OcrTierOverride::Full;
+            filter->ocrOverrideTier_.store(next, std::memory_order_release);
+            filter->ocrZeroLineStreak_.store(0, std::memory_order_release);
+            filter->ocrLastEscalateMs_.store(nowMs, std::memory_order_release);
+            blog(LOG_WARNING,
+                 "[SC-ocr] self-heal escalate eff=%d ov->%d (3 cycles zero "
+                 "lines)",
+                 static_cast<int>(curEff), static_cast<int>(next));
+          } else {
+            // 텍스트는 못 찾았지만 PII 트래커가 작동 중이므로 격상 보류
+            filter->ocrZeroLineStreak_.store(0, std::memory_order_release);
+          }
         }
       } else {
         // 정상 인식: streak 즉시 리셋.
@@ -1406,28 +1419,27 @@ static void ocr_worker_loop(SecureCastFilter *filter) {
           filter->ocrPolicyTier_.load(std::memory_order_acquire);
       const int64_t last =
           filter->ocrLastEscalateMs_.load(std::memory_order_acquire);
-      if (curOv != OcrTierOverride::Auto && last > 0 &&
-          nowMs - last > 60000) {
-        const OcrTierOverride relaxed =
-            SecureCastFilter::relax_override(curOv, curPolicy);
-        filter->ocrOverrideTier_.store(relaxed, std::memory_order_release);
-        filter->ocrLastEscalateMs_.store(nowMs, std::memory_order_release);
-        blog(LOG_INFO,
-             "[SC-ocr] self-heal relax override %d->%d after 60s",
-             static_cast<int>(curOv), static_cast<int>(relaxed));
+      if (curOv != OcrTierOverride::Auto && last > 0 && nowMs - last > 60000) {
+        if (!hasActiveBoxes) {
+          const OcrTierOverride relaxed =
+              SecureCastFilter::relax_override(curOv, curPolicy);
+          filter->ocrOverrideTier_.store(relaxed, std::memory_order_release);
+          filter->ocrLastEscalateMs_.store(nowMs, std::memory_order_release);
+          blog(LOG_INFO, "[SC-ocr] self-heal relax override %d->%d after 60s",
+               static_cast<int>(curOv), static_cast<int>(relaxed));
+        }
       }
     }
 
     // 진단 로깅: enqueue→완료까지 소요 ms를 누적, 100사이클마다 평균 출력.
     if (enqueueTs.time_since_epoch().count() != 0) {
-      const auto procMs =
-          std::chrono::duration<double, std::milli>(
-              std::chrono::steady_clock::now() - enqueueTs)
-              .count();
+      const auto procMs = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - enqueueTs)
+                              .count();
       filter->ocrEnqueueLatencyAccumMs_ += procMs;
       if (++filter->ocrEnqueueLatencyCount_ >= 100) {
-        const double avgMs = filter->ocrEnqueueLatencyAccumMs_ /
-                             filter->ocrEnqueueLatencyCount_;
+        const double avgMs =
+            filter->ocrEnqueueLatencyAccumMs_ / filter->ocrEnqueueLatencyCount_;
         const OcrTierOverride curOv2 =
             filter->ocrOverrideTier_.load(std::memory_order_acquire);
         blog(LOG_INFO,
@@ -1984,15 +1996,74 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
     return;
   }
 
-  // --- Step 2: 현재 프레임을 Ring Buffer HEAD에 Push ---
-  // OBS 소스 내부 버퍼링으로 obs_source_video_render()가 반환하는 픽셀은
+  // --- Step 2: OCR 박스 스냅샷 갱신 + 현재 프레임을 Ring Buffer HEAD에 Push
+  // --- OBS 소스 내부 버퍼링으로 obs_source_video_render()가 반환하는 픽셀은
   // 실제 DWM 쿼리보다 ~1프레임 뒤처진다.
   // captureWindowList(직전 프레임에서 저장한 DWM 좌표)를 스냅샷으로 쓰면
   // 픽셀 내용과 마스크 위치가 정확히 동기화된다.
+
+  // [OCR 박스 동기화] trackerMgr.active_boxes()를 slotHead에 봉인.
+  // windowSnapshot 패턴과 동일: 이 프레임 텍스처와 박스 좌표를 함께 저장.
+  // 60프레임 후 송출 시 outputSlot->ocrBoxSnapshot 사용 → 1프레임도 어긋나지
+  // 않음.
+  {
+    OcrBoxSnapshot nextSnap{};
+    const float tScale = filter->trackerCoordScale_;
+    const auto activeBxs = filter->trackerMgr.active_boxes();
+
+    // 1. 현재 살아있는 박스 추가 (TTL 최대로 리셋)
+    for (const auto &tb : activeBxs) {
+      if (nextSnap.count >= SC_MAX_SLOT_OCR_BOXES)
+        break;
+      BlurRect r{};
+      r.x = static_cast<int>(tb.x * tScale);
+      r.y = static_cast<int>(tb.y * tScale);
+      r.width = static_cast<int>(tb.w * tScale);
+      r.height = static_cast<int>(tb.h * tScale);
+      r.type = 0;
+      if (r.width > 0 && r.height > 0) {
+        nextSnap.rects[nextSnap.count] = r;
+        nextSnap.ticksRemaining[nextSnap.count] = SC_RING_BUFFER_SLOTS + 1;
+        nextSnap.count++;
+      }
+    }
+
+    // 2. Lingering (T5): NCC lost 후에도 직전 스냅샷 박스를 N프레임 유지.
+    //    windowSnapshot의 lingeringWindows 패턴과 동일한 목적.
+    for (int li = 0; li < filter->liveOcrSnapshot_.count; ++li) {
+      const int ttl = filter->liveOcrSnapshot_.ticksRemaining[li];
+      if (ttl <= 0)
+        continue;
+      const BlurRect &lr = filter->liveOcrSnapshot_.rects[li];
+      // active 박스가 이미 같은 영역을 커버하면 lingering 불필요
+      bool covered = false;
+      for (int ai = 0; ai < nextSnap.count; ++ai) {
+        const BlurRect &ar = nextSnap.rects[ai];
+        // 두 박스의 중심 간 거리 < 각 반폭 합산 → 겹침으로 판정
+        int dx = abs((lr.x + lr.width / 2) - (ar.x + ar.width / 2));
+        int dy = abs((lr.y + lr.height / 2) - (ar.y + ar.height / 2));
+        if (dx < (lr.width + ar.width) / 2 &&
+            dy < (lr.height + ar.height) / 2) {
+          covered = true;
+          break;
+        }
+      }
+      if (!covered && nextSnap.count < SC_MAX_SLOT_OCR_BOXES) {
+        nextSnap.rects[nextSnap.count] = lr;
+        nextSnap.ticksRemaining[nextSnap.count] = ttl - 1;
+        nextSnap.count++;
+      }
+    }
+
+    filter->liveOcrSnapshot_ = nextSnap;
+  }
+
   uint64_t ts = obs_get_video_frame_time();
 #ifdef _WIN32
-  filter->ringBuffer.pushFrame(ts, filter->context, &filter->captureWindowList,
-                               filter->lastSubmittedOcrFrameId.load(std::memory_order_relaxed));
+  filter->ringBuffer.pushFrame(
+      ts, filter->context, &filter->captureWindowList,
+      filter->lastSubmittedOcrFrameId.load(std::memory_order_relaxed),
+      &filter->liveOcrSnapshot_);
   // push 이후에 DWM 갱신 → 다음 프레임의 captureWindowList로 저장
   // [Fix #3-B] 사라진 hwnd를 render 경로에서 즉시 lingering에 등록
   //   → tick(slow-scan)보다 훨씬 빠르게 잔영을 보장
@@ -2012,8 +2083,10 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
   }
   filter->captureWindowList = filter->windowList;
 #else
-  filter->ringBuffer.pushFrame(ts, filter->context,
-                               filter->lastSubmittedOcrFrameId.load(std::memory_order_relaxed));
+  filter->ringBuffer.pushFrame(
+      ts, filter->context,
+      filter->lastSubmittedOcrFrameId.load(std::memory_order_relaxed),
+      &filter->liveOcrSnapshot_);
 #endif
 
   // --- Step 3: maskChannel drain (OCR 좌표는 Visual Tracker가 직접 관리) ---
@@ -2127,8 +2200,6 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
   }
 #endif // _WIN32 Phase1 end
 
-
-
   // --- Step 4~5: N프레임 지연된 슬롯 꺼내기 ---
   const FrameRingBuffer::Slot *delayedSlot =
       filter->ringBuffer.peekDelayedSlot();
@@ -2148,8 +2219,8 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
     // --- [OCR 다운스케일 tier 결정] ---
     // policyTier: 해상도 + 로드된 effect에 따라 결정.
     //   Half      : ≥1440p (downsample.effect bilinear 필요)
-    //   TwoThirds : ≥1080p AND SECURECAST_OCR_TWOTHIRDS AND ocrDownsampleEffect_
-    //   Full      : 그 외 또는 effect 미로드 시 안전 폴백.
+    //   TwoThirds : ≥1080p AND SECURECAST_OCR_TWOTHIRDS AND
+    //   ocrDownsampleEffect_ Full      : 그 외 또는 effect 미로드 시 안전 폴백.
     // overrideTier: 셀프힐링이 강제하는 안전 모드.
     // effective = min(policy, override)로 더 안전한 쪽 선택.
 #ifdef _WIN32
@@ -2174,8 +2245,7 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
         filter->lastEffectiveTier_.exchange(ocrTier, std::memory_order_acq_rel);
     if (prevTier != ocrTier) {
       filter->trackerMgr.clear();
-      blog(LOG_INFO,
-           "[SC-ocr] tier transition %d->%d -> trackerMgr cleared",
+      blog(LOG_INFO, "[SC-ocr] tier transition %d->%d -> trackerMgr cleared",
            static_cast<int>(prevTier), static_cast<int>(ocrTier));
     }
 #else
@@ -2257,8 +2327,7 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
     // OCR 픽셀 확보 → submit_ocr_frame.
     if (claimedOcr) {
       std::vector<uint8_t> ocrPixels;
-      int ocrW = static_cast<int>(w), ocrH = static_cast<int>(h),
-          ocrStride = 0;
+      int ocrW = static_cast<int>(w), ocrH = static_cast<int>(h), ocrStride = 0;
       bool ocrSubmitted = false;
 
 #ifdef _WIN32
@@ -2287,8 +2356,8 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
 
       if (ocrSubmitted) {
         submit_ocr_frame(filter, std::move(ocrPixels), ocrW, ocrH, ocrStride,
-                         analysisSlot->frameId,
-                         std::move(trackerGrayForWorker), trkW, trkH, ocrTier);
+                         analysisSlot->frameId, std::move(trackerGrayForWorker),
+                         trkW, trkH, ocrTier);
         if (++filter->trackerLogCounter >= 150) {
           filter->trackerLogCounter = 0;
           blog(LOG_INFO, "[SC-tracker] active=%zu",
@@ -2304,18 +2373,23 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
 
   // --- Step 5b: 분석 완료 프레임만 그리기 ---
   // delayedSlot이 의존하는 대표 OCR 프레임이 완료 표시를 받았는지 확인한다.
-  // 완료되지 않았다면 원본 송출 금지. 마스크까지 합성해둔 마지막 안전 출력 프레임을 재송출(Freeze)한다.
-  uint64_t safeWatermarkId = filter->lastCompletedOcrFrameId.load(std::memory_order_acquire);
+  // 완료되지 않았다면 원본 송출 금지. 마스크까지 합성해둔 마지막 안전 출력
+  // 프레임을 재송출(Freeze)한다.
+  uint64_t safeWatermarkId =
+      filter->lastCompletedOcrFrameId.load(std::memory_order_acquire);
   uint64_t delayedId = delayedSlot ? delayedSlot->frameId : 0;
-  bool isSafeToRender = (safeWatermarkId > 0) && delayedSlot && (delayedSlot->dependentOcrFrameId <= safeWatermarkId);
+  bool isSafeToRender = (safeWatermarkId > 0) && delayedSlot &&
+                        (delayedSlot->dependentOcrFrameId <= safeWatermarkId);
 
   if (!delayedSlot || !delayedSlot->getTexture() || !isSafeToRender) {
     if (++filter->unverifiedFrameLogCounter >= 60) {
       filter->unverifiedFrameLogCounter = 0;
       blog(LOG_WARNING,
            "[SecureCast][gate] delayed frame %" PRIu64
-           " dependent on OCR %" PRIu64 " not analyzed (watermark %" PRIu64 "); freezing last safe output",
-           delayedId, delayedSlot ? delayedSlot->dependentOcrFrameId : 0, safeWatermarkId);
+           " dependent on OCR %" PRIu64 " not analyzed (watermark %" PRIu64
+           "); freezing last safe output",
+           delayedId, delayedSlot ? delayedSlot->dependentOcrFrameId : 0,
+           safeWatermarkId);
     }
     if (!render_last_safe_frame(filter, w, h))
       render_solid_black_frame(w, h);
@@ -2376,22 +2450,15 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
       all_rects[all_count++] = r;
   }
 #endif
-  // OCR 박스 — Visual Tracker가 제공하는 NCC 추적 위치
-  // [좌표계 동기화] Half tier 모드에서는 트래커가 half-res 공간에서 추적하므로
-  // trackerCoordScale_(=2.0f)를 곱해 원본 해상도로 좌표를 복원한다.
-  // TwoThirds tier는 워커에서 미리 원본 좌표로 올렸으므로 tScale=1.0f.
+  // OCR 박스 — 슬롯 캡처 시점의 스냅샷 사용 (프레임 ↔ 박스 위치 완벽 동기화)
+  // ocrBoxSnapshot은 pushFrame 직전 trackerMgr.active_boxes() + lingering으로
+  // 구성된 원본 해상도 좌표이므로 별도 tScale 보정 불필요.
   {
-    const float tScale = filter->trackerCoordScale_;
-    const auto trackerBoxes = filter->trackerMgr.active_boxes();
-    for (const auto &tb : trackerBoxes) {
+    const OcrBoxSnapshot &snap = outputSlot->ocrBoxSnapshot;
+    for (int bi = 0; bi < snap.count; ++bi) {
       if (all_count >= (int)(sizeof(all_rects) / sizeof(all_rects[0])))
         break;
-      BlurRect r{};
-      r.x = static_cast<int>(tb.x * tScale);
-      r.y = static_cast<int>(tb.y * tScale);
-      r.width = static_cast<int>(tb.w * tScale);
-      r.height = static_cast<int>(tb.h * tScale);
-      r.type = 0; // Blur
+      const BlurRect &r = snap.rects[bi];
       if (r.width > 0 && r.height > 0)
         all_rects[all_count++] = r;
     }

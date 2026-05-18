@@ -69,7 +69,8 @@ class SecureCastOcrEngine;
 constexpr int SC_MAX_BLUR_RECTS =
     32; // 한 프레임에 동시에 마스킹 가능한 최대 영역 수
 constexpr int SC_RING_BUFFER_SLOTS =
-    60; // Bounded Exposure: OCR 최대 레이턴시(≈1000ms) 대비 여유 확보를 위해 60슬롯으로 증가 (1초 지연)
+    60; // Bounded Exposure: OCR 최대 레이턴시(≈1000ms) 대비 여유 확보를 위해
+        // 60슬롯으로 증가 (1초 지연)
 
 // ----------------------------------------------------
 // OCR 다운스케일 정책 tier
@@ -117,6 +118,27 @@ constexpr int SC_MAX_LINGERING = SC_MAX_TRACKED_WINDOWS;
 #endif
 
 // ----------------------------------------------------
+// [Role C] OCR 트래커 박스 슬롯 스냅샷
+//
+// windowSnapshot이 창 좌표를 슬롯 단위로 저장해 송출과 동기화하듯,
+// OCR/Visual Tracker 박스 좌표도 캡처 시점의 슬롯에 함께 저장한다.
+// → 60프레임 후 그 슬롯이 송출될 때 저장된 박스를 사용 = 1프레임 오차.
+//
+// lingering 처리:
+//   NCC lost 후에도 ticksRemaining > 0이면 마지막 위치를 유지.
+//   SC_RING_BUFFER_SLOTS(60) 경과 후 슬롯이 자연 순환하여 소멸.
+// ----------------------------------------------------
+constexpr int SC_MAX_SLOT_OCR_BOXES =
+    16; // VisualTrackerManager::MAX_TRACKERS(8)의 2배 여유
+
+struct OcrBoxSnapshot {
+  BlurRect rects[SC_MAX_SLOT_OCR_BOXES]{};
+  int count = 0;
+  // 각 박스의 lingering TTL. lost 후에도 > 0이면 박스 유지.
+  int ticksRemaining[SC_MAX_SLOT_OCR_BOXES]{};
+};
+
+// ----------------------------------------------------
 // [Role C] N-Frame Ring Buffer
 //
 // 송출 지연(Bounded Exposure) 구현의 핵심 자료구조.
@@ -136,13 +158,17 @@ public:
     gs_texrender_t *texrender = nullptr; // OBS 안전 렌더 타겟 관리자
     uint64_t timestamp = 0;
     uint64_t frameId = 0;
-    uint64_t dependentOcrFrameId = 0; // 이 프레임 송출 전 완료되어야 할 대표 OCR 프레임 ID
+    uint64_t dependentOcrFrameId =
+        0; // 이 프레임 송출 전 완료되어야 할 대표 OCR 프레임 ID
 #ifdef _WIN32
     // 이 프레임이 캡처된 시점의 창 좌표 스냅샷.
     // 렌더 시 출력 슬롯의 windowSnapshot을 사용해야 프레임 내용과 마스크 위치가
     // 동기화됨.
     TrackedWindowList windowSnapshot{};
 #endif
+    // 이 프레임이 캡처된 시점의 OCR/Tracker 박스 스냅샷 (플랫폼 무관).
+    // 송출 시 outputSlot->ocrBoxSnapshot을 사용해 박스 위치와 텍스처를 동기화.
+    OcrBoxSnapshot ocrBoxSnapshot{};
 
     // gs_texrender에서 결과 텍스처를 꺼내는 헬퍼
     gs_texture_t *getTexture() const {
@@ -158,12 +184,16 @@ public:
   void destroy();
 
   // gs_texrender_begin/end를 사용하여 안전하게 프레임을 캡처.
-  // wlist: 이 프레임 캡처 시점의 창 좌표 스냅샷 (null 허용).
+  // wlist      : 이 프레임 캡처 시점의 창 좌표 스냅샷 (null 허용, Win32 전용).
+  // ocrSnapshot: 이 프레임 캡처 시점의 OCR/Tracker 박스 스냅샷 (null 허용).
 #ifdef _WIN32
   void pushFrame(uint64_t timestamp, obs_source_t *filter_context,
-                 const TrackedWindowList *wlist, uint64_t dependentOcrFrameId);
+                 const TrackedWindowList *wlist, uint64_t dependentOcrFrameId,
+                 const OcrBoxSnapshot *ocrSnapshot = nullptr);
 #else
-  void pushFrame(uint64_t timestamp, obs_source_t *filter_context, uint64_t dependentOcrFrameId);
+  void pushFrame(uint64_t timestamp, obs_source_t *filter_context,
+                 uint64_t dependentOcrFrameId,
+                 const OcrBoxSnapshot *ocrSnapshot = nullptr);
 #endif
 
   const Slot *peekDelayedSlot() const;
@@ -490,6 +520,11 @@ struct SecureCastFilter {
   // 1.0f = full-res 모드(기본 / TwoThirds 트래커는 원본 공간 추적),
   // 2.0f = half-res OCR 최적화 모드.
   float trackerCoordScale_ = 1.0f;
+
+  // pushFrame 직전에 매 프레임 갱신되는 "살아있는" OCR 박스 스냅샷.
+  // captureWindowList와 동일한 역할 — 이 값이 다음 슬롯에 봉인됨.
+  // active_boxes()가 줄었을 때(lost) ticksRemaining > 0인 박스를 N프레임 유지.
+  OcrBoxSnapshot liveOcrSnapshot_{};
 
   // ----- [OCR 다운스케일 tier + 셀프힐링] -----
   // policyTier : 해상도에서 결정되는 기본 정책 (compute_policy 결과).
