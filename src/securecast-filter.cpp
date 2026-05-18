@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
 #include <util/platform.h>
@@ -224,6 +225,115 @@ static void render_blur_rect(gs_effect_t *fx, gs_texture_t *img_tex,
   gs_matrix_pop();
 }
 
+static void render_solid_black_frame(uint32_t w, uint32_t h) {
+  gs_effect_t *solid = obs_get_base_effect(OBS_EFFECT_SOLID);
+  gs_eparam_t *colorParam = gs_effect_get_param_by_name(solid, "color");
+  gs_effect_set_color(colorParam, 0xFF000000);
+  while (gs_effect_loop(solid, "Solid"))
+    gs_draw_sprite(nullptr, 0, w, h);
+}
+
+static void draw_texture_full_frame(gs_texture_t *tex, uint32_t w, uint32_t h) {
+  if (!tex)
+    return;
+  gs_effect_t *draw = obs_get_base_effect(OBS_EFFECT_DEFAULT);
+  gs_effect_set_texture(gs_effect_get_param_by_name(draw, "image"), tex);
+  while (gs_effect_loop(draw, "Draw"))
+    gs_draw_sprite(tex, 0, w, h);
+}
+
+static void render_masked_output(SecureCastFilter *filter, gs_texture_t *srcTex,
+                                 const BlurRect *rects, int rectCount,
+                                 uint32_t w, uint32_t h) {
+  if (!filter || !srcTex)
+    return;
+
+  draw_texture_full_frame(srcTex, w, h);
+
+  if (rectCount <= 0)
+    return;
+
+  if (filter->blurEffect) {
+    for (int i = 0; i < rectCount; i++)
+      render_blur_rect(filter->blurEffect, srcTex, rects[i], w, h);
+    return;
+  }
+
+  // 셰이더 로드 실패 시 fallback: 단색 검정 박스
+  gs_effect_t *solid = obs_get_base_effect(OBS_EFFECT_SOLID);
+  gs_effect_set_color(gs_effect_get_param_by_name(solid, "color"), 0xFF000000);
+  gs_matrix_push();
+  while (gs_effect_loop(solid, "Solid")) {
+    for (int i = 0; i < rectCount; i++) {
+      gs_matrix_identity();
+      gs_matrix_translate3f((float)rects[i].x, (float)rects[i].y, 0.0f);
+      gs_draw_sprite(nullptr, 0, (uint32_t)rects[i].width,
+                     (uint32_t)rects[i].height);
+    }
+  }
+  gs_matrix_pop();
+}
+
+static void destroy_last_safe_render(SecureCastFilter *filter) {
+  if (!filter)
+    return;
+  if (filter->lastSafeRender_) {
+    gs_texrender_destroy(filter->lastSafeRender_);
+    filter->lastSafeRender_ = nullptr;
+  }
+  filter->lastSafeReady_ = false;
+  filter->lastSafeW_ = 0;
+  filter->lastSafeH_ = 0;
+}
+
+static bool ensure_last_safe_render(SecureCastFilter *filter, uint32_t w,
+                                    uint32_t h) {
+  if (!filter || w == 0 || h == 0)
+    return false;
+  if (filter->lastSafeRender_ && filter->lastSafeW_ == w &&
+      filter->lastSafeH_ == h)
+    return true;
+
+  destroy_last_safe_render(filter);
+  filter->lastSafeRender_ = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
+  if (!filter->lastSafeRender_)
+    return false;
+  filter->lastSafeW_ = w;
+  filter->lastSafeH_ = h;
+  return true;
+}
+
+static bool update_last_safe_render(SecureCastFilter *filter,
+                                    gs_texture_t *srcTex, const BlurRect *rects,
+                                    int rectCount, uint32_t w, uint32_t h) {
+  if (!ensure_last_safe_render(filter, w, h) || !srcTex)
+    return false;
+
+  gs_texrender_reset(filter->lastSafeRender_);
+  if (!gs_texrender_begin(filter->lastSafeRender_, (int)w, (int)h))
+    return false;
+
+  struct vec4 clearColor;
+  vec4_zero(&clearColor);
+  gs_clear(GS_CLEAR_COLOR, &clearColor, 1.0f, 0);
+  gs_ortho(0.0f, (float)w, 0.0f, (float)h, -100.0f, 100.0f);
+  render_masked_output(filter, srcTex, rects, rectCount, w, h);
+  gs_texrender_end(filter->lastSafeRender_);
+  filter->lastSafeReady_ = true;
+  return true;
+}
+
+static bool render_last_safe_frame(SecureCastFilter *filter, uint32_t w,
+                                   uint32_t h) {
+  if (!filter || !filter->lastSafeReady_ || !filter->lastSafeRender_)
+    return false;
+  gs_texture_t *tex = gs_texrender_get_texture(filter->lastSafeRender_);
+  if (!tex)
+    return false;
+  draw_texture_full_frame(tex, w, h);
+  return true;
+}
+
 // ================================================================
 // [Role C] FrameRingBuffer 구현부
 // ================================================================
@@ -252,6 +362,8 @@ bool FrameRingBuffer::initialize(uint32_t width, uint32_t height) {
       return false;
     }
     slot.timestamp = 0;
+    slot.frameId = 0;
+    slot.dependentOcrFrameId = 0;
   }
 
   m_initialized = true;
@@ -273,12 +385,15 @@ void FrameRingBuffer::destroy() {
       slot.texrender = nullptr;
     }
     slot.timestamp = 0;
+    slot.frameId = 0;
+    slot.dependentOcrFrameId = 0;
   }
   obs_leave_graphics();
 
   m_initialized = false;
   m_head = 0;
   m_frameCount = 0;
+  m_nextFrameId = 1;
   blog(LOG_INFO, "FrameRingBuffer destroyed.");
 }
 
@@ -287,23 +402,29 @@ void FrameRingBuffer::destroy() {
 #ifdef _WIN32
 void FrameRingBuffer::pushFrame(uint64_t timestamp,
                                 obs_source_t *filter_context,
-                                const TrackedWindowList *wlist)
+                                const TrackedWindowList *wlist,
+                                uint64_t dependentOcrFrameId)
 #else
 void FrameRingBuffer::pushFrame(uint64_t timestamp,
-                                obs_source_t *filter_context)
+                                obs_source_t *filter_context,
+                                uint64_t dependentOcrFrameId)
 #endif
 {
   if (!m_initialized)
     return;
 
+  Slot &slot = m_slots[m_head];
+  slot.frameId = m_nextFrameId++;
+  slot.dependentOcrFrameId = dependentOcrFrameId;
+
 #ifdef _WIN32
   if (wlist)
-    m_slots[m_head].windowSnapshot = *wlist;
+    slot.windowSnapshot = *wlist;
   else
-    m_slots[m_head].windowSnapshot = TrackedWindowList{};
+    slot.windowSnapshot = TrackedWindowList{};
 #endif
 
-  gs_texrender_t *tr = m_slots[m_head].texrender;
+  gs_texrender_t *tr = slot.texrender;
   gs_texrender_reset(tr);
 
   // gs_texrender_begin/end가 내부적으로 렌더 타겟, 뷰포트, 투영 행렬을
@@ -325,7 +446,7 @@ void FrameRingBuffer::pushFrame(uint64_t timestamp,
     gs_texrender_end(tr);
   }
 
-  m_slots[m_head].timestamp = timestamp;
+  slot.timestamp = timestamp;
 
   // 다음 HEAD로 순환
   m_head = (m_head + 1) % SC_RING_BUFFER_SLOTS;
@@ -350,6 +471,8 @@ FrameRingBuffer::peekSlotAtOffset(int framesBack) const {
       SC_RING_BUFFER_SLOTS;
   return &m_slots[idx];
 }
+
+
 
 // ================================================================
 // [Role C] MockAIWorker 구현부
@@ -846,6 +969,7 @@ static void clear_pending_ocr_frame(SecureCastFilter *filter) {
 
   std::lock_guard<std::mutex> lock(filter->ocrWorkerMutex);
   filter->ocrFramePending = false;
+  filter->ocrPendingFrameId = 0;
   filter->ocrPendingPixels.clear();
   filter->ocrPendingWidth = 0;
   filter->ocrPendingHeight = 0;
@@ -854,8 +978,9 @@ static void clear_pending_ocr_frame(SecureCastFilter *filter) {
 
 static void submit_ocr_frame(SecureCastFilter *filter,
                              std::vector<uint8_t> &&pixels, int width,
-                             int height, int stride) {
-  if (!filter || pixels.empty() || width <= 0 || height <= 0 || stride <= 0)
+                             int height, int stride, uint64_t frameId) {
+  if (!filter || pixels.empty() || width <= 0 || height <= 0 || stride <= 0 ||
+      frameId == 0)
     return;
 
   if (!filter->ocrWorkerRunning.load(std::memory_order_acquire))
@@ -863,6 +988,7 @@ static void submit_ocr_frame(SecureCastFilter *filter,
 
   {
     std::lock_guard<std::mutex> lock(filter->ocrWorkerMutex);
+    filter->ocrPendingFrameId = frameId;
     filter->ocrPendingPixels = std::move(pixels);
     filter->ocrPendingWidth = width;
     filter->ocrPendingHeight = height;
@@ -895,6 +1021,7 @@ static void ocr_worker_loop(SecureCastFilter *filter) {
     int width = 0;
     int height = 0;
     int stride = 0;
+    uint64_t frameId = 0;
 
     {
       std::unique_lock<std::mutex> lock(filter->ocrWorkerMutex);
@@ -909,10 +1036,12 @@ static void ocr_worker_loop(SecureCastFilter *filter) {
       }
 
       pixels.swap(filter->ocrPendingPixels);
+      frameId = filter->ocrPendingFrameId;
       width = filter->ocrPendingWidth;
       height = filter->ocrPendingHeight;
       stride = filter->ocrPendingStride;
 
+      filter->ocrPendingFrameId = 0;
       filter->ocrPendingWidth = 0;
       filter->ocrPendingHeight = 0;
       filter->ocrPendingStride = 0;
@@ -1070,6 +1199,11 @@ static void ocr_worker_loop(SecureCastFilter *filter) {
            filter->lastLoggedOcrCount, boxCount);
       filter->lastLoggedOcrCount = boxCount;
     }
+
+    // 이 프레임은 OCR + tracker registration까지 완료됨. 렌더 스레드가
+    // 같은 frameId를 가진 ring-buffer slot에 완료 표시를 붙이고, 완료되지
+    // 않은 지연 슬롯은 송출하지 않는다.
+    filter->lastCompletedOcrFrameId.store(frameId, std::memory_order_release);
 
     // back-pressure 해제: 다음 프레임 readback 허용
     filter->ocrWorkerIdle.store(true, std::memory_order_release);
@@ -1396,6 +1530,7 @@ static void securecast_destroy(void *data) {
     gs_effect_destroy(filter->trackerGrayEffect_);
     filter->trackerGrayEffect_ = nullptr;
   }
+  destroy_last_safe_render(filter);
 #ifdef _WIN32
   // 1-G: half-size OCR 다운스케일 리소스 해제
   destroy_ocr_down_stage(filter);
@@ -1464,9 +1599,11 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
   // --- Step 1: 링 버퍼 지연 초기화 또는 해상도 변경 대응 ---
   if (!filter->ringBuffer.isInitialized()) {
     if (!filter->ringBuffer.initialize(w, h)) {
-      obs_source_skip_video_filter(filter->context);
+      render_solid_black_frame(w, h);
       return;
     }
+    filter->lastCompletedOcrFrameId.store(0, std::memory_order_release);
+    filter->unverifiedFrameLogCounter = 0;
     // 첫 초기화 시 AI 워커 + Tracker 스레드 시작
     filter->mockWorker.start(w, h, [filter](const MaskPayload &payload) {
       filter->maskChannel.publish(payload);
@@ -1490,15 +1627,18 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
 
     // 2. 링 버퍼 재구성
     filter->ringBuffer.destroy();
+    destroy_last_safe_render(filter);
     destroy_ocr_stage_surface(filter);
 #ifdef _WIN32
     destroy_ocr_down_stage(
         filter); // 1-G: 해상도 변경 시 half-size stagesurf 재생성
 #endif
     if (!filter->ringBuffer.initialize(w, h)) {
-      obs_source_skip_video_filter(filter->context);
+      render_solid_black_frame(w, h);
       return;
     }
+    filter->lastCompletedOcrFrameId.store(0, std::memory_order_release);
+    filter->unverifiedFrameLogCounter = 0;
 
     // 3. 마스킹 큐 비우기
     MaskPayload dummy;
@@ -1546,6 +1686,9 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
   // ringBuffer.destroy()는 이미 파괴된 경우 no-op이라 매 프레임 호출해도 안전.
   if (filter->panicMode.load(std::memory_order_relaxed)) {
     filter->ringBuffer.destroy();
+    destroy_last_safe_render(filter);
+    filter->lastCompletedOcrFrameId.store(0, std::memory_order_release);
+    filter->unverifiedFrameLogCounter = 0;
 
     gs_effect_t *solid = obs_get_base_effect(OBS_EFFECT_SOLID);
 
@@ -1587,7 +1730,8 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
   // 픽셀 내용과 마스크 위치가 정확히 동기화된다.
   uint64_t ts = obs_get_video_frame_time();
 #ifdef _WIN32
-  filter->ringBuffer.pushFrame(ts, filter->context, &filter->captureWindowList);
+  filter->ringBuffer.pushFrame(ts, filter->context, &filter->captureWindowList,
+                               filter->lastSubmittedOcrFrameId.load(std::memory_order_relaxed));
   // push 이후에 DWM 갱신 → 다음 프레임의 captureWindowList로 저장
   // [Fix #3-B] 사라진 hwnd를 render 경로에서 즉시 lingering에 등록
   //   → tick(slow-scan)보다 훨씬 빠르게 잔영을 보장
@@ -1607,7 +1751,8 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
   }
   filter->captureWindowList = filter->windowList;
 #else
-  filter->ringBuffer.pushFrame(ts, filter->context);
+  filter->ringBuffer.pushFrame(ts, filter->context,
+                               filter->lastSubmittedOcrFrameId.load(std::memory_order_relaxed));
 #endif
 
   // --- Step 3: maskChannel drain (OCR 좌표는 Visual Tracker가 직접 관리) ---
@@ -1654,7 +1799,7 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
   // ---------------------------------------------------------
   // [C-5 수정] Phase 1(Collect+Hash) 도중에 돌려 delayedSlot early-return 앞에
   // 실행. 이로써 첫 N프레임 동안도 GPU 수확 시도가 이루어짐. Phase
-  // 2(Enqueue)+3(Submit)은 delayedTex 확보 후에 수행 (아래 참조).
+  // 2(Enqueue)+3(Submit)은 최신 분석 슬롯 확보 후에 수행 (아래 참조).
   // ---------------------------------------------------------
   // OCR 해상도 캡(Cap): 최대 1920x1080 [C-4 수정: totalSlots=2 제거]
   int ocrW = ((int)w > 1920) ? 1920 : (int)w;
@@ -1721,29 +1866,22 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
   }
 #endif // _WIN32 Phase1 end
 
+
+
   // --- Step 4~5: N프레임 지연된 슬롯 꺼내기 ---
   const FrameRingBuffer::Slot *delayedSlot =
       filter->ringBuffer.peekDelayedSlot();
-
-  if (!delayedSlot || !delayedSlot->getTexture()) {
-    // [P1 Fix] Fail-Secure 최우선 정책: 버퍼가 아직 충분히 준비되지 않은 첫
-    // N프레임 초기 구간에서 민감한 원본 화면이 노출되지 않도록 전면 블랙 렌더링
-    // 적용
-    gs_effect_t *solid = obs_get_base_effect(OBS_EFFECT_SOLID);
-    gs_eparam_t *colorParam = gs_effect_get_param_by_name(solid, "color");
-    gs_effect_set_color(colorParam, 0xFF000000); // 100% 불투명 검정색
-    while (gs_effect_loop(solid, "Solid")) {
-      gs_draw_sprite(nullptr, 0, w, h);
-    }
-    return;
-  }
+  const FrameRingBuffer::Slot *analysisSlot =
+      filter->ringBuffer.peekSlotAtOffset(1);
 
   // --- Step 5a: 30Hz Tracker readback + OCR 제출 ---
   // Tracker: 2프레임마다 GPU readback → tracker thread에 swap 전달 (30Hz NCC)
   // OCR:     tracker readback과 동일 프레임 중 ocrWorkerIdle일 때만 제출
   // (~4fps) update_all()은 tracker thread에서 실행 — 렌더 스레드 블로킹 없음.
   ++filter->trackerFrameSkip_;
-  if (filter->trackerFrameSkip_ >= 2) {
+  gs_texture_t *analysisTex =
+      analysisSlot ? analysisSlot->getTexture() : nullptr;
+  if (analysisTex && filter->trackerFrameSkip_ >= 2) {
     filter->trackerFrameSkip_ = 0;
 
     // ocrWorkerIdle: 단일 소비자(렌더 스레드)가 load→조건부 store(false),
@@ -1751,20 +1889,26 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
     // 이 구조상 load와 store(false) 사이의 원자성 갭은 race를 일으키지 않는다.
     // 멀티 제출 경로가 추가될 경우 compare_exchange_strong으로 교체 필요.
     const bool ocrIdle = filter->ocrWorkerIdle.load(std::memory_order_acquire);
-    if (ocrIdle)
+    const bool ocrCanSubmit =
+        ocrIdle && filter->ocrWorkerRunning.load(std::memory_order_acquire);
+    if (ocrCanSubmit) {
       filter->ocrWorkerIdle.store(false, std::memory_order_release);
+      filter->lastSubmittedOcrFrameId.store(analysisSlot->frameId, std::memory_order_relaxed);
+      // analysisSlot은 방금 제출되었으므로, 자신을 대표 ID로 삼음 (const cast 필요)
+      const_cast<FrameRingBuffer::Slot*>(analysisSlot)->dependentOcrFrameId = analysisSlot->frameId;
+    }
 
     std::vector<uint8_t> bgraPixels;
     int stride = 0;
-    gs_texture_t *ocrTex = delayedSlot->getTexture();
 
     // Tier 1: GPU gray readback (30Hz, 2MB) — 기존 8MB BGRA readback 대체
     // GS_R8 미지원 시 false 반환 → CPU bgra_to_gray 폴백 경로 사용.
     std::vector<uint8_t> grayPixels;
-    bool grayOk = read_tracker_gray_gpu(filter, ocrTex, w, h, grayPixels);
+    bool grayOk = read_tracker_gray_gpu(filter, analysisTex, w, h, grayPixels);
     if (!grayOk) {
       // 폴백: 전체 BGRA readback → CPU gray 변환
-      if (read_texture_bgra_to_cpu(filter, ocrTex, w, h, bgraPixels, stride)) {
+      if (read_texture_bgra_to_cpu(filter, analysisTex, w, h, bgraPixels,
+                                   stride)) {
         VisualTrackerManager::bgra_to_gray(bgraPixels.data(), (int)w, (int)h,
                                            stride, grayPixels);
         grayOk = true;
@@ -1812,7 +1956,7 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
     // OCR 제출: ocrIdle일 때만 (~4fps)
     // 1-G: 1280px+ → GPU 2× 다운샘플 readback으로 속도 최적화.
     //      트래커도 동일 half-res 공간을 사용하므로 좌표계 불일치 없음.
-    if (ocrIdle) {
+    if (ocrCanSubmit) {
       std::vector<uint8_t> ocrPixels;
       int ocrW = static_cast<int>(w), ocrH = static_cast<int>(h), ocrStride = 0;
       bool ocrSubmit = false;
@@ -1820,7 +1964,7 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
 #ifdef _WIN32
       if (use1GPath) {
         // 1-G: GPU BGRADownsample2x → half-size BGRA readback
-        if (read_texture_bgra_half_gpu(filter, ocrTex, w, h, ocrPixels,
+        if (read_texture_bgra_half_gpu(filter, analysisTex, w, h, ocrPixels,
                                        ocrStride)) {
           ocrW = static_cast<int>(filter->ocrDownW_);
           ocrH = static_cast<int>(filter->ocrDownH_);
@@ -1834,14 +1978,16 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
           ocrPixels = bgraPixels;
           ocrStride = static_cast<int>(w) * 4;
           ocrSubmit = true;
-        } else if (read_texture_bgra_to_cpu(filter, ocrTex, w, h, ocrPixels,
-                                            ocrStride)) {
+        } else if (read_texture_bgra_to_cpu(filter, analysisTex, w, h,
+                                            ocrPixels, ocrStride)) {
           ocrSubmit = true;
         }
       }
 
       if (ocrSubmit) {
-        submit_ocr_frame(filter, std::move(ocrPixels), ocrW, ocrH, ocrStride);
+        // markAnalysisSubmitted 호출 삭제됨
+        submit_ocr_frame(filter, std::move(ocrPixels), ocrW, ocrH, ocrStride,
+                         analysisSlot->frameId);
 
         if (++filter->trackerLogCounter >= 150) {
           filter->trackerLogCounter = 0;
@@ -1851,21 +1997,38 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
       } else {
         filter->ocrWorkerIdle.store(true, std::memory_order_release);
       }
-    } else if (!grayOk) {
+    } else if (ocrIdle && !grayOk) {
       // gray도 실패, OCR도 건너뜀 → ocrIdle 복원
       filter->ocrWorkerIdle.store(true, std::memory_order_release);
     }
   }
 
-  // --- Step 5b: 지연 프레임 그리기 ---
-  gs_texture_t *delayedTex = delayedSlot->getTexture();
-  gs_effect_t *draw = obs_get_base_effect(OBS_EFFECT_DEFAULT);
-  gs_effect_set_texture(gs_effect_get_param_by_name(draw, "image"), delayedTex);
-  while (gs_effect_loop(draw, "Draw"))
-    gs_draw_sprite(delayedTex, 0, w, h);
+  // --- Step 5b: 분석 완료 프레임만 그리기 ---
+  // delayedSlot이 의존하는 대표 OCR 프레임이 완료 표시를 받았는지 확인한다.
+  // 완료되지 않았다면 원본 송출 금지. 마스크까지 합성해둔 마지막 안전 출력 프레임을 재송출(Freeze)한다.
+  uint64_t safeWatermarkId = filter->lastCompletedOcrFrameId.load(std::memory_order_acquire);
+  uint64_t delayedId = delayedSlot ? delayedSlot->frameId : 0;
+  bool isSafeToRender = (safeWatermarkId > 0) && delayedSlot && (delayedSlot->dependentOcrFrameId <= safeWatermarkId);
+
+  if (!delayedSlot || !delayedSlot->getTexture() || !isSafeToRender) {
+    if (++filter->unverifiedFrameLogCounter >= 60) {
+      filter->unverifiedFrameLogCounter = 0;
+      blog(LOG_WARNING,
+           "[SecureCast][gate] delayed frame %" PRIu64
+           " dependent on OCR %" PRIu64 " not analyzed (watermark %" PRIu64 "); freezing last safe output",
+           delayedId, delayedSlot ? delayedSlot->dependentOcrFrameId : 0, safeWatermarkId);
+    }
+    if (!render_last_safe_frame(filter, w, h))
+      render_solid_black_frame(w, h);
+    return;
+  }
+  filter->unverifiedFrameLogCounter = 0;
+
+  const FrameRingBuffer::Slot *outputSlot = delayedSlot;
+  gs_texture_t *outputTex = outputSlot->getTexture();
 
   // --- 마스킹 오버레이 ---
-  // Role A: delayedSlot->windowSnapshot (프레임 캡처 시점의 창 위치 → 프레임과
+  // Role A: outputSlot->windowSnapshot (프레임 캡처 시점의 창 위치 → 프레임과
   // 동기화됨) Role B/C: lastMask (AI/MockAI 결과)
   // [Fix #3-D] capacity: manualBlur(32) + lastMask(32) + windowSnapshot×2(32)
   //            + lingering(16) + trackers(8) + notif/여유(8) = 128
@@ -1878,11 +2041,11 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
 
 #ifdef _WIN32
   // N프레임 전 스냅샷 (현재 렌더링 중인 지연 프레임과 동기화)
-  for (int i = 0; i < delayedSlot->windowSnapshot.count &&
+  for (int i = 0; i < outputSlot->windowSnapshot.count &&
                   all_count < (int)(sizeof(all_rects) / sizeof(all_rects[0]));
        i++) {
     BlurRect r =
-        tracked_window_to_blur_rect(delayedSlot->windowSnapshot.items[i], w, h);
+        tracked_window_to_blur_rect(outputSlot->windowSnapshot.items[i], w, h);
     if (r.width > 0 && r.height > 0)
       all_rects[all_count++] = r;
   }
@@ -1980,29 +2143,10 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
     }
   }
 
-  if (all_count > 0) {
-    if (filter->blurEffect) {
-      // blur.effect 셰이더 사용 (Blur / Blackout technique)
-      for (int i = 0; i < all_count; i++)
-        render_blur_rect(filter->blurEffect, delayedTex, all_rects[i], w, h);
-    } else {
-      // 셰이더 로드 실패 시 fallback: 단색 검정 박스
-      gs_effect_t *solid = obs_get_base_effect(OBS_EFFECT_SOLID);
-      gs_effect_set_color(gs_effect_get_param_by_name(solid, "color"),
-                          0xFF000000);
-      gs_matrix_push();
-      while (gs_effect_loop(solid, "Solid")) {
-        for (int i = 0; i < all_count; i++) {
-          gs_matrix_identity();
-          gs_matrix_translate3f((float)all_rects[i].x, (float)all_rects[i].y,
-                                0.0f);
-          gs_draw_sprite(nullptr, 0, (uint32_t)all_rects[i].width,
-                         (uint32_t)all_rects[i].height);
-        }
-      }
-      gs_matrix_pop();
-    }
-  }
+  if (update_last_safe_render(filter, outputTex, all_rects, all_count, w, h))
+    render_last_safe_frame(filter, w, h);
+  else
+    render_masked_output(filter, outputTex, all_rects, all_count, w, h);
 
 #ifdef _WIN32
   // 게임 모드 활성 시: 우상단에 빨간 네모 박스 표시 (임시 인디케이터)

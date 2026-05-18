@@ -23,9 +23,9 @@
 #include <functional>
 #include <mutex>
 #include <stdint.h>
+#include <string>
 #include <thread>
 #include <vector>
-#include <string>
 
 #ifdef _WIN32
 #include "gpu-readback.h"
@@ -67,8 +67,9 @@ class SecureCastOcrEngine;
 constexpr int SC_MAX_BLUR_RECTS =
     32; // 한 프레임에 동시에 마스킹 가능한 최대 영역 수
 constexpr int SC_RING_BUFFER_SLOTS =
-    15; // Bounded Exposure: OCR 레이턴시(≈250ms) / 프레임(16.7ms@60fps) = 15슬롯.
-        // 이 값 미만이면 새 PII가 OCR 탐지 전에 스트림에 출력된다 (보안 원시 위반).
+    15; // Bounded Exposure: OCR 레이턴시(≈250ms) / 프레임(16.7ms@60fps) =
+        // 15슬롯. 이 값 미만이면 새 PII가 OCR 탐지 전에 스트림에 출력된다 (보안
+        // 원시 위반).
 
 // ----------------------------------------------------
 // Shared Types (Types) - Moved to securecast-types.h
@@ -109,10 +110,12 @@ public:
   struct Slot {
     gs_texrender_t *texrender = nullptr; // OBS 안전 렌더 타겟 관리자
     uint64_t timestamp = 0;
+    uint64_t frameId = 0;
+    uint64_t dependentOcrFrameId = 0; // 이 프레임 송출 전 완료되어야 할 대표 OCR 프레임 ID
 #ifdef _WIN32
     // 이 프레임이 캡처된 시점의 창 좌표 스냅샷.
-    // 렌더 시 delayedSlot->windowSnapshot을 사용해야 프레임 내용과 마스크
-    // 위치가 동기화됨.
+    // 렌더 시 출력 슬롯의 windowSnapshot을 사용해야 프레임 내용과 마스크 위치가
+    // 동기화됨.
     TrackedWindowList windowSnapshot{};
 #endif
 
@@ -133,9 +136,9 @@ public:
   // wlist: 이 프레임 캡처 시점의 창 좌표 스냅샷 (null 허용).
 #ifdef _WIN32
   void pushFrame(uint64_t timestamp, obs_source_t *filter_context,
-                 const TrackedWindowList *wlist);
+                 const TrackedWindowList *wlist, uint64_t dependentOcrFrameId);
 #else
-  void pushFrame(uint64_t timestamp, obs_source_t *filter_context);
+  void pushFrame(uint64_t timestamp, obs_source_t *filter_context, uint64_t dependentOcrFrameId);
 #endif
 
   const Slot *peekDelayedSlot() const;
@@ -152,6 +155,7 @@ private:
   std::array<Slot, SC_RING_BUFFER_SLOTS> m_slots{};
   int m_head = 0;
   int m_frameCount = 0;
+  uint64_t m_nextFrameId = 1;
   uint32_t m_width = 0;
   uint32_t m_height = 0;
   bool m_initialized = false;
@@ -241,7 +245,8 @@ struct SecureCastFilter {
 #ifdef _WIN32
   GpuReadback readback; // GPU 텍스처를 CPU 메모리로 지연 없이 복사하는 다중
                         // 슬롯 텍스처 풀
-  OverlayWindow overlay; // [Role D] 스트리머 전용 보안 상태 HUD (OBS 캡처에서 제외됨)
+  OverlayWindow
+      overlay; // [Role D] 스트리머 전용 보안 상태 HUD (OBS 캡처에서 제외됨)
 #endif
   PixelHashCache fullScreenHash; // FNV-1a 기반으로 화면 변화(Smart Grid)를
                                  // 감지하여 AI 동작을 제어하는 객체
@@ -254,7 +259,8 @@ struct SecureCastFilter {
                          // 담당하는 헬스 매니저
 
   // ----- [Role D] UI 설정 -----
-  mutable std::mutex settingsMutex; // GUI 스레드(update)와 렌더 스레드 간 data race 방지
+  mutable std::mutex
+      settingsMutex; // GUI 스레드(update)와 렌더 스레드 간 data race 방지
   std::string blacklistApps = ""; // 줄바꿈 구분 앱 이름 목록
   float blurIntensity = 5.0f;
   float sensitivity = 0.5f;
@@ -273,6 +279,11 @@ struct SecureCastFilter {
   float trackerAccumulator =
       0.0f; // 윈도우 스캔 틱 조절(0.15초 단위)용 시간 누산기
   gs_effect_t *blurEffect = nullptr; // 컴파일된 HLSL 셰이더
+  gs_texrender_t *lastSafeRender_ =
+      nullptr; // 마스크까지 합성된 마지막 안전 출력 프레임
+  bool lastSafeReady_ = false;
+  uint32_t lastSafeW_ = 0;
+  uint32_t lastSafeH_ = 0;
   std::mutex blacklistMutex;   // video_tick(비디오)과 video_render(렌더) 간의
                                // 동시 접근을 막는 뮤텍스
   MaskPayload blacklistMask{}; // [우선순위 1] Role A가 추적한 블랙리스트 앱
@@ -298,7 +309,8 @@ struct SecureCastFilter {
   FILETIME prevUserTime = {};
 #endif
 
-  // destroy 진입 즉시 true — 진행 중인 핫키 콜백이 해제된 멤버에 접근하지 못하도록
+  // destroy 진입 즉시 true — 진행 중인 핫키 콜백이 해제된 멤버에 접근하지
+  // 못하도록
   std::atomic<bool> isDestroying{false};
 
   // ----- [Panic Button] Ctrl+Shift+F12 -----
@@ -386,6 +398,7 @@ struct SecureCastFilter {
   // OCR 입력 프레임은 최신 1장만 유지한다. OCR이 render보다 느릴 때 큐 누적을
   // 막기 위함이다.
   bool ocrFramePending = false;
+  uint64_t ocrPendingFrameId = 0;
   std::vector<uint8_t> ocrPendingPixels;
   int ocrPendingWidth = 0;
   int ocrPendingHeight = 0;
@@ -393,10 +406,13 @@ struct SecureCastFilter {
 
   // back-pressure: idle이면 즉시 새 프레임 수용, busy면 GPU readback 건너뜀
   std::atomic<bool> ocrWorkerIdle{true};
+  std::atomic<uint64_t> lastSubmittedOcrFrameId{0};
+  std::atomic<uint64_t> lastCompletedOcrFrameId{0};
+  int unverifiedFrameLogCounter = 0;
 
-  // dHash 캐시 무효화 요청 — GUI 스레드가 set, OCR 워커가 다음 사이클 진입 시 clear.
-  // clearDHashCache()를 GUI 스레드에서 직접 호출하면 data race 발생하므로
-  // 이 플래그를 경유해 워커 스레드에서 안전하게 실행한다.
+  // dHash 캐시 무효화 요청 — GUI 스레드가 set, OCR 워커가 다음 사이클 진입 시
+  // clear. clearDHashCache()를 GUI 스레드에서 직접 호출하면 data race
+  // 발생하므로 이 플래그를 경유해 워커 스레드에서 안전하게 실행한다.
   std::atomic<bool> ocrClearCachePending{false};
 
   // M8: OCR 엔진 초기화 영구 실패 여부. 렌더 루프에서 확인 후 RISK 상태로 전환.
