@@ -255,7 +255,9 @@ struct SecureCastFilter {
 
   // ----- [Role D] UI 설정 -----
   mutable std::mutex settingsMutex; // GUI 스레드(update)와 렌더 스레드 간 data race 방지
-  std::string blacklistApps = ""; // 줄바꿈 구분 앱 이름 목록
+  std::vector<std::wstring> appBlacklist;     // Normal mode 보호 대상 앱 목록
+  std::vector<std::wstring> appBlacklistGame; // Game mode 보호 대상 앱 목록
+  std::mutex appBlacklistMutex;              // appBlacklist/appBlacklistGame 보호
   float blurIntensity = 5.0f;
   float sensitivity = 0.5f;
 

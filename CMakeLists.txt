@@ -191,6 +191,8 @@ if(WIN32)
     dxgi
     dwmapi
     windowsapp
+    advapi32
+    version
   )
 endif()
 

@@ -58,8 +58,9 @@ SecureCastFilter::~SecureCastFilter() = default;
 // trackerAccumulator에 이 값을 대입하면 다음 sc_tracker_tick 호출 시 임계를
 // 즉시 초과 → 강제 스캔 트리거.
 
-// forward declaration — 정의는 Properties/Settings 섹션에 있음
+// forward declarations — 정의는 Properties/Settings 섹션에 있음
 static void save_manual_rects(SecureCastFilter *filter, const MaskPayload &mask);
+static void securecast_update(void *data, obs_data_t *settings);
 
 static constexpr float SCAN_INTERVAL_FORCE = 1.0f;
 static constexpr float SCAN_INTERVAL_NORMAL = 0.15f; // 일반 모드 스캔 주기
@@ -1161,8 +1162,6 @@ static const char *securecast_get_name(void *type_data) {
 //
 // 반환값은 OBS가 보관하다가 이후 모든 콜백의 data 인자로 다시 넘겨준다.
 static void *securecast_create(obs_data_t *settings, obs_source_t *context) {
-  (void)settings;
-
   SecureCastFilter *filter = new SecureCastFilter();
   filter->context = context;
   filter->isActive = true;
@@ -1309,6 +1308,9 @@ static void *securecast_create(obs_data_t *settings, obs_source_t *context) {
   else
     blog(LOG_INFO,
          "[SecureCast] downsample effect loaded (Tier 1 GPU gray active).");
+
+  // 저장된 설정에서 앱 목록 초기 로드
+  securecast_update(filter, settings);
 
   return filter;
 }
@@ -2109,11 +2111,22 @@ static void securecast_video_tick(void *data, float seconds) {
     }
   }
 
-  const float scanInterval =
-      filter->isGameMode.load(std::memory_order_acquire) ? SCAN_INTERVAL_GAME
-                                                          : SCAN_INTERVAL_NORMAL;
+  const bool gameMode = filter->isGameMode.load(std::memory_order_acquire);
+  const float scanInterval = gameMode ? SCAN_INTERVAL_GAME : SCAN_INTERVAL_NORMAL;
+
+  // 게임 모드 여부에 따라 사용할 앱 목록을 스냅샷으로 가져온다
+  std::vector<std::wstring> appSnapshot;
+  {
+    std::lock_guard<std::mutex> alLock(filter->appBlacklistMutex);
+    appSnapshot = gameMode ? filter->appBlacklistGame : filter->appBlacklist;
+  }
+  std::vector<const wchar_t *> appPtrs;
+  appPtrs.reserve(appSnapshot.size());
+  for (const auto &s : appSnapshot)
+    appPtrs.push_back(s.c_str());
+
   sc_tracker_tick(seconds, &filter->trackerAccumulator, &filter->windowList,
-                  scanInterval);
+                  scanInterval, appPtrs.data(), (int)appPtrs.size());
 
   // [Role D] windowList 스캔 결과를 blacklistMask에 반영 (video_render에서 최우선 차단에 사용)
   {
@@ -2238,11 +2251,53 @@ static void securecast_video_tick(void *data, float seconds) {
 // [Role D] Properties UI
 // ================================================================
 
-#define SC_SETTING_BLACKLIST      "sc_blacklist"
+#define SC_SETTING_NORMAL_LIST    "sc_normal_list"
+#define SC_SETTING_GAME_LIST      "sc_game_list"
+#define SC_SETTING_APP_PICKER     "sc_app_picker"
 #define SC_SETTING_BLUR_INTENSITY "sc_blur_intensity"
 // #define SC_SETTING_GAME_MODE   "sc_game_mode"  // [v2] 게임 모드 — 현재 스코프 외
 #define SC_SETTING_SENSITIVITY    "sc_sensitivity"
 #define SC_SETTING_MANUAL_RECTS   "sc_manual_rects"
+
+#ifdef _WIN32
+// 현재 실행 중인 프로세스의 exe 이름 목록을 반환한다.
+// OBS Properties 창이 열릴 때 앱 picker 드롭다운 채우기에 사용.
+static std::vector<std::string> enumerate_running_apps()
+{
+  struct Ctx { std::vector<std::string> *apps; };
+  std::vector<std::string> result;
+  Ctx ctx{&result};
+  EnumWindows([](HWND hwnd, LPARAM lp) -> BOOL {
+    auto *c = reinterpret_cast<Ctx *>(lp);
+    if (!IsWindowVisible(hwnd))
+      return TRUE;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (!pid)
+      return TRUE;
+    HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!proc)
+      return TRUE;
+    wchar_t path[MAX_PATH] = {};
+    DWORD sz = MAX_PATH;
+    if (QueryFullProcessImageNameW(proc, 0, path, &sz)) {
+      const wchar_t *name = path;
+      for (const wchar_t *p = path; *p; ++p)
+        if (*p == L'\\' || *p == L'/')
+          name = p + 1;
+      char buf[256] = {};
+      WideCharToMultiByte(CP_UTF8, 0, name, -1, buf, sizeof(buf), nullptr, nullptr);
+      if (*buf)
+        c->apps->push_back(buf);
+    }
+    CloseHandle(proc);
+    return TRUE;
+  }, reinterpret_cast<LPARAM>(&ctx));
+  std::sort(result.begin(), result.end());
+  result.erase(std::unique(result.begin(), result.end()), result.end());
+  return result;
+}
+#endif
 
 // manualBlurMask → obs_data_array 직렬화 후 source settings에 write-back.
 // settingsMutex 밖에서 호출해야 함 — obs_source_get_settings가 OBS 내부 락을 잡을 수 있음.
@@ -2268,9 +2323,29 @@ static void save_manual_rects(SecureCastFilter* filter, const MaskPayload& mask)
 }
 
 static void securecast_get_defaults(obs_data_t *settings) {
-  obs_data_set_default_string(settings, SC_SETTING_BLACKLIST, "");
   obs_data_set_default_double(settings, SC_SETTING_BLUR_INTENSITY, 5.0);
   obs_data_set_default_double(settings, SC_SETTING_SENSITIVITY, 0.5);
+
+  // 기본 보호 앱 목록 (Normal / Game 공통 초기값)
+  static const char *kDefaultApps[] = {
+    "KakaoTalk.exe", "Discord.exe", "Slack.exe"
+  };
+  auto make_default_arr = [](const char *const *names, int count) {
+    obs_data_array_t *arr = obs_data_array_create();
+    for (int i = 0; i < count; ++i) {
+      obs_data_t *item = obs_data_create();
+      obs_data_set_string(item, "value", names[i]);
+      obs_data_array_push_back(arr, item);
+      obs_data_release(item);
+    }
+    return arr;
+  };
+  obs_data_array_t *normalArr = make_default_arr(kDefaultApps, 3);
+  obs_data_array_t *gameArr   = make_default_arr(kDefaultApps, 3);
+  obs_data_set_default_array(settings, SC_SETTING_NORMAL_LIST, normalArr);
+  obs_data_set_default_array(settings, SC_SETTING_GAME_LIST,   gameArr);
+  obs_data_array_release(normalArr);
+  obs_data_array_release(gameArr);
 
   obs_data_array_t *emptyArr = obs_data_array_create();
   obs_data_set_default_array(settings, SC_SETTING_MANUAL_RECTS, emptyArr);
@@ -2278,9 +2353,78 @@ static void securecast_get_defaults(obs_data_t *settings) {
 }
 
 static obs_properties_t *securecast_get_properties(void *data) {
+  auto *filter = static_cast<SecureCastFilter *>(data);
   obs_properties_t *props = obs_properties_create();
-  obs_properties_add_text(props, SC_SETTING_BLACKLIST,
-                          "Blacklist Apps (one per line)", OBS_TEXT_MULTILINE);
+
+#ifdef _WIN32
+  // --- 앱 picker 드롭다운 (실행 중인 앱 목록) ---
+  obs_property_t *picker = obs_properties_add_list(
+      props, SC_SETTING_APP_PICKER, obs_module_text("SelectApp"),
+      OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+  for (const auto &app : enumerate_running_apps())
+    obs_property_list_add_string(picker, app.c_str(), app.c_str());
+
+  // --- Normal Mode Apps 그룹 ---
+  obs_properties_t *normal_grp = obs_properties_create();
+  obs_properties_add_editable_list(normal_grp, SC_SETTING_NORMAL_LIST,
+                                   obs_module_text("NormalAppList"),
+                                   OBS_EDITABLE_LIST_TYPE_STRINGS,
+                                   nullptr, nullptr);
+  obs_properties_add_button(
+      normal_grp, "sc_add_normal", obs_module_text("AddToNormalList"),
+      [](obs_properties_t *, obs_property_t *, void *btn_data) -> bool {
+        auto *f = static_cast<SecureCastFilter *>(btn_data);
+        obs_data_t *s = obs_source_get_settings(f->context);
+        const char *sel = obs_data_get_string(s, SC_SETTING_APP_PICKER);
+        if (sel && *sel) {
+          obs_data_array_t *arr = obs_data_get_array(s, SC_SETTING_NORMAL_LIST);
+          if (!arr) arr = obs_data_array_create();
+          obs_data_t *item = obs_data_create();
+          obs_data_set_string(item, "value", sel);
+          obs_data_array_push_back(arr, item);
+          obs_data_release(item);
+          obs_data_set_array(s, SC_SETTING_NORMAL_LIST, arr);
+          obs_data_array_release(arr);
+          obs_source_update(f->context, s);
+        }
+        obs_data_release(s);
+        return true;
+      });
+  obs_properties_add_group(props, "sc_normal_group",
+                           obs_module_text("NormalModeApps"),
+                           OBS_GROUP_NORMAL, normal_grp);
+
+  // --- Game Mode Apps 그룹 ---
+  obs_properties_t *game_grp = obs_properties_create();
+  obs_properties_add_editable_list(game_grp, SC_SETTING_GAME_LIST,
+                                   obs_module_text("GameAppList"),
+                                   OBS_EDITABLE_LIST_TYPE_STRINGS,
+                                   nullptr, nullptr);
+  obs_properties_add_button(
+      game_grp, "sc_add_game", obs_module_text("AddToGameList"),
+      [](obs_properties_t *, obs_property_t *, void *btn_data) -> bool {
+        auto *f = static_cast<SecureCastFilter *>(btn_data);
+        obs_data_t *s = obs_source_get_settings(f->context);
+        const char *sel = obs_data_get_string(s, SC_SETTING_APP_PICKER);
+        if (sel && *sel) {
+          obs_data_array_t *arr = obs_data_get_array(s, SC_SETTING_GAME_LIST);
+          if (!arr) arr = obs_data_array_create();
+          obs_data_t *item = obs_data_create();
+          obs_data_set_string(item, "value", sel);
+          obs_data_array_push_back(arr, item);
+          obs_data_release(item);
+          obs_data_set_array(s, SC_SETTING_GAME_LIST, arr);
+          obs_data_array_release(arr);
+          obs_source_update(f->context, s);
+        }
+        obs_data_release(s);
+        return true;
+      });
+  obs_properties_add_group(props, "sc_game_group",
+                           obs_module_text("GameModeApps"),
+                           OBS_GROUP_NORMAL, game_grp);
+#endif
+
   obs_properties_add_float_slider(props, SC_SETTING_BLUR_INTENSITY,
                                   "Blur Intensity", 1.0, 10.0, 0.5);
   obs_properties_add_float_slider(props, SC_SETTING_SENSITIVITY,
@@ -2291,32 +2435,52 @@ static obs_properties_t *securecast_get_properties(void *data) {
   obs_properties_add_button(
       props, "sc_clear_manual", "Clear Manual Blurs",
       [](obs_properties_t *, obs_property_t *, void *btn_data) -> bool {
-        auto *filter = static_cast<SecureCastFilter *>(btn_data);
+        auto *f2 = static_cast<SecureCastFilter *>(btn_data);
         MaskPayload snapshot{};
         {
-          std::lock_guard<std::mutex> lock(filter->settingsMutex);
-          filter->manualBlurMask.rectCount = 0;
-          filter->dragActive = false;
-          snapshot = filter->manualBlurMask;
+          std::lock_guard<std::mutex> lock(f2->settingsMutex);
+          f2->manualBlurMask.rectCount = 0;
+          f2->dragActive = false;
+          snapshot = f2->manualBlurMask;
         }
-        save_manual_rects(filter, snapshot);
+        save_manual_rects(f2, snapshot);
         blog(LOG_INFO,
              "[SecureCast][D] Manual blur rects cleared (Properties button).");
         return true;
       });
-  (void)data;
-#else
-  (void)data;
 #endif
 
+  (void)filter;
   return props;
+}
+
+// obs_data_array_t에서 exe 이름(value 키)을 wstring 벡터로 변환하는 헬퍼
+static std::vector<std::wstring> load_app_list_from_array(obs_data_array_t *arr)
+{
+  std::vector<std::wstring> result;
+  if (!arr)
+    return result;
+  size_t count = obs_data_array_count(arr);
+  for (size_t i = 0; i < count; ++i) {
+    obs_data_t *item = obs_data_array_item(arr, i);
+    const char *val = obs_data_get_string(item, "value");
+    if (val && *val) {
+      int len = MultiByteToWideChar(CP_UTF8, 0, val, -1, nullptr, 0);
+      if (len > 1) {
+        std::wstring ws(len - 1, 0);
+        MultiByteToWideChar(CP_UTF8, 0, val, -1, ws.data(), len);
+        result.push_back(std::move(ws));
+      }
+    }
+    obs_data_release(item);
+  }
+  return result;
 }
 
 // GUI 스레드에서 호출되므로 settingsMutex로 보호 (Render Thread와 data race 방지)
 static void securecast_update(void *data, obs_data_t *settings) {
   SecureCastFilter *filter = static_cast<SecureCastFilter *>(data);
   std::lock_guard<std::mutex> lock(filter->settingsMutex);
-  filter->blacklistApps = obs_data_get_string(settings, SC_SETTING_BLACKLIST);
   filter->blurIntensity =
       (float)obs_data_get_double(settings, SC_SETTING_BLUR_INTENSITY);
   filter->sensitivity =
@@ -2324,6 +2488,19 @@ static void securecast_update(void *data, obs_data_t *settings) {
   blog(LOG_INFO,
        "[SecureCast][D] Settings updated — blur=%.1f sensitivity=%.2f",
        filter->blurIntensity, filter->sensitivity);
+
+  // 앱 목록 로드 (Normal / Game)
+  {
+    obs_data_array_t *normalArr = obs_data_get_array(settings, SC_SETTING_NORMAL_LIST);
+    obs_data_array_t *gameArr   = obs_data_get_array(settings, SC_SETTING_GAME_LIST);
+    std::vector<std::wstring> nl = load_app_list_from_array(normalArr);
+    std::vector<std::wstring> gl = load_app_list_from_array(gameArr);
+    if (normalArr) obs_data_array_release(normalArr);
+    if (gameArr)   obs_data_array_release(gameArr);
+    std::lock_guard<std::mutex> alLock(filter->appBlacklistMutex);
+    filter->appBlacklist     = std::move(nl);
+    filter->appBlacklistGame = std::move(gl);
+  }
 
   // 수동 블러 rect 역직렬화
   obs_data_array_t *arr = obs_data_get_array(settings, SC_SETTING_MANUAL_RECTS);

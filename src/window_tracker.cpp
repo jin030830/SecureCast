@@ -36,13 +36,6 @@ constexpr int MIN_WINDOW_DIMENSION = 100;
 // 게임 모드에서는 호출자(securecast-filter.cpp)가 SCAN_INTERVAL_GAME(0.5초)을 전달한다.
 constexpr float SCAN_INTERVAL_SEC = 0.15f;
 
-// 보호 대상 앱 목록. 향후 OBS Properties UI에서 사용자가 편집할 수 있게 확장 예정.
-const wchar_t *const kBlacklist[] = {
-	L"KakaoTalk.exe",
-	L"Discord.exe",
-	L"Slack.exe",
-};
-
 // UWP (Microsoft Store) 앱은 모두 ApplicationFrameHost.exe라는 단일 호스트
 // 프로세스로 보고된다. 실제 앱 식별은 자식 윈도우의 PID를 다시 봐야 가능하므로
 // 1주차에선 일괄 스킵하고 후속 단계에서 EnumChildWindows로 보강한다.
@@ -78,14 +71,20 @@ void path_basename(const wchar_t *full_path, wchar_t *out, size_t out_cap)
 	out[i] = 0;
 }
 
-bool is_blacklisted(const wchar_t *exe_name)
+bool is_blacklisted(const wchar_t *const *list, int count, const wchar_t *exe_name)
 {
-	for (const wchar_t *entry : kBlacklist) {
-		if (iequals(entry, exe_name))
+	for (int i = 0; i < count; ++i) {
+		if (list[i] && iequals(list[i], exe_name))
 			return true;
 	}
 	return false;
 }
+
+struct EnumProcCtx {
+	TrackedWindowList *out;
+	const wchar_t *const *appList;
+	int appCount;
+};
 
 // Win+Tab(Task View)나 Alt+Tab(앱 전환기)인지 클래스명으로 판별.
 // 이 창이 앞에 있을 때는 뒤에 있는 민감 앱을 추적 해제하지 않는다.
@@ -138,7 +137,8 @@ bool is_window_top_at_center(HWND hwnd, const RECT &rect)
 //   FALSE → 즉시 순회 중단 (슬롯 소진 시 사용)
 BOOL CALLBACK enum_proc(HWND hwnd, LPARAM lparam)
 {
-	auto *out = reinterpret_cast<TrackedWindowList *>(lparam);
+	auto *ctx = reinterpret_cast<EnumProcCtx *>(lparam);
+	auto *out = ctx->out;
 	if (out->count >= SC_MAX_TRACKED_WINDOWS)
 		return FALSE; // 슬롯 소진 — 순회 중단
 
@@ -184,7 +184,7 @@ BOOL CALLBACK enum_proc(HWND hwnd, LPARAM lparam)
 	if (iequals(exe_name, kUwpHost))
 		return TRUE;
 
-	if (!is_blacklisted(exe_name))
+	if (!is_blacklisted(ctx->appList, ctx->appCount, exe_name))
 		return TRUE;
 
 	// Z-order: 창 중앙이 다른 앱에 가려져 있으면 (뒤로 보내기 상태) 추적 대상 제외.
@@ -238,17 +238,18 @@ extern "C" void sc_update_tracked_bounds(TrackedWindowList *list)
 
 // 호출자는 OBS의 video_tick / video_render 같은 렌더 스레드 컨텍스트에서만 호출할 것.
 // (DWM/Win32 윈도우 핸들 조회는 caller 스레드의 메시지 큐에 의존)
-extern "C" void sc_scan_blacklisted_windows(TrackedWindowList *out)
+extern "C" void sc_scan_blacklisted_windows(TrackedWindowList *out, const wchar_t *const *appList, int appCount)
 {
-	if (!out)
+	if (!out || !appList || appCount <= 0)
 		return;
 	out->count = 0;
-	EnumWindows(enum_proc, reinterpret_cast<LPARAM>(out));
+	EnumProcCtx ctx{out, appList, appCount};
+	EnumWindows(enum_proc, reinterpret_cast<LPARAM>(&ctx));
 }
 
 // 60fps tick에서 매번 호출되어도 실제 무거운 EnumWindows는 0.15초마다 1회만 실행.
 // 매칭된 창은 일단 obs_log로만 출력 — 후속 단계에서 BlurRect로 변환 후 셰이더에 전달.
-extern "C" void sc_tracker_tick(float seconds, float *accumulator, TrackedWindowList *out, float interval)
+extern "C" void sc_tracker_tick(float seconds, float *accumulator, TrackedWindowList *out, float interval, const wchar_t *const *appList, int appCount)
 {
 	if (!accumulator)
 		return;
@@ -259,7 +260,7 @@ extern "C" void sc_tracker_tick(float seconds, float *accumulator, TrackedWindow
 	*accumulator = 0.0f;
 
 	TrackedWindowList list{};
-	sc_scan_blacklisted_windows(&list);
+	sc_scan_blacklisted_windows(&list, appList, appCount);
 
 	// 스캔 결과를 호출자에게 전달 (창이 0개여도 업데이트 — 닫힌 창 반영).
 	if (out)
