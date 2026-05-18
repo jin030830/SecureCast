@@ -2023,7 +2023,7 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
       r.type = 0;
       if (r.width > 0 && r.height > 0) {
         nextSnap.rects[nextSnap.count] = r;
-        nextSnap.ticksRemaining[nextSnap.count] = SC_RING_BUFFER_SLOTS + 1;
+        nextSnap.ticksRemaining[nextSnap.count] = SC_OCR_LINGER_FRAMES;
         nextSnap.count++;
       }
     }
@@ -2453,14 +2453,36 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
   // OCR 박스 — 슬롯 캡처 시점의 스냅샷 사용 (프레임 ↔ 박스 위치 완벽 동기화)
   // ocrBoxSnapshot은 pushFrame 직전 trackerMgr.active_boxes() + lingering으로
   // 구성된 원본 해상도 좌표이므로 별도 tScale 보정 불필요.
+  //
+  // Fallback: 스냅샷이 비어 있을 때(창 복원 직후 — 스냅샷 캡처 시점에 아직
+  // OCR이 미완료) live active_boxes()로 보완.
+  // 스냅샷이 있으면 항상 스냅샷 우선 (위치 동기화 보장).
   {
     const OcrBoxSnapshot &snap = outputSlot->ocrBoxSnapshot;
-    for (int bi = 0; bi < snap.count; ++bi) {
-      if (all_count >= (int)(sizeof(all_rects) / sizeof(all_rects[0])))
-        break;
-      const BlurRect &r = snap.rects[bi];
-      if (r.width > 0 && r.height > 0)
-        all_rects[all_count++] = r;
+    if (snap.count > 0) {
+      for (int bi = 0; bi < snap.count; ++bi) {
+        if (all_count >= (int)(sizeof(all_rects) / sizeof(all_rects[0])))
+          break;
+        const BlurRect &r = snap.rects[bi];
+        if (r.width > 0 && r.height > 0)
+          all_rects[all_count++] = r;
+      }
+    } else {
+      // 스냅샷 empty → live 트래커 fallback (창 복원 직후 OCR 미완료 구간 보호)
+      const float tScale = filter->trackerCoordScale_;
+      const auto liveBoxes = filter->trackerMgr.active_boxes();
+      for (const auto &tb : liveBoxes) {
+        if (all_count >= (int)(sizeof(all_rects) / sizeof(all_rects[0])))
+          break;
+        BlurRect r{};
+        r.x = static_cast<int>(tb.x * tScale);
+        r.y = static_cast<int>(tb.y * tScale);
+        r.width = static_cast<int>(tb.w * tScale);
+        r.height = static_cast<int>(tb.h * tScale);
+        r.type = 0;
+        if (r.width > 0 && r.height > 0)
+          all_rects[all_count++] = r;
+      }
     }
   }
 #ifdef _WIN32

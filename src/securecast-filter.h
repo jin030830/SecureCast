@@ -131,6 +131,11 @@ constexpr int SC_MAX_LINGERING = SC_MAX_TRACKED_WINDOWS;
 constexpr int SC_MAX_SLOT_OCR_BOXES =
     16; // VisualTrackerManager::MAX_TRACKERS(8)의 2배 여유
 
+// NCC가 박스를 일시적으로 잃었을 때(부분 가림 등) 유지할 프레임 수.
+// 너무 크면 창 최소화 후 빈 화면에 블러 잔상이 남음.
+// 너무 작으면 짧은 가림에도 블러가 깜박임.
+constexpr int SC_OCR_LINGER_FRAMES = 5;
+
 struct OcrBoxSnapshot {
   BlurRect rects[SC_MAX_SLOT_OCR_BOXES]{};
   int count = 0;
