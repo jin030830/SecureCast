@@ -193,6 +193,8 @@ if(WIN32)
     windowsapp
     advapi32
     version
+    shell32
+    ole32
   )
 endif()
 

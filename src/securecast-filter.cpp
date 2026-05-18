@@ -28,9 +28,13 @@
 
 #include <algorithm>
 #include <chrono>
+#include <map>
 #include <stdlib.h>
 #include <string.h>
 #include <util/platform.h>
+#ifdef _WIN32
+#include <shlobj.h>  // SHGetKnownFolderPath, IShellLink, FOLDERID_*
+#endif
 
 // 1-E: BGRA 스케일 SIMD 헬퍼 인클루드
 #if defined(_MSC_VER) && defined(_M_X64)
@@ -2260,41 +2264,163 @@ static void securecast_video_tick(void *data, float seconds) {
 #define SC_SETTING_MANUAL_RECTS   "sc_manual_rects"
 
 #ifdef _WIN32
-// 현재 실행 중인 프로세스의 exe 이름 목록을 반환한다.
-// OBS Properties 창이 열릴 때 앱 picker 드롭다운 채우기에 사용.
-static std::vector<std::string> enumerate_running_apps()
+// exe 전체 경로에서 version resource의 FileDescription을 UTF-8로 반환.
+// 버전 정보가 없거나 실패하면 빈 문자열 반환.
+static std::string get_exe_description(const wchar_t *exePath)
 {
-  struct Ctx { std::vector<std::string> *apps; };
-  std::vector<std::string> result;
-  Ctx ctx{&result};
+  DWORD dummy;
+  DWORD size = GetFileVersionInfoSizeW(exePath, &dummy);
+  if (!size)
+    return "";
+  std::vector<BYTE> buf(size);
+  if (!GetFileVersionInfoW(exePath, 0, size, buf.data()))
+    return "";
+  WORD *trans = nullptr;
+  UINT transLen = 0;
+  if (!VerQueryValueW(buf.data(), L"\\VarFileInfo\\Translation",
+                      reinterpret_cast<LPVOID *>(&trans), &transLen)
+      || transLen < 4)
+    return "";
+  wchar_t subBlock[64];
+  swprintf_s(subBlock, L"\\StringFileInfo\\%04x%04x\\FileDescription",
+             trans[0], trans[1]);
+  LPWSTR desc = nullptr;
+  UINT descLen = 0;
+  if (!VerQueryValueW(buf.data(), subBlock,
+                      reinterpret_cast<LPVOID *>(&desc), &descLen)
+      || !desc || descLen == 0)
+    return "";
+  char out[512] = {};
+  WideCharToMultiByte(CP_UTF8, 0, desc, -1, out, sizeof(out), nullptr, nullptr);
+  return out;
+}
+
+// .lnk 바로가기를 IShellLink로 해석해 타겟 exe 전체 경로 반환. 실패 시 빈 문자열.
+static std::wstring resolve_lnk(const wchar_t *lnkPath,
+                                  IShellLinkW *psl, IPersistFile *ppf)
+{
+  if (FAILED(ppf->Load(lnkPath, STGM_READ)))
+    return {};
+  psl->Resolve(nullptr, SLR_NO_UI | SLR_NOSEARCH | SLR_NOTRACK);
+  wchar_t target[MAX_PATH] = {};
+  if (FAILED(psl->GetPath(target, MAX_PATH, nullptr, SLGP_RAWPATH)) || !target[0])
+    return {};
+  return target;
+}
+
+// Start Menu 폴더를 재귀 탐색해 {exeName → 표시 레이블} 맵을 채운다.
+// 바로가기 파일 이름(확장자 제외)이 친화명이 된다 (예: "메모장.lnk" → "메모장").
+static void scan_startmenu(const wchar_t *folder,
+                            std::map<std::string, std::string> &exeToLabel,
+                            IShellLinkW *psl, IPersistFile *ppf)
+{
+  wchar_t pattern[MAX_PATH];
+  swprintf_s(pattern, L"%s\\*", folder);
+  WIN32_FIND_DATAW fd;
+  HANDLE hf = FindFirstFileW(pattern, &fd);
+  if (hf == INVALID_HANDLE_VALUE)
+    return;
+  do {
+    if (fd.cFileName[0] == L'.' &&
+        (fd.cFileName[1] == 0 ||
+         (fd.cFileName[1] == L'.' && fd.cFileName[2] == 0)))
+      continue;
+    wchar_t full[MAX_PATH];
+    swprintf_s(full, L"%s\\%s", folder, fd.cFileName);
+    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+      scan_startmenu(full, exeToLabel, psl, ppf);
+      continue;
+    }
+    size_t len = wcslen(fd.cFileName);
+    if (len <= 4 || _wcsicmp(fd.cFileName + len - 4, L".lnk") != 0)
+      continue;
+    std::wstring target = resolve_lnk(full, psl, ppf);
+    if (target.empty())
+      continue;
+    size_t tlen = target.size();
+    if (tlen <= 4 || _wcsicmp(target.c_str() + tlen - 4, L".exe") != 0)
+      continue;
+    // exe 베이스네임 추출
+    const wchar_t *exeW = target.c_str();
+    for (const wchar_t *p = target.c_str(); *p; ++p)
+      if (*p == L'\\' || *p == L'/') exeW = p + 1;
+    // 바로가기 이름 (.lnk 제거) = 친화명
+    wchar_t shortName[MAX_PATH] = {};
+    wcsncpy_s(shortName, fd.cFileName, len - 4);
+    char exeUtf8[256] = {}, nameUtf8[512] = {};
+    WideCharToMultiByte(CP_UTF8, 0, exeW, -1, exeUtf8, sizeof(exeUtf8), nullptr, nullptr);
+    WideCharToMultiByte(CP_UTF8, 0, shortName, -1, nameUtf8, sizeof(nameUtf8), nullptr, nullptr);
+    if (!*exeUtf8 || !*nameUtf8)
+      continue;
+    std::string key(exeUtf8);
+    if (exeToLabel.find(key) == exeToLabel.end())
+      exeToLabel[key] = std::string(nameUtf8) + " (" + exeUtf8 + ")";
+  } while (FindNextFileW(hf, &fd));
+  FindClose(hf);
+}
+
+// 설치된 앱(Start Menu) + 실행 중인 앱을 합쳐 {표시 레이블, exe 이름} 목록 반환.
+// Start Menu 바로가기 이름이 최우선 친화명. 없으면 version FileDescription. 둘 다 없으면 exe 이름만.
+static std::vector<std::pair<std::string, std::string>> enumerate_all_apps()
+{
+  std::map<std::string, std::string> exeToLabel;
+
+  // 1. Start Menu 바로가기에서 설치된 앱 열거
+  HRESULT hrCom = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+  IShellLinkW *psl = nullptr;
+  if (SUCCEEDED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
+                                  IID_IShellLinkW, reinterpret_cast<void **>(&psl)))) {
+    IPersistFile *ppf = nullptr;
+    if (SUCCEEDED(psl->QueryInterface(IID_IPersistFile,
+                                       reinterpret_cast<void **>(&ppf)))) {
+      PWSTR folders[2] = {};
+      SHGetKnownFolderPath(FOLDERID_CommonPrograms, 0, nullptr, &folders[0]);
+      SHGetKnownFolderPath(FOLDERID_Programs,       0, nullptr, &folders[1]);
+      for (auto *f : folders) {
+        if (f) { scan_startmenu(f, exeToLabel, psl, ppf); CoTaskMemFree(f); }
+      }
+      ppf->Release();
+    }
+    psl->Release();
+  }
+  if (hrCom == S_OK)
+    CoUninitialize();
+
+  // 2. 실행 중인 프로세스 보완 (Start Menu에 없는 앱은 version info 또는 exe 이름으로 추가)
+  struct Ctx { std::map<std::string, std::string> *m; };
+  Ctx ctx{&exeToLabel};
   EnumWindows([](HWND hwnd, LPARAM lp) -> BOOL {
     auto *c = reinterpret_cast<Ctx *>(lp);
-    if (!IsWindowVisible(hwnd))
-      return TRUE;
+    if (!IsWindowVisible(hwnd)) return TRUE;
     DWORD pid = 0;
     GetWindowThreadProcessId(hwnd, &pid);
-    if (!pid)
-      return TRUE;
+    if (!pid) return TRUE;
     HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (!proc)
-      return TRUE;
+    if (!proc) return TRUE;
     wchar_t path[MAX_PATH] = {};
     DWORD sz = MAX_PATH;
     if (QueryFullProcessImageNameW(proc, 0, path, &sz)) {
-      const wchar_t *name = path;
+      const wchar_t *exeW = path;
       for (const wchar_t *p = path; *p; ++p)
-        if (*p == L'\\' || *p == L'/')
-          name = p + 1;
-      char buf[256] = {};
-      WideCharToMultiByte(CP_UTF8, 0, name, -1, buf, sizeof(buf), nullptr, nullptr);
-      if (*buf)
-        c->apps->push_back(buf);
+        if (*p == L'\\' || *p == L'/') exeW = p + 1;
+      char exeUtf8[256] = {};
+      WideCharToMultiByte(CP_UTF8, 0, exeW, -1, exeUtf8, sizeof(exeUtf8), nullptr, nullptr);
+      if (*exeUtf8 && c->m->find(exeUtf8) == c->m->end()) {
+        std::string desc = get_exe_description(path);
+        (*c->m)[exeUtf8] = desc.empty() ? exeUtf8
+                                         : (desc + " (" + exeUtf8 + ")");
+      }
     }
     CloseHandle(proc);
     return TRUE;
   }, reinterpret_cast<LPARAM>(&ctx));
+
+  // 레이블 기준 정렬 후 반환
+  std::vector<std::pair<std::string, std::string>> result;
+  result.reserve(exeToLabel.size());
+  for (auto &[exe, label] : exeToLabel)
+    result.push_back({label, exe});
   std::sort(result.begin(), result.end());
-  result.erase(std::unique(result.begin(), result.end()), result.end());
   return result;
 }
 #endif
@@ -2361,8 +2487,8 @@ static obs_properties_t *securecast_get_properties(void *data) {
   obs_property_t *picker = obs_properties_add_list(
       props, SC_SETTING_APP_PICKER, obs_module_text("SelectApp"),
       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
-  for (const auto &app : enumerate_running_apps())
-    obs_property_list_add_string(picker, app.c_str(), app.c_str());
+  for (const auto &[label, val] : enumerate_all_apps())
+    obs_property_list_add_string(picker, label.c_str(), val.c_str());
 
   // --- Normal Mode Apps 그룹 ---
   obs_properties_t *normal_grp = obs_properties_create();
