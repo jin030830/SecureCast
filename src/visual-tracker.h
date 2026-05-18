@@ -117,6 +117,11 @@ private:
     // Phase C 커밋 시 이 값이 같아야만 템플릿 필드를 덮어쓴다 (충돌 방지).
     uint32_t templateTs = 0;
 
+    // [Fix #2] OCR worker가 register_or_update를 호출할 때마다 증가.
+    // Phase C에서 ocrRevision이 lt와 it에서 다르면
+    // 사이에 OCR이 리셋한 것이므로 framesSinceMatch 등 카운터를 보존.
+    uint32_t ocrRevision = 0;
+
     // Tier 3: AVX2 NCC 용 사전 계산 float 템플릿
     // tmpl_float[i] = (float)tmpl[i] - tmean  (centered)
     // tmpl_dT = Σ tmpl_float[i]²  (template variance × N)
@@ -156,6 +161,21 @@ private:
   // Tier 3: tmpl → tmpl_float/tmpl_dT/tmpl_sumCt 사전 계산.
   // tmpl 또는 tw/th 변경 시 반드시 호출한다.
   static void precompute_tmpl_stats(Tracker &tr);
+
+  // [Fix #5] 무상태 NCC 피라미드 검색 결과 구조체
+  struct NccSearchResult {
+    float score;
+    int x;
+    int y;
+  };
+
+  // [Fix #5] ncc_pyramid_search — tr은 const& (상태 변경 없음).
+  // update_one_pyramid가 이를 호출하며, fallback(NEAR→FAR) 도 이 함수로 처리.
+  // ncc_at/ncc_at_simd 호출이 필요해 const 비정적 메서드로 선언.
+  NccSearchResult ncc_pyramid_search(const Tracker &tr, const uint8_t *gray,
+                                     int gw, int gh, const uint8_t *quarterGray,
+                                     int qw, int qh, float predX, float predY,
+                                     int radius) const;
 
   // Tier 3: 2-Level 피라미드 매칭 (quarter coarse → full fine)
   // quarterGray: 1/4 다운샘플 gray (gw/4 × gh/4), qw/qh = 그 크기

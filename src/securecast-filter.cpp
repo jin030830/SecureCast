@@ -59,7 +59,37 @@ SecureCastFilter::~SecureCastFilter() = default;
 // 즉시 초과 → 강제 스캔 트리거.
 
 // forward declaration — 정의는 Properties/Settings 섹션에 있음
-static void save_manual_rects(SecureCastFilter *filter, const MaskPayload &mask);
+static void save_manual_rects(SecureCastFilter *filter,
+                              const MaskPayload &mask);
+
+#ifdef _WIN32
+// ────────────────────────────────────────────────────────────
+// [Fix #3-A] register_lingering_window — hwnd 기반 lingering upsert 헬퍼
+//
+// 기존 창이 있으면 window 좌표와 TTL(SC_RING_BUFFER_SLOTS+1)을 갱신하고,
+// 없으면 슬롯이 남은 경우에만 신규 추가한다.
+// TTL = SC_RING_BUFFER_SLOTS + 1 로 통일:
+//   N슬롯 지연 분 + 탐지 틱의 render가 captureWindowList를 업데이트하기 전에
+//   pushFrame이 먼저 실행되는 1프레임 갭을 커버.
+// ────────────────────────────────────────────────────────────
+static void register_lingering_window(SecureCastFilter *filter,
+                                      const TrackedWindow &win) {
+  for (int li = 0; li < filter->lingeringCount; ++li) {
+    if (filter->lingeringWindows[li].window.hwnd == win.hwnd) {
+      filter->lingeringWindows[li].window = win;
+      filter->lingeringWindows[li].ticksRemaining = SC_RING_BUFFER_SLOTS + 1;
+      return;
+    }
+  }
+  if (filter->lingeringCount < SC_MAX_LINGERING) {
+    filter->lingeringWindows[filter->lingeringCount++] = {
+        win, SC_RING_BUFFER_SLOTS + 1};
+  } else {
+    blog(LOG_WARNING, "[SecureCast][linger-full] dropping hwnd=%p",
+         (void *)win.hwnd);
+  }
+}
+#endif
 
 static constexpr float SCAN_INTERVAL_FORCE = 1.0f;
 static constexpr float SCAN_INTERVAL_NORMAL = 0.15f; // 일반 모드 스캔 주기
@@ -889,8 +919,9 @@ static void ocr_worker_loop(SecureCastFilter *filter) {
       filter->ocrFramePending = false;
     }
 
-    // dHash 캐시 무효화 요청 처리 — GUI 스레드(securecast_update)가 플래그를 세우고,
-    // 워커 스레드가 여기서 안전하게 소비한다. ocrReady 여부와 무관하게 실행한다.
+    // dHash 캐시 무효화 요청 처리 — GUI 스레드(securecast_update)가 플래그를
+    // 세우고, 워커 스레드가 여기서 안전하게 소비한다. ocrReady 여부와 무관하게
+    // 실행한다.
     if (filter->ocrClearCachePending.exchange(false,
                                               std::memory_order_acq_rel)) {
       if (filter->ocrEngine)
@@ -902,7 +933,8 @@ static void ocr_worker_loop(SecureCastFilter *filter) {
       // continue를 쓰면 렌더-워커 간 4fps 공회전이 영원히 반복된다.
       filter->ocrWorkerRunning.store(false, std::memory_order_release);
       filter->ocrIsDown.store(true, std::memory_order_release);
-      blog(LOG_WARNING, "[SecureCast] OCR engine init failed permanently — worker terminating");
+      blog(LOG_WARNING, "[SecureCast] OCR engine init failed permanently — "
+                        "worker terminating");
       filter->ocrWorkerIdle.store(true, std::memory_order_release);
       break;
     }
@@ -1184,7 +1216,8 @@ static void *securecast_create(obs_data_t *settings, obs_source_t *context) {
 #ifdef _WIN32
   // [Role D] 스트리머 전용 오버레이 HUD 시작 (OBS 캡처에서 자동 제외)
   if (!filter->overlay.create())
-    blog(LOG_WARNING, "[SecureCast][D] OverlayWindow 생성 실패 — HUD 없이 계속.");
+    blog(LOG_WARNING,
+         "[SecureCast][D] OverlayWindow 생성 실패 — HUD 없이 계속.");
 #endif
 
   blog(LOG_INFO, "Filter created (Role C: 2-Stage Gate Pipeline Active).");
@@ -1401,7 +1434,8 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
 
   SecureCastFilter *filter = static_cast<SecureCastFilter *>(data);
 
-  // [Role D] isActive는 GUI 스레드(update)에서도 쓸 수 있으므로 settingsMutex로 보호
+  // [Role D] isActive는 GUI 스레드(update)에서도 쓸 수 있으므로 settingsMutex로
+  // 보호
   {
     std::lock_guard<std::mutex> lock(filter->settingsMutex);
     if (!filter->isActive) {
@@ -1555,7 +1589,22 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
 #ifdef _WIN32
   filter->ringBuffer.pushFrame(ts, filter->context, &filter->captureWindowList);
   // push 이후에 DWM 갱신 → 다음 프레임의 captureWindowList로 저장
+  // [Fix #3-B] 사라진 hwnd를 render 경로에서 즉시 lingering에 등록
+  //   → tick(slow-scan)보다 훨씬 빠르게 잔영을 보장
+  TrackedWindowList before = filter->windowList;
   sc_update_tracked_bounds(&filter->windowList);
+  for (int i = 0; i < before.count; ++i) {
+    HWND ph = before.items[i].hwnd;
+    bool stillThere = false;
+    for (int j = 0; j < filter->windowList.count; ++j) {
+      if (filter->windowList.items[j].hwnd == ph) {
+        stillThere = true;
+        break;
+      }
+    }
+    if (!stillThere)
+      register_lingering_window(filter, before.items[i]);
+  }
   filter->captureWindowList = filter->windowList;
 #else
   filter->ringBuffer.pushFrame(ts, filter->context);
@@ -1596,7 +1645,8 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
     newState = filter->currentState;
   }
 #ifdef _WIN32
-  // [Role D] 오버레이 HUD에 상태 동기화 (PostMessage → thread-safe, non-blocking)
+  // [Role D] 오버레이 HUD에 상태 동기화 (PostMessage → thread-safe,
+  // non-blocking)
   filter->overlay.setState(newState);
 #endif
 
@@ -1622,7 +1672,8 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
   // [DORMANT] enqueueCopy / submitFrame을 호출하는 경로가 없어 m_pendingCount=0
   // 고착 → tryCollectPreviousFrame()은 항상 PENDING을 반환하므로
   // OK / SOFT_RECOVERED 분기는 실행되지 않는다.
-  // 활성화하려면 video_render에서 enqueueCopy → submitFrame 호출 경로를 연결해야 한다.
+  // 활성화하려면 video_render에서 enqueueCopy → submitFrame 호출 경로를
+  // 연결해야 한다.
   CollectResult sc_collected = filter->readback.tryCollectPreviousFrame();
   if (sc_collected == CollectResult::OK ||
       sc_collected == CollectResult::SOFT_RECOVERED) {
@@ -1816,7 +1867,13 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
   // --- 마스킹 오버레이 ---
   // Role A: delayedSlot->windowSnapshot (프레임 캡처 시점의 창 위치 → 프레임과
   // 동기화됨) Role B/C: lastMask (AI/MockAI 결과)
-  BlurRect all_rects[SC_MAX_BLUR_RECTS + SC_MAX_TRACKED_WINDOWS];
+  // [Fix #3-D] capacity: manualBlur(32) + lastMask(32) + windowSnapshot×2(32)
+  //            + lingering(16) + trackers(8) + notif/여유(8) = 128
+  // MAX_TRACKERS는 VisualTrackerManager 클래스 static 상수이므로
+  // securecast-filter.cpp에서는 직접 사용 불가. 실제 값(8)을 리터럴로 대체.
+  static constexpr int kMaxTrackerSlots = 8;
+  BlurRect all_rects[SC_MAX_BLUR_RECTS * 2 + SC_MAX_TRACKED_WINDOWS * 2 +
+                     SC_MAX_LINGERING + kMaxTrackerSlots + 8];
   int all_count = 0;
 
 #ifdef _WIN32
@@ -1890,9 +1947,8 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
   // [Role D] 수동 드래그 블러 — 확정 rects + 드래그 중 미리보기
   {
     std::lock_guard<std::mutex> lock(filter->settingsMutex);
-    for (int i = 0;
-         i < filter->manualBlurMask.rectCount &&
-         all_count < (int)(sizeof(all_rects) / sizeof(all_rects[0]));
+    for (int i = 0; i < filter->manualBlurMask.rectCount &&
+                    all_count < (int)(sizeof(all_rects) / sizeof(all_rects[0]));
          i++) {
       all_rects[all_count++] = filter->manualBlurMask.rects[i];
     }
@@ -1914,6 +1970,15 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
                   all_count < (int)(sizeof(all_rects) / sizeof(all_rects[0]));
        i++)
     all_rects[all_count++] = filter->lastMask.rects[i];
+
+  // [Fix #3-E] 렌더 비용 측정 로그 (60프레임마다 1회)
+  {
+    static int s_render_log_throttle = 0;
+    if (++s_render_log_throttle >= 60) {
+      s_render_log_throttle = 0;
+      blog(LOG_INFO, "[SecureCast][render] rects=%d", all_count);
+    }
+  }
 
   if (all_count > 0) {
     if (filter->blurEffect) {
@@ -1955,7 +2020,8 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
     }
   }
 
-  // [Role D] 보안 상태 테두리 오버레이 (색상: SAFE=초록, PARTIAL=노랑, RISK=빨강)
+  // [Role D] 보안 상태 테두리 오버레이 (색상: SAFE=초록, PARTIAL=노랑,
+  // RISK=빨강)
   {
     uint32_t borderColor = 0xFF00FF00;
     if (newState == SecurityState::PARTIAL)
@@ -1965,7 +2031,8 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
 
     constexpr int BORDER = 6;
     gs_effect_t *solid = obs_get_base_effect(OBS_EFFECT_SOLID);
-    gs_effect_set_color(gs_effect_get_param_by_name(solid, "color"), borderColor);
+    gs_effect_set_color(gs_effect_get_param_by_name(solid, "color"),
+                        borderColor);
     gs_matrix_push();
     while (gs_effect_loop(solid, "Solid")) {
       gs_matrix_identity();
@@ -2018,7 +2085,8 @@ static void securecast_video_tick(void *data, float seconds) {
   SecureCastFilter *filter = (SecureCastFilter *)data;
   if (!filter)
     return;
-  // [Role D] isActive는 GUI 스레드(update)에서도 쓸 수 있으므로 settingsMutex로 보호
+  // [Role D] isActive는 GUI 스레드(update)에서도 쓸 수 있으므로 settingsMutex로
+  // 보호
   {
     std::lock_guard<std::mutex> lock(filter->settingsMutex);
     if (!filter->isActive)
@@ -2109,23 +2177,28 @@ static void securecast_video_tick(void *data, float seconds) {
     }
   }
 
-  const float scanInterval =
-      filter->isGameMode.load(std::memory_order_acquire) ? SCAN_INTERVAL_GAME
-                                                          : SCAN_INTERVAL_NORMAL;
+  const float scanInterval = filter->isGameMode.load(std::memory_order_acquire)
+                                 ? SCAN_INTERVAL_GAME
+                                 : SCAN_INTERVAL_NORMAL;
   sc_tracker_tick(seconds, &filter->trackerAccumulator, &filter->windowList,
                   scanInterval);
 
-  // [Role D] windowList 스캔 결과를 blacklistMask에 반영 (video_render에서 최우선 차단에 사용)
+  // [Role D] windowList 스캔 결과를 blacklistMask에 반영 (video_render에서
+  // 최우선 차단에 사용)
   {
     std::lock_guard<std::mutex> lock(filter->blacklistMutex);
-    filter->blacklistMask.rectCount = (filter->windowList.count > SC_MAX_BLUR_RECTS)
-                                          ? SC_MAX_BLUR_RECTS : filter->windowList.count;
+    filter->blacklistMask.rectCount =
+        (filter->windowList.count > SC_MAX_BLUR_RECTS)
+            ? SC_MAX_BLUR_RECTS
+            : filter->windowList.count;
     for (int i = 0; i < filter->blacklistMask.rectCount; ++i) {
       filter->blacklistMask.rects[i] = {
           (int)filter->windowList.items[i].bounds.left,
           (int)filter->windowList.items[i].bounds.top,
-          (int)(filter->windowList.items[i].bounds.right - filter->windowList.items[i].bounds.left),
-          (int)(filter->windowList.items[i].bounds.bottom - filter->windowList.items[i].bounds.top),
+          (int)(filter->windowList.items[i].bounds.right -
+                filter->windowList.items[i].bounds.left),
+          (int)(filter->windowList.items[i].bounds.bottom -
+                filter->windowList.items[i].bounds.top),
           0};
     }
     if (filter->windowList.count > 0 && filter->logScanThrottle++ % 10 == 0)
@@ -2156,35 +2229,19 @@ static void securecast_video_tick(void *data, float seconds) {
           filter->recentlySeenList.items[--filter->recentlySeenList.count];
   }
 
-  // Lingering: 직전 스캔에 있었지만 이번엔 사라진 창 감지.
-  // windowList는 slow-scan 주기(150ms)마다만 바뀌므로 비교는 실질적으로 그때만
-  // 의미 있다.
+  // [Fix #3-C] Lingering: 직전 스캔에 있었지만 이번엔 사라진 창 감지.
+  // register_lingering_window helper 호출로 TTL(SC_RING_BUFFER_SLOTS+1)로 통일.
   for (int pi = 0; pi < filter->prevWindowList.count; ++pi) {
     HWND ph = filter->prevWindowList.items[pi].hwnd;
     bool found = false;
     for (int ci = 0; ci < filter->windowList.count && !found; ++ci)
       found = (filter->windowList.items[ci].hwnd == ph);
-    if (!found) {
-      bool already = false;
-      for (int li = 0; li < filter->lingeringCount; ++li) {
-        if (filter->lingeringWindows[li].window.hwnd == ph) {
-          filter->lingeringWindows[li].ticksRemaining = SC_RING_BUFFER_SLOTS;
-          already = true;
-          break;
-        }
-      }
-      if (!already && filter->lingeringCount < SC_MAX_LINGERING)
-        filter->lingeringWindows[filter->lingeringCount++] = {
-            filter->prevWindowList.items[pi], SC_RING_BUFFER_SLOTS};
-    }
+    if (!found)
+      register_lingering_window(filter, filter->prevWindowList.items[pi]);
   }
 
   // New window detection: 이번 스캔에서 새로 등장한 창을 즉시 lingering에
-  // prime. 탐지 전에 ring buffer에 이미 쌓인 프레임(최대
-  // SC_RING_BUFFER_SLOTS개)이 출력될 때도 마스킹되도록 SC_RING_BUFFER_SLOTS+1
-  // 틱을 부여한다.
-  // (+1: 탐지 틱의 render에서 captureWindowList가 업데이트되기 전에
-  //  pushFrame이 먼저 실행되어 생기는 1프레임 갭을 커버)
+  // prime. register_lingering_window로 TTL SC_RING_BUFFER_SLOTS+1 보장.
   for (int ci = 0; ci < filter->windowList.count; ++ci) {
     HWND ch = filter->windowList.items[ci].hwnd;
     bool wasPrev = false;
@@ -2194,20 +2251,8 @@ static void securecast_video_tick(void *data, float seconds) {
         break;
       }
     }
-    if (!wasPrev) {
-      bool already = false;
-      for (int li = 0; li < filter->lingeringCount; ++li) {
-        if (filter->lingeringWindows[li].window.hwnd == ch) {
-          filter->lingeringWindows[li].ticksRemaining =
-              SC_RING_BUFFER_SLOTS + 1;
-          already = true;
-          break;
-        }
-      }
-      if (!already && filter->lingeringCount < SC_MAX_LINGERING)
-        filter->lingeringWindows[filter->lingeringCount++] = {
-            filter->windowList.items[ci], SC_RING_BUFFER_SLOTS + 1};
-    }
+    if (!wasPrev)
+      register_lingering_window(filter, filter->windowList.items[ci]);
   }
 
   filter->prevWindowList = filter->windowList;
@@ -2238,33 +2283,34 @@ static void securecast_video_tick(void *data, float seconds) {
 // [Role D] Properties UI
 // ================================================================
 
-#define SC_SETTING_BLACKLIST      "sc_blacklist"
+#define SC_SETTING_BLACKLIST "sc_blacklist"
 #define SC_SETTING_BLUR_INTENSITY "sc_blur_intensity"
-// #define SC_SETTING_GAME_MODE   "sc_game_mode"  // [v2] 게임 모드 — 현재 스코프 외
-#define SC_SETTING_SENSITIVITY    "sc_sensitivity"
-#define SC_SETTING_MANUAL_RECTS   "sc_manual_rects"
+// #define SC_SETTING_GAME_MODE   "sc_game_mode"  // [v2] 게임 모드 — 현재
+// 스코프 외
+#define SC_SETTING_SENSITIVITY "sc_sensitivity"
+#define SC_SETTING_MANUAL_RECTS "sc_manual_rects"
 
 // manualBlurMask → obs_data_array 직렬화 후 source settings에 write-back.
-// settingsMutex 밖에서 호출해야 함 — obs_source_get_settings가 OBS 내부 락을 잡을 수 있음.
-// mask는 락 안에서 복사한 스냅샷을 전달한다.
-static void save_manual_rects(SecureCastFilter* filter, const MaskPayload& mask)
-{
-    obs_data_array_t* arr = obs_data_array_create();
-    for (int i = 0; i < mask.rectCount; ++i) {
-        const BlurRect& r = mask.rects[i];
-        obs_data_t* item = obs_data_create();
-        obs_data_set_int(item, "x",      r.x);
-        obs_data_set_int(item, "y",      r.y);
-        obs_data_set_int(item, "width",  r.width);
-        obs_data_set_int(item, "height", r.height);
-        obs_data_set_int(item, "type",   r.type);
-        obs_data_array_push_back(arr, item);
-        obs_data_release(item);
-    }
-    obs_data_t* settings = obs_source_get_settings(filter->context);
-    obs_data_set_array(settings, SC_SETTING_MANUAL_RECTS, arr);
-    obs_data_release(settings);
-    obs_data_array_release(arr);
+// settingsMutex 밖에서 호출해야 함 — obs_source_get_settings가 OBS 내부 락을
+// 잡을 수 있음. mask는 락 안에서 복사한 스냅샷을 전달한다.
+static void save_manual_rects(SecureCastFilter *filter,
+                              const MaskPayload &mask) {
+  obs_data_array_t *arr = obs_data_array_create();
+  for (int i = 0; i < mask.rectCount; ++i) {
+    const BlurRect &r = mask.rects[i];
+    obs_data_t *item = obs_data_create();
+    obs_data_set_int(item, "x", r.x);
+    obs_data_set_int(item, "y", r.y);
+    obs_data_set_int(item, "width", r.width);
+    obs_data_set_int(item, "height", r.height);
+    obs_data_set_int(item, "type", r.type);
+    obs_data_array_push_back(arr, item);
+    obs_data_release(item);
+  }
+  obs_data_t *settings = obs_source_get_settings(filter->context);
+  obs_data_set_array(settings, SC_SETTING_MANUAL_RECTS, arr);
+  obs_data_release(settings);
+  obs_data_array_release(arr);
 }
 
 static void securecast_get_defaults(obs_data_t *settings) {
@@ -2312,7 +2358,8 @@ static obs_properties_t *securecast_get_properties(void *data) {
   return props;
 }
 
-// GUI 스레드에서 호출되므로 settingsMutex로 보호 (Render Thread와 data race 방지)
+// GUI 스레드에서 호출되므로 settingsMutex로 보호 (Render Thread와 data race
+// 방지)
 static void securecast_update(void *data, obs_data_t *settings) {
   SecureCastFilter *filter = static_cast<SecureCastFilter *>(data);
   std::lock_guard<std::mutex> lock(filter->settingsMutex);
@@ -2348,11 +2395,10 @@ static void securecast_update(void *data, obs_data_t *settings) {
   }
 
   // 소스/설정 전환 시 dHash 캐시 무효화 요청.
-  // clearDHashCache()를 여기서 직접 호출하면 GUI 스레드↔OCR 워커 data race 발생.
-  // 플래그만 세우고 워커 스레드가 다음 사이클에 안전하게 처리한다.
+  // clearDHashCache()를 여기서 직접 호출하면 GUI 스레드↔OCR 워커 data race
+  // 발생. 플래그만 세우고 워커 스레드가 다음 사이클에 안전하게 처리한다.
   filter->ocrClearCachePending.store(true, std::memory_order_release);
 }
-
 
 // ================================================================
 // [Role D] 수동 드래그 블러 -- OBS Interaction API 콜백
@@ -2363,70 +2409,74 @@ static void securecast_update(void *data, obs_data_t *settings) {
 // 스레드: UI 스레드에서 호출 -> settingsMutex로 Render 스레드와 동기화
 // ================================================================
 #ifdef _WIN32
-static void securecast_mouse_click(void* data,
-    const struct obs_mouse_event* event,
-    int32_t type, bool mouse_up, uint32_t /*click_count*/)
-{
-    auto* filter = static_cast<SecureCastFilter*>(data);
+static void securecast_mouse_click(void *data,
+                                   const struct obs_mouse_event *event,
+                                   int32_t type, bool mouse_up,
+                                   uint32_t /*click_count*/) {
+  auto *filter = static_cast<SecureCastFilter *>(data);
 
-    MaskPayload snapshot{};
-    bool save = false;
+  MaskPayload snapshot{};
+  bool save = false;
 
-    {
-        std::lock_guard<std::mutex> lock(filter->settingsMutex);
-
-        if (type == MOUSE_RIGHT && !mouse_up) {
-            // 우클릭 DOWN: 수동 블러 전체 초기화
-            filter->manualBlurMask.rectCount = 0;
-            filter->dragActive               = false;
-            snapshot = filter->manualBlurMask;
-            save     = true;
-            blog(LOG_INFO, "[SecureCast][D] Manual blur rects cleared (right-click).");
-
-        } else if (type == MOUSE_LEFT) {
-            if (!mouse_up) {
-                // 좌클릭 DOWN: 드래그 시작
-                filter->dragActive = true;
-                filter->dragStartX = event->x;
-                filter->dragStartY = event->y;
-                filter->dragCurX   = event->x;
-                filter->dragCurY   = event->y;
-            } else if (filter->dragActive) {
-                // 좌클릭 UP: 드래그 완료 -> BlurRect 확정
-                filter->dragActive = false;
-                int x  = std::min(filter->dragStartX, event->x);
-                int y  = std::min(filter->dragStartY, event->y);
-                int bw = std::abs(event->x - filter->dragStartX);
-                int bh = std::abs(event->y - filter->dragStartY);
-                if (bw > 8 && bh > 8 &&
-                    filter->manualBlurMask.rectCount < SecureCastFilter::SC_MAX_MANUAL_RECTS) {
-                    filter->manualBlurMask.rects[filter->manualBlurMask.rectCount++] = {x, y, bw, bh, 0};
-                    snapshot = filter->manualBlurMask;
-                    save     = true;
-                    blog(LOG_INFO, "[SecureCast][D] Manual blur added: (%d,%d %dx%d) total=%d",
-                         x, y, bw, bh, filter->manualBlurMask.rectCount);
-                }
-            }
-        }
-    }  // settingsMutex 해제 후 OBS API 호출
-
-    if (save)
-        save_manual_rects(filter, snapshot);
-}
-
-static void securecast_mouse_move(void* data,
-    const struct obs_mouse_event* event, bool mouse_leave)
-{
-    auto* filter = static_cast<SecureCastFilter*>(data);
+  {
     std::lock_guard<std::mutex> lock(filter->settingsMutex);
-    if (mouse_leave) {
-        filter->dragActive = false;
-        return;
-    }
-    if (filter->dragActive) {
+
+    if (type == MOUSE_RIGHT && !mouse_up) {
+      // 우클릭 DOWN: 수동 블러 전체 초기화
+      filter->manualBlurMask.rectCount = 0;
+      filter->dragActive = false;
+      snapshot = filter->manualBlurMask;
+      save = true;
+      blog(LOG_INFO,
+           "[SecureCast][D] Manual blur rects cleared (right-click).");
+
+    } else if (type == MOUSE_LEFT) {
+      if (!mouse_up) {
+        // 좌클릭 DOWN: 드래그 시작
+        filter->dragActive = true;
+        filter->dragStartX = event->x;
+        filter->dragStartY = event->y;
         filter->dragCurX = event->x;
         filter->dragCurY = event->y;
+      } else if (filter->dragActive) {
+        // 좌클릭 UP: 드래그 완료 -> BlurRect 확정
+        filter->dragActive = false;
+        int x = std::min(filter->dragStartX, event->x);
+        int y = std::min(filter->dragStartY, event->y);
+        int bw = std::abs(event->x - filter->dragStartX);
+        int bh = std::abs(event->y - filter->dragStartY);
+        if (bw > 8 && bh > 8 &&
+            filter->manualBlurMask.rectCount <
+                SecureCastFilter::SC_MAX_MANUAL_RECTS) {
+          filter->manualBlurMask.rects[filter->manualBlurMask.rectCount++] = {
+              x, y, bw, bh, 0};
+          snapshot = filter->manualBlurMask;
+          save = true;
+          blog(LOG_INFO,
+               "[SecureCast][D] Manual blur added: (%d,%d %dx%d) total=%d", x,
+               y, bw, bh, filter->manualBlurMask.rectCount);
+        }
+      }
     }
+  } // settingsMutex 해제 후 OBS API 호출
+
+  if (save)
+    save_manual_rects(filter, snapshot);
+}
+
+static void securecast_mouse_move(void *data,
+                                  const struct obs_mouse_event *event,
+                                  bool mouse_leave) {
+  auto *filter = static_cast<SecureCastFilter *>(data);
+  std::lock_guard<std::mutex> lock(filter->settingsMutex);
+  if (mouse_leave) {
+    filter->dragActive = false;
+    return;
+  }
+  if (filter->dragActive) {
+    filter->dragCurX = event->x;
+    filter->dragCurY = event->y;
+  }
 }
 #endif
 
@@ -2448,7 +2498,7 @@ struct obs_source_info securecast_filter_info = []() {
   info.video_render = securecast_video_render;
   info.get_properties = securecast_get_properties; // [Role D] Properties UI
   info.get_defaults = securecast_get_defaults;     // [Role D]
-  info.update = securecast_update;                 // [Role D] settingsMutex 보호
+  info.update = securecast_update; // [Role D] settingsMutex 보호
 #ifdef _WIN32
   info.mouse_click = securecast_mouse_click;
   info.mouse_move = securecast_mouse_move;

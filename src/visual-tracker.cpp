@@ -5,6 +5,10 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <limits> // [Fix #7] std::numeric_limits
+
+// OBS 로깅 (blog, LOG_DEBUG, LOG_WARNING 등)
+#include <util/base.h>
 
 // SIMD intrinsics
 // x64 MSVC: <intrin.h>가 SSSE3·AVX2·FMA를 모두 포함.
@@ -400,25 +404,23 @@ float VisualTrackerManager::ncc_at(const uint8_t *gray, int gstride, int gw,
 //   - quarter stride-2 = 8px 간격; coarse best ±1 stride 오차 시 fine ±6으로
 //   보정
 // ──────────────────────────────────────────────────────────────
-void VisualTrackerManager::update_one_pyramid(Tracker &tr, const uint8_t *gray,
-                                              int gw, int gh,
-                                              const uint8_t *quarterGray,
-                                              int qw, int qh) {
+// [Fix #5] ncc_pyramid_search — 무상태 순수 NCC 피라미드 탐색
+//
+// tr는 const& (상태 변경 없음). 결과만 NccSearchResult로 반환.
+// radius: 탐색 반경 (SEARCH_NEAR 또는 SEARCH_FAR).
+// ──────────────────────────────────────────────────────────────
+VisualTrackerManager::NccSearchResult VisualTrackerManager::ncc_pyramid_search(
+    const Tracker &tr, const uint8_t *gray, int gw, int gh,
+    const uint8_t *quarterGray, int qw, int qh, float predX, float predY,
+    int radius) const {
+
+  NccSearchResult out{-1.0f, (int)(predX + (tr.bw - tr.tw) * 0.5f),
+                      (int)(predY + (tr.bh - tr.th) * 0.5f)};
+
   if (tr.tmpl.empty() || tr.tw <= 0 || tr.th <= 0)
-    return;
-
-  // P0-3: 속도 기반 예측 위치
-  const float predX = tr.x + tr.vx;
-  const float predY = tr.y + tr.vy;
-
-  // 적응형 탐색 반경: 기본 반경 + 속도 크기, SEARCH_FAR 상한
-  const int baseRadius = (tr.lastScore >= SCORE_OK) ? SEARCH_NEAR : SEARCH_FAR;
-  const int velBonus =
-      std::min((int)(std::abs(tr.vx) + std::abs(tr.vy)), SEARCH_FAR);
-  const int radius = std::min(baseRadius + velBonus, SEARCH_FAR);
+    return out;
 
   // ----- Level 0: coarse (1/4 해상도) -----
-  // 템플릿 4×4 avg 다운샘플 (on-the-fly; 160×80→40×20 = 800 ops)
   const int qtw = std::max(tr.tw / 4, 1);
   const int qth = std::max(tr.th / 4, 1);
   std::vector<uint8_t> qtmpl(static_cast<size_t>(qtw * qth));
@@ -441,7 +443,7 @@ void VisualTrackerManager::update_one_pyramid(Tracker &tr, const uint8_t *gray,
     }
   }
 
-  // 예측 중심 (1/4 스케일), 탐색 반경 (1/4 스케일)
+  assert(quarterGray != nullptr && qw > 0 && qh > 0);
   const int qcx = (int)((predX + tr.bw * 0.5f) * 0.25f);
   const int qcy = (int)((predY + tr.bh * 0.5f) * 0.25f);
   const int qr = (radius + 3) / 4;
@@ -453,10 +455,6 @@ void VisualTrackerManager::update_one_pyramid(Tracker &tr, const uint8_t *gray,
   float bestQScore = -1.0f;
   int bestQX = qcx - qtw / 2;
   int bestQY = qcy - qth / 2;
-
-  // quarterGray / gray는 tight-packed(stride == width) 전제. row pitch가 정렬된
-  // 버퍼가 들어오면 OOB read 발생하므로 호출자 책임으로 명시.
-  assert(quarterGray != nullptr && qw > 0 && qh > 0);
   for (int sy = qsy0; sy <= qsy1; sy += 2) {
     for (int sx = qsx0; sx <= qsx1; sx += 2) {
       const float sc = ncc_at(quarterGray, qw, qw, qh, qtmpl, qtw, qth, sx, sy);
@@ -469,14 +467,12 @@ void VisualTrackerManager::update_one_pyramid(Tracker &tr, const uint8_t *gray,
   }
 
   // ----- Level 1: fine (원해상도, quarter best ×4 주변 ±6px) -----
-  // quarter stride-2 → 8px step at full scale; ±6px fine이 항상 커버
   const int refineX = bestQX * 4;
   const int refineY = bestQY * 4;
 
   float bestScore = -1.0f;
-  int bestX = (int)(predX + (tr.bw - tr.tw) * 0.5f);
-  int bestY = (int)(predY + (tr.bh - tr.th) * 0.5f);
-
+  int bestX = out.x;
+  int bestY = out.y;
   for (int dy = -6; dy <= 6; ++dy) {
     for (int dx = -6; dx <= 6; ++dx) {
       const float sc =
@@ -488,6 +484,54 @@ void VisualTrackerManager::update_one_pyramid(Tracker &tr, const uint8_t *gray,
       }
     }
   }
+
+  out.score = bestScore;
+  out.x = bestX;
+  out.y = bestY;
+  return out;
+}
+
+// ──────────────────────────────────────────────────────────────
+void VisualTrackerManager::update_one_pyramid(Tracker &tr, const uint8_t *gray,
+                                              int gw, int gh,
+                                              const uint8_t *quarterGray,
+                                              int qw, int qh) {
+  if (tr.tmpl.empty() || tr.tw <= 0 || tr.th <= 0)
+    return;
+
+  // P0-3: 속도 기반 예측 위치
+  const float predX = tr.x + tr.vx;
+  const float predY = tr.y + tr.vy;
+
+  // [Fix #5] NEAR 반경으로 1차 탐색
+  const int velBonus =
+      std::min((int)(std::abs(tr.vx) + std::abs(tr.vy)), SEARCH_FAR);
+  const int radius1 = std::min(
+      ((tr.lastScore >= SCORE_OK) ? SEARCH_NEAR : SEARCH_FAR) + velBonus,
+      SEARCH_FAR);
+
+  auto best = ncc_pyramid_search(tr, gray, gw, gh, quarterGray, qw, qh, predX,
+                                 predY, radius1);
+
+  // [Fix #5] NEAR 탐색 실패 시 FAR 재시도 (near→far fallback)
+  if (radius1 < SEARCH_FAR && best.score < SCORE_LOST) {
+    auto far = ncc_pyramid_search(tr, gray, gw, gh, quarterGray, qw, qh, predX,
+                                  predY, SEARCH_FAR);
+    if (far.score > best.score) {
+      best = far;
+      static int s_fallback_throttle = 0;
+      if (++s_fallback_throttle >= 60) {
+        s_fallback_throttle = 0;
+        blog(LOG_DEBUG,
+             "[SecureCast][fallback] FAR search triggered for tracker id=%d",
+             tr.id);
+      }
+    }
+  }
+
+  const float bestScore = best.score;
+  const int bestX = best.x;
+  const int bestY = best.y;
 
   tr.lastScore = bestScore;
   if (bestScore >= SCORE_LOST) {
@@ -558,6 +602,9 @@ void VisualTrackerManager::update_all_gray(const uint8_t *gray, int gw,
   if (local.empty())
     return;
 
+  // [Fix #7-D] NCC 사이클 wall-clock 측정
+  const auto ncc_t0 = std::chrono::steady_clock::now();
+
   // ── Phase B: NCC 연산 (락 없음) ──
   int hw, hh, qw, qh;
   downsample_2x_into(gray, gw, gh, halfGrayBuf_, hw, hh);
@@ -589,6 +636,18 @@ void VisualTrackerManager::update_all_gray(const uint8_t *gray, int gw,
       tr.consecutiveLostFrames = 0;
   }
 
+  // [Fix #7-D] NCC 사이클 종료 — 33ms 초과 시 경고
+  {
+    const auto ncc_t1 = std::chrono::steady_clock::now();
+    const auto ncc_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(ncc_t1 - ncc_t0)
+            .count();
+    if (ncc_ms > 33) {
+      blog(LOG_WARNING, "[SecureCast][ncc-slow] NCC cycle took %lld ms",
+           static_cast<long long>(ncc_ms));
+    }
+  }
+
   // ── Phase C: 커밋 + dead tracker 제거 (unique_lock 짧게) ──
   {
     std::unique_lock<std::shared_mutex> lock(stateMtx_);
@@ -603,9 +662,25 @@ void VisualTrackerManager::update_all_gray(const uint8_t *gray, int gw,
       it->vx = lt.vx;
       it->vy = lt.vy;
       it->lastScore = lt.lastScore;
-      it->framesSinceMatch = lt.framesSinceMatch;
-      it->framesSinceOcrValidate = lt.framesSinceOcrValidate;
-      it->consecutiveLostFrames = lt.consecutiveLostFrames;
+
+      // [Fix #2-C] ocrRevision 비교:
+      // revision이 같으면 Phase B 실행 중 OCR 리셋 없음 → 카운터 커밋
+      // revision이 다르면 Phase B 실행 중 OCR이 리셋함 → 카운터 부보존
+      if (it->ocrRevision == lt.ocrRevision) {
+        it->framesSinceMatch = lt.framesSinceMatch;
+        it->framesSinceOcrValidate = lt.framesSinceOcrValidate;
+        it->consecutiveLostFrames = lt.consecutiveLostFrames;
+      } else {
+        // OCR이 사이에 리셋 — Phase B가 쪬은 오래된 카운터를 커밋하지 않음
+        static int s_race_throttle = 0;
+        if (++s_race_throttle >= 30) {
+          s_race_throttle = 0;
+          blog(LOG_DEBUG,
+               "[SecureCast][race] tracker id=%d ocrRevision mismatch "
+               "(it=%u lt=%u), preserving counters",
+               it->id, it->ocrRevision, lt.ocrRevision);
+        }
+      }
 
       // templateTs 동일 → Phase B에서 refresh된 템플릿 커밋.
       // templateTs 변경 → register_or_update가 더 최신 템플릿을 설정했으므로
@@ -655,9 +730,10 @@ void VisualTrackerManager::register_or_update(
   std::vector<bool> matchedOcr(N, false);
   std::vector<bool> matchedTr(M, false);
 
-  // greedy IoU 매칭 (IoU threshold = 0.30)
+  // greedy IoU 매칭 [Fix #7-B] IoU threshold 0.30 → 0.20 + 거리 fallback
   for (int n = 0; n < N; ++n) {
-    float bestIou = 0.30f;
+    float bestIou = 0.20f; // [Fix #7-B] 0.30 → 0.20
+    float bestDist = std::numeric_limits<float>::max();
     int bestM = -1;
     for (int m = 0; m < M; ++m) {
       if (matchedTr[m])
@@ -666,6 +742,32 @@ void VisualTrackerManager::register_or_update(
       if (iou > bestIou) {
         bestIou = iou;
         bestM = m;
+        bestDist = 0.0f;
+      } else if (iou == 0.0f) {
+        // IoU 0: 타입이 같을 때 중심 거리 fallback
+        if (ocr_boxes[n].type && trackers_[m].type &&
+            std::strcmp(ocr_boxes[n].type, trackers_[m].type) == 0) {
+          const float cx1 = ocr_boxes[n].x + ocr_boxes[n].w * 0.5f;
+          const float cy1 = ocr_boxes[n].y + ocr_boxes[n].h * 0.5f;
+          const float cx2 = trackers_[m].x + trackers_[m].bw * 0.5f;
+          const float cy2 = trackers_[m].y + trackers_[m].bh * 0.5f;
+          const float d = std::hypot(cx1 - cx2, cy1 - cy2);
+          const float thresh =
+              0.5f * std::min(trackers_[m].bw, trackers_[m].bh);
+          if (d < thresh && d < bestDist && bestIou == 0.20f) {
+            bestDist = d;
+            bestM = m;
+            // [Fix #7] fallback 로그
+            static int s_iou_miss_throttle = 0;
+            if (++s_iou_miss_throttle >= 60) {
+              s_iou_miss_throttle = 0;
+              blog(
+                  LOG_DEBUG,
+                  "[SecureCast][iou-miss] dist-fallback matched type=%s d=%.1f",
+                  ocr_boxes[n].type, d);
+            }
+          }
+        }
       }
     }
     if (bestM >= 0) {
@@ -681,6 +783,7 @@ void VisualTrackerManager::register_or_update(
       tr.framesSinceOcrValidate = 0;
       tr.consecutiveLostFrames = 0; // 3-A: OCR 재확인으로 fast-fail 해제
       tr.lastScore = 1.0f;
+      ++tr.ocrRevision; // [Fix #2-B] OCR worker 리셋 시그널
 
       // 템플릿은 현재 NCC 위치(tr.x, tr.y)에서 재추출 (OCR 위치 아님)
       int tcx = (int)tr.x, tcy = (int)tr.y;
@@ -774,8 +877,10 @@ void VisualTrackerManager::register_or_update_gray(
   std::vector<bool> matchedOcr(N, false);
   std::vector<bool> matchedTr(M, false);
 
+  // [Fix #7-B2] IoU 0.30 → 0.20 + 거리 fallback (gray 버전)
   for (int n = 0; n < N; ++n) {
-    float bestIou = 0.30f;
+    float bestIou = 0.20f;
+    float bestDist = std::numeric_limits<float>::max();
     int bestM = -1;
     for (int m = 0; m < M; ++m) {
       if (matchedTr[m])
@@ -784,6 +889,29 @@ void VisualTrackerManager::register_or_update_gray(
       if (iou > bestIou) {
         bestIou = iou;
         bestM = m;
+        bestDist = 0.0f;
+      } else if (iou == 0.0f) {
+        if (ocr_boxes[n].type && trackers_[m].type &&
+            std::strcmp(ocr_boxes[n].type, trackers_[m].type) == 0) {
+          const float cx1 = ocr_boxes[n].x + ocr_boxes[n].w * 0.5f;
+          const float cy1 = ocr_boxes[n].y + ocr_boxes[n].h * 0.5f;
+          const float cx2 = trackers_[m].x + trackers_[m].bw * 0.5f;
+          const float cy2 = trackers_[m].y + trackers_[m].bh * 0.5f;
+          const float d = std::hypot(cx1 - cx2, cy1 - cy2);
+          const float thresh =
+              0.5f * std::min(trackers_[m].bw, trackers_[m].bh);
+          if (d < thresh && d < bestDist && bestIou == 0.20f) {
+            bestDist = d;
+            bestM = m;
+            static int s_iou_miss_g = 0;
+            if (++s_iou_miss_g >= 60) {
+              s_iou_miss_g = 0;
+              blog(LOG_DEBUG,
+                   "[SecureCast][iou-miss] dist-fallback(gray) type=%s d=%.1f",
+                   ocr_boxes[n].type, d);
+            }
+          }
+        }
       }
     }
     if (bestM >= 0) {
@@ -797,6 +925,7 @@ void VisualTrackerManager::register_or_update_gray(
       tr.framesSinceOcrValidate = 0;
       tr.consecutiveLostFrames = 0;
       tr.lastScore = 1.0f;
+      ++tr.ocrRevision; // [Fix #2-B] OCR worker 리셋 시그널
 
       int tcx = static_cast<int>(tr.x), tcy = static_cast<int>(tr.y);
       int tcw = static_cast<int>(tr.bw), tch = static_cast<int>(tr.bh);
@@ -871,8 +1000,30 @@ std::vector<VtOcrBox> VisualTrackerManager::active_boxes() const {
   std::shared_lock<std::shared_mutex> lock(stateMtx_);
   std::vector<VtOcrBox> result;
   result.reserve(trackers_.size());
-  for (const auto &tr : trackers_)
+
+  // [Fix #7-C] 보조 ghost-kill 게이트:
+  //   NCC 연속 실패(FRAMES_LOST) AND OCR 장기 미갱신(STALE_OCR_FRAMES) 조건을
+  //   동시에 만족하는 트래커는 렌더에 노출하지 않는다.
+  //   HARD_EXPIRY / STALE_OCR_FRAMES 상수는 보류(#4) 정책상 변경하지 않음.
+  int ghostHidden = 0;
+  for (const auto &tr : trackers_) {
+    const bool nccDeadlyLost = tr.framesSinceMatch >= FRAMES_LOST &&
+                               tr.framesSinceOcrValidate >= STALE_OCR_FRAMES;
+    if (nccDeadlyLost) {
+      ++ghostHidden;
+      continue;
+    }
     result.push_back({tr.type, tr.x, tr.y, tr.bw, tr.bh});
+  }
+
+  if (ghostHidden > 0) {
+    static int s_ghost_throttle = 0;
+    if (++s_ghost_throttle >= 60) {
+      s_ghost_throttle = 0;
+      blog(LOG_DEBUG, "[SecureCast][ghost] gate hidden %d tracker(s)",
+           ghostHidden);
+    }
+  }
   return result;
 }
 

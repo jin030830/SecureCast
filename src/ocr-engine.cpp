@@ -6,6 +6,7 @@
 #include <initializer_list>
 #include <mutex>
 #include <string>
+#include <string_view> // [Fix #6] std::string_view
 #include <unordered_set>
 #include <vector>
 
@@ -212,8 +213,7 @@ SecureCastOcrEngine::analyze_bgra_frame(const uint8_t *pixels, int width,
   // PII 박스 영역만 해시 → 시계·커서 등 ROI 외부 변화는 완전히 무시.
   // hamming_distance ≤ 2 → 안티앨리어싱·압축 노이즈 허용 → OCR 생략.
   if (sameRes && hasLastRoiDhash_) {
-    const uint64_t roiHash =
-        compute_roi_dhash(pixels, stride, width, height);
+    const uint64_t roiHash = compute_roi_dhash(pixels, stride, width, height);
     if (hamming_distance(roiHash, lastRoiDhash_) <= 2) {
       if (++consecutiveSkips_ < kMaxConsecutiveSkips)
         return lastBoxes_; // L1 hit
@@ -668,6 +668,88 @@ static int count_hangul_syllables(const std::string &text) {
   return count;
 }
 
+static bool looks_like_korean_address_text(const std::string &text) {
+  // 방향·이동 표현이 포함된 경우 주소가 아님 ("서울 쪽으로", "서울 방향")
+  if (contains_any(text, {"쪽으로", "방향으로", "방면으로", "쪽방향", "가는 길",
+                          "오는 길", "방향", "근처", "부근"}))
+    return false;
+
+  // 명시 라벨 → 단독으로 충분
+  if (contains_any(text,
+                   {"주소", "주소지", "거주지", "소재지", "사는곳", "배송지"}))
+    return true;
+
+  // [Fix #6] PAT_DISTRICT: 자치구·시·군 단독 포함 ("강남구", "수원시")
+  if (contains_any(
+          text, {"강남구", "강동구",   "강북구", "강서구", "관악구",   "광진구",
+                 "구로구", "금천구",   "노원구", "도봉구", "동대문구", "동작구",
+                 "마포구", "서대문구", "서초구", "성동구", "성북구",   "송파구",
+                 "양천구", "영등포구", "용산구", "은평구", "종로구",   "중구",
+                 "중랑구", "해운대구", "수성구", "달서구", "남구",     "북구",
+                 "연제구", "사상구",   "금정구", "기장군"}))
+    return true;
+
+  // [Fix #6] PAT_REGION_GENERIC: 도명 직접 포함 (충청남도, 경기도 등)
+  const bool hasRegion = contains_any(
+      text, {"서울", "부산", "대구", "인천", "광주", "대전", "울산", "세종",
+             "경기", "강원", "충북", "충남", "충청", "전북", "전남", "전라",
+             "경북", "경남", "경상", "제주",
+             // [Fix #6] 도명 전체 문자열
+             "서울특별시", "부산광역시", "대구광역시", "인천광역시",
+             "광주광역시", "대전광역시", "충청남도", "충청북도", "경기도",
+             "강원도", "전라남도", "전라북도", "경상남도", "경상북도"});
+
+  // [Fix #6] PAT_ROAD_BASIC: 기본 도로명 (테헤란로 152, 강남대로 396)
+  {
+    static const re2::RE2 PAT_ROAD_BASIC(R"([가-힣]{2,}(?:로|길)\s*\d+)");
+    if (RE2::PartialMatch(text, PAT_ROAD_BASIC)) {
+      // 단위어(분, 시간, m, km) 후처리: 해당 단위가 있으면 주소가 아님
+      // 예: "5로 10분", "2길 3km"
+      if (contains_any(text, {"분 ", "분\n", "시간", " m ", " km", "m 거리",
+                              "km 거리", "개 ", " 개\n"}))
+        return false;
+      return true;
+    }
+  }
+
+  // [Fix #6] PAT_ROAD_NUMBERED: 숫자 도로명 (불당 25로 8)
+  {
+    static const re2::RE2 PAT_ROAD_NUMBERED(
+        R"([가-힣]{1,}\s+\d+(?:로|길)\s+\d+)");
+    if (RE2::PartialMatch(text, PAT_ROAD_NUMBERED)) {
+      if (contains_any(text, {"분 ", "분\n", "시간", " m ", " km"}))
+        return false;
+      return true;
+    }
+  }
+
+  // B-2: 지역어 + 도로명 주소 ("서울 테헤란로 152")
+  if (hasRegion) {
+    static const re2::RE2 PAT_ROAD(R"([가-힣]{2,}(?:로|길)\s*\d+)");
+    if (RE2::PartialMatch(text, PAT_ROAD))
+      return true;
+  }
+
+  // B-3: 동·읍·면 + 번지 ("역삼동 736-1") — 지역어 없어도 충분한 시그널
+  {
+    static const re2::RE2 PAT_LOT(
+        R"([가-힣]{2,}(?:동|읍|면)\s*\d+(?:-\d+)?(?:번지)?)");
+    if (RE2::PartialMatch(text, PAT_LOT))
+      return true;
+  }
+
+  if (!hasRegion)
+    return false;
+
+  const std::string hangulOnly = extract_hangul_syllables_utf8(text);
+  if (count_hangul_syllables(hangulOnly) < 3)
+    return false;
+
+  return ends_with(hangulOnly, "시") || ends_with(hangulOnly, "군") ||
+         ends_with(hangulOnly, "구") || ends_with(hangulOnly, "동") ||
+         ends_with(hangulOnly, "읍") || ends_with(hangulOnly, "면");
+}
+
 static int count_ascii_digits(const std::string &text) {
   int count = 0;
   for (char c : text) {
@@ -723,51 +805,6 @@ static bool has_adjacent_name_label(const std::vector<SecureCastOcrLine> &lines,
   }
 
   return false;
-}
-
-static bool looks_like_korean_address_text(const std::string &text) {
-  // 방향·이동 표현이 포함된 경우 주소가 아님 ("서울 쪽으로", "서울 방향")
-  // "쪽" 단독은 "양쪽", "이쪽" 등 정상 주소 컨텍스트를 억압하므로 제외.
-  if (contains_any(text, {"쪽으로", "방향으로", "방면으로", "쪽방향", "가는 길",
-                           "오는 길", "방향", "근처", "부근"}))
-    return false;
-
-  // 명시 라벨 → 단독으로 충분
-  if (contains_any(text,
-                   {"주소", "주소지", "거주지", "소재지", "사는곳", "배송지"}))
-    return true;
-
-  // 시·도 광역권 키워드 AND 행정구역 접미사 — 둘 다 만족해야 ADDRESS
-  const bool hasRegion = contains_any(
-      text, {"서울", "부산", "대구", "인천", "광주", "대전", "울산",
-             "세종", "경기", "강원", "충북", "충남", "충청", "전북",
-             "전남", "전라", "경북", "경남", "경상", "제주"});
-
-  // B-2: 지역어 + 도로명 주소 ("서울 테헤란로 152")
-  if (hasRegion) {
-    static const re2::RE2 PAT_ROAD(R"([가-힣]{2,}(?:로|길)\s*\d+)");
-    if (RE2::PartialMatch(text, PAT_ROAD))
-      return true;
-  }
-
-  // B-3: 동·읍·면 + 번지 ("역삼동 736-1") — 지역어 없어도 충분한 시그널
-  {
-    static const re2::RE2 PAT_LOT(
-        R"([가-힣]{2,}(?:동|읍|면)\s*\d+(?:-\d+)?(?:번지)?)");
-    if (RE2::PartialMatch(text, PAT_LOT))
-      return true;
-  }
-
-  if (!hasRegion)
-    return false;
-
-  const std::string hangulOnly = extract_hangul_syllables_utf8(text);
-  if (count_hangul_syllables(hangulOnly) < 3)
-    return false;
-
-  return ends_with(hangulOnly, "시") || ends_with(hangulOnly, "군") ||
-         ends_with(hangulOnly, "구") || ends_with(hangulOnly, "동") ||
-         ends_with(hangulOnly, "읍") || ends_with(hangulOnly, "면");
 }
 
 static bool starts_with_common_korean_surname(const std::string &hangulOnly) {
@@ -1080,8 +1117,7 @@ SecureCastOcrEngine::detect_pii(const std::vector<SecureCastOcrLine> &lines) {
 
   // 1) 주민등록번호: 6자리-7자리, 뒷자리 첫 글자 1~8 (외국인 포함)
   // [-/·\s]?: OCR이 슬래시·중간점·공백으로 구분자를 잘못 읽는 경우까지 허용.
-  static const re2::RE2 PATTERN_RRN(
-      R"(\b(\d{6})\s?[-/·]?\s?([1-8]\d{6})\b)");
+  static const re2::RE2 PATTERN_RRN(R"(\b(\d{6})\s?[-/·]?\s?([1-8]\d{6})\b)");
 
   // 2) 전화번호: 국내(010/011/016~019, 02~06x) + 국제(+1-xxx, +44-xx...)
   // 국제번호는 \b 없이 +로 시작하므로 별도 alt 추가.
@@ -1239,7 +1275,8 @@ SecureCastOcrEngine::detect_pii(const std::vector<SecureCastOcrLine> &lines) {
         normalizedLine += normalize_numeric_candidate(cluster) + " ";
       }
       // 클러스터 추출 실패 시(OCR 오류 문자 포함): rawText 전체를 직접 정규화
-      // 예: "O1O-1234-5678" → 클러스터 미추출 → normalize 직접 적용 → "010-1234-5678"
+      // 예: "O1O-1234-5678" → 클러스터 미추출 → normalize 직접 적용 →
+      // "010-1234-5678"
       if (normalizedLine.empty())
         normalizedLine = normalize_numeric_candidate(rawText);
       if (normalizedLine.empty())
@@ -1271,11 +1308,14 @@ SecureCastOcrEngine::detect_pii(const std::vector<SecureCastOcrLine> &lines) {
         }
       }
 
-      // (b) PHONE: 기술 문서 맥락(버전·빌드·코드 등)에서만 제외, 나머지는 모두 탐지
-      // 🚨 보안 원칙: 화이트리스트가 아닌 블랙리스트로 통제 — 차단 범위를 최소화해
-      //    "전화 010-", "담당 010-", "본가 010-" 같은 실제 개인정보를 놓치지 않는다.
+      // (b) PHONE: 기술 문서 맥락(버전·빌드·코드 등)에서만 제외, 나머지는 모두
+      // 탐지 🚨 보안 원칙: 화이트리스트가 아닌 블랙리스트로 통제 — 차단 범위를
+      // 최소화해
+      //    "전화 010-", "담당 010-", "본가 010-" 같은 실제 개인정보를 놓치지
+      //    않는다.
       if (type == nullptr && RE2::PartialMatch(normalizedLine, PATTERN_PHONE)) {
-        // 기술 문서 키워드가 전화번호 바로 앞에 있을 때만 제외 (정확한 블랙리스트)
+        // 기술 문서 키워드가 전화번호 바로 앞에 있을 때만 제외 (정확한
+        // 블랙리스트)
         static const re2::RE2 PAT_PHONE_TECH_BLOCK(
             R"((?:빌드|버전|version|v\.|build|patch|패치|품번|코드|code|모델|model|ref|rev|번호[가-힣]{0,2}(?=\s*(?!\d{3})))\s*(?:010|01[16-9]|02|0[3-9]))");
         if (!RE2::PartialMatch(rawText, PAT_PHONE_TECH_BLOCK))
@@ -1306,7 +1346,8 @@ SecureCastOcrEngine::detect_pii(const std::vector<SecureCastOcrLine> &lines) {
                     int v = d[d.size() - 1 - k] - '0';
                     if (k % 2 == 1) {
                       v *= 2;
-                      if (v > 9) v -= 9;
+                      if (v > 9)
+                        v -= 9;
                     }
                     sum += v;
                   }
@@ -1404,8 +1445,8 @@ SecureCastOcrEngine::detect_pii(const std::vector<SecureCastOcrLine> &lines) {
         std::string engName;
         if (RE2::PartialMatch(rawText, PAT_ENG_NAME, &engName)) {
           static const std::unordered_set<std::string> ENG_NAME_BLOCKLIST = {
-              "Full Name", "First Name", "Last Name", "User Name",
-              "Error Code", "Build Version"};
+              "Full Name", "First Name", "Last Name",
+              "User Name", "Error Code", "Build Version"};
           if (ENG_NAME_BLOCKLIST.find(engName) == ENG_NAME_BLOCKLIST.end())
             type = "NAME";
         }
