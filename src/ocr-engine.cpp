@@ -140,6 +140,7 @@ void SecureCastOcrEngine::clearDHashCache() {
   lastRoiDhash_ = 0;
   lastLineDhashes_.clear();
   consecutiveSkips_ = 0;
+  consecutiveEmptyOcr_ = 0;
 }
 
 SecureCastOcrEngine::~SecureCastOcrEngine() = default;
@@ -149,6 +150,7 @@ bool SecureCastOcrEngine::init() {
   try {
     hasLastRoiDhash_ = false;
     consecutiveSkips_ = 0;
+    consecutiveEmptyOcr_ = 0;
     avgLineHeight_ = 0.0f;
     lastBoxes_.clear();
     lastLineDhashes_.clear();
@@ -188,9 +190,9 @@ bool SecureCastOcrEngine::available() const { return available_; }
 // 현재 구현: FNV-1a 전체 픽셀 해시 기반 Dirty Skip
 // ============================================================
 
-OcrAnalysisResult
-SecureCastOcrEngine::analyze_bgra_frame(const uint8_t *pixels, int width,
-                                        int height, int stride) {
+OcrAnalysisResult SecureCastOcrEngine::analyze_bgra_frame(const uint8_t *pixels,
+                                                          int width, int height,
+                                                          int stride) {
   FrameTimer frame_timer(&profile_);
 
   if (!available_ || pixels == nullptr || width <= 0 || height <= 0 ||
@@ -211,12 +213,16 @@ SecureCastOcrEngine::analyze_bgra_frame(const uint8_t *pixels, int width,
     avgLineHeight_ = 0.0f;
   }
 
+  // ROI dHash는 현재 프레임 픽셀 기준으로 한 번만 계산해 L1·L2·Option B·최종
+  // 캐시 기록 경로에서 공유한다 (이전엔 최대 2회 중복 계산됐음).
+  const uint64_t currentRoiDhash =
+      compute_roi_dhash(pixels, stride, width, height);
+
   // ── L1: ROI dHash ─────────────────────────────────────────────
   // PII 박스 영역만 해시 → 시계·커서 등 ROI 외부 변화는 완전히 무시.
   // hamming_distance ≤ 2 → 안티앨리어싱·압축 노이즈 허용 → OCR 생략.
   if (sameRes && hasLastRoiDhash_) {
-    const uint64_t roiHash = compute_roi_dhash(pixels, stride, width, height);
-    if (hamming_distance(roiHash, lastRoiDhash_) <= 2) {
+    if (hamming_distance(currentRoiDhash, lastRoiDhash_) <= 2) {
       if (++consecutiveSkips_ < kMaxConsecutiveSkips) {
         OcrAnalysisResult res;
         res.boxes = lastBoxes_;
@@ -291,7 +297,7 @@ SecureCastOcrEngine::analyze_bgra_frame(const uint8_t *pixels, int width,
           }
         }
       }
-      lastRoiDhash_ = compute_roi_dhash(pixels, stride, width, height);
+      lastRoiDhash_ = currentRoiDhash;
       lastBoxes_ = merged;
       // L2 hit이지만 부분 OCR을 실제로 실행했으므로 L1 skip 카운터는 리셋한다.
       consecutiveSkips_ = 0;
@@ -324,8 +330,42 @@ SecureCastOcrEngine::analyze_bgra_frame(const uint8_t *pixels, int width,
       multipass_small_text(lines, pixels, width, height, stride);
   auto boxes = detect_pii(updatedLines);
 
+  // === Option B: 빈 결과 캐시 보존 (정적 화면 깜빡임 차단) ===
+  // Full OCR이 0개 박스를 반환했지만 같은 화면(dHash 동일)에서 이전엔 PII를
+  // 찾았다면 Windows OCR 비결정성으로 간주하고 kEmptyOcrTolerance회까지
+  // lastBoxes_를 보존한다. dHash 변경 시는 진짜 화면 변화이므로 보존 안 함.
+  // 1a051bd 회귀를 피하기 위해 lingering(SC_OCR_LINGER_FRAMES=5)은 건드리지
+  // 않는다 — 캐시 hysteresis는 OCR 결과 레이어에서만 동작한다.
+  // currentRoiDhash는 함수 상단에서 계산해 둔 값을 재사용한다.
+  const bool sameDhash = sameRes && hasLastRoiDhash_ &&
+                         hamming_distance(currentRoiDhash, lastRoiDhash_) <= 2;
+
+  if (boxes.empty() && !lastBoxes_.empty() && sameDhash &&
+      consecutiveEmptyOcr_ < kEmptyOcrTolerance) {
+    ++consecutiveEmptyOcr_;
+
+    if (++preserveLogCounter_ >= 30) {
+      preserveLogCounter_ = 0;
+      blog(LOG_INFO, "[SC-ocr] empty preserved (cnt=%d/%d, lastBoxes=%zu)",
+           consecutiveEmptyOcr_, kEmptyOcrTolerance, lastBoxes_.size());
+    }
+
+    // L1 dHash·해상도만 갱신; lastBoxes_와 lastLineDhashes_는 보존.
+    lastRoiDhash_ = currentRoiDhash;
+    hasLastRoiDhash_ = true;
+    impl_->lastFrameWidth = width;
+    impl_->lastFrameHeight = height;
+
+    OcrAnalysisResult res;
+    res.boxes = lastBoxes_;
+    res.effectiveLineCount = static_cast<int>(lines.size());
+    res.fullRecognitionRan = true;
+    return res;
+  }
+  consecutiveEmptyOcr_ = 0;
+
   // L1 캐시 갱신 (VisualTracker가 좌표 추적 담당, OCR은 탐지/확인만 수행)
-  lastRoiDhash_ = compute_roi_dhash(pixels, stride, width, height);
+  lastRoiDhash_ = currentRoiDhash;
   hasLastRoiDhash_ = true;
   impl_->lastFrameWidth = width;
   impl_->lastFrameHeight = height;

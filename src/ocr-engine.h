@@ -144,6 +144,17 @@ private:
   // OCR 워커 주기 포함 시 최대 ~250ms stale.
   static constexpr int kMaxConsecutiveSkips = 2;
 
+  // Full OCR이 0개 박스를 반환했을 때 lastBoxes_ 캐시를 보존한 연속 횟수.
+  // 같은 화면(dHash 동일)에서 이전엔 PII를 찾았다면 Windows OCR 비결정성으로
+  // 간주하고 kEmptyOcrTolerance회까지 캐시를 유지한다 — 정적 화면 깜빡임 차단.
+  // dHash 변경·해상도 변경 시 0으로 리셋된다.
+  int consecutiveEmptyOcr_ = 0;
+  // mp=300ms 기준 N=3 → 약 600ms 허용 → STALE_OCR_FRAMES(25프레임≈833ms)와
+  // 조화.
+  static constexpr int kEmptyOcrTolerance = 3;
+  // 캐시 보존 로그 throttle 카운터(인스턴스별). 30회마다 1회 출력.
+  int preserveLogCounter_ = 0;
+
   // dHash: 9×8 샘플 격자 → 행별 인접 밝기 비교(8비트 × 8행) → 64비트
   uint64_t compute_dhash_region(const uint8_t *px, int stride, int x, int y,
                                 int w, int h) const;
