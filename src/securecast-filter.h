@@ -160,58 +160,6 @@ private:
 };
 
 // ----------------------------------------------------
-// [Role C] Mock AI Worker Thread
-// ----------------------------------------------------
-class MockAIWorker {
-public:
-  // resultCallback: AI 분석이 끝날 때마다 Render Thread에서 읽을 결과를
-  // 전달하는 함수
-  using ResultCallback = std::function<void(const MaskPayload &)>;
-
-  MockAIWorker() = default;
-  ~MockAIWorker() { stop(); }
-
-  // 워커 스레드 시작. frameWidth/Height로 가짜 중앙 좌표를 계산한다.
-  void start(uint32_t frameWidth, uint32_t frameHeight,
-             ResultCallback callback);
-  void stop();
-  void setPaused(bool paused);
-
-  bool isRunning() const { return m_running.load(); }
-  bool isPaused() const { return m_paused.load(); }
-
-private:
-  void workerLoop();
-
-  std::thread m_thread;
-  std::atomic<bool> m_running{false};
-  std::atomic<bool> m_paused{false};
-  std::mutex m_mutex;
-  std::condition_variable m_cv;
-
-  uint32_t m_frameWidth = 0;
-  uint32_t m_frameHeight = 0;
-  ResultCallback m_callback;
-};
-
-// ----------------------------------------------------
-// [Role C] Lock-Free Result Slot
-// ----------------------------------------------------
-class AtomicMaskChannel {
-public:
-  // AI 스레드에서 호출 (produce)
-  void publish(const MaskPayload &payload);
-
-  // 렌더 스레드에서 호출 (consume). 새 데이터가 없으면 false 반환
-  bool consume(MaskPayload &out);
-
-private:
-  std::mutex m_mutex; // m_pending 접근 보호 (torn read 방지)
-  alignas(64) MaskPayload m_pending{};
-  alignas(64) std::atomic<bool> m_ready{false};
-};
-
-// ----------------------------------------------------
 // Core Filter Context
 // ----------------------------------------------------
 struct SecureCastFilter {
@@ -233,12 +181,8 @@ struct SecureCastFilter {
   // ----- [Role C 담당: 렌더링 파이프라인 및 GPU Readback] -----
   FrameRingBuffer
       ringBuffer; // Bounded Exposure(송출 지연) 구현용 N-프레임 텍스처 버퍼
-  MockAIWorker mockWorker; // [Role B 작업용] Role B가 AI/OCR을 연결하기 전까지
-                           // 모의 데이터를 발생시키는 워커
-  AtomicMaskChannel maskChannel; // AI 스레드 -> 비디오 렌더 스레드로 마스크
-                                 // 데이터를 안전하게 전달하는 단방향 채널
-  MaskPayload lastMask{}; // AI가 마지막으로 검출하여 발행한 블러/블랙아웃 처리
-                          // 영역 정보
+  MaskPayload lastMask{}; // health.shouldReset() 비상 경로의 풀스크린 블랙아웃
+                          // 영역 (그 외 마스킹 좌표는 trackerMgr이 직접 관리)
 
 #ifdef _WIN32
   GpuReadback readback; // GPU 텍스처를 CPU 메모리로 지연 없이 복사하는 다중

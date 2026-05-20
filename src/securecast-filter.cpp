@@ -472,129 +472,6 @@ FrameRingBuffer::peekSlotAtOffset(int framesBack) const {
   return &m_slots[idx];
 }
 
-
-
-// ================================================================
-// [Role C] MockAIWorker 구현부
-// ================================================================
-
-// 워커 스레드를 시작한다. AI 분석이 완료될 때마다 callback으로 마스킹 결과를
-// 전달.
-void MockAIWorker::start(uint32_t frameWidth, uint32_t frameHeight,
-                         ResultCallback callback) {
-  if (m_running.load())
-    return;
-
-  m_frameWidth = frameWidth;
-  m_frameHeight = frameHeight;
-  m_callback = std::move(callback);
-  m_running.store(true);
-
-  m_thread = std::thread([this]() { workerLoop(); });
-  blog(LOG_INFO, "MockAIWorker started (frame: %dx%d).", m_frameWidth,
-       m_frameHeight);
-}
-
-// 워커 스레드에 종료 신호를 보내고 join한다. securecast_destroy() 에서 ring
-// buffer 해제 전에 반드시 호출.
-void MockAIWorker::stop() {
-  if (!m_running.load())
-    return;
-
-  {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    m_running.store(false);
-  }
-  m_cv.notify_all();
-
-  if (m_thread.joinable())
-    m_thread.join();
-
-  blog(LOG_INFO, "MockAIWorker stopped.");
-}
-
-// 게임 모드 진입/해제 시 호출. paused=true면 스레드는 cv.wait에서 대기해 CPU를
-// 점유하지 않는다.
-void MockAIWorker::setPaused(bool paused) {
-  if (!m_running.load())
-    return;
-  {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    m_paused.store(paused, std::memory_order_relaxed);
-  }
-  m_cv.notify_all();
-  blog(LOG_INFO, "MockAIWorker %s.", paused ? "paused" : "resumed");
-}
-
-// 워커 스레드 본체. 50ms 주기로 빈 페이로드를 publish한다.
-// Role B 구현 시 여기서 OCR 호출 후 실제 BlurRect를 채워 publish하도록 교체.
-void MockAIWorker::workerLoop() {
-  while (m_running.load()) {
-    {
-      std::unique_lock<std::mutex> lock(m_mutex);
-      if (m_paused.load(std::memory_order_relaxed)) {
-        // 게임 모드 일시정지: stop() 또는 resume 신호까지 대기
-        m_cv.wait(lock, [this]() {
-          return !m_running.load() || !m_paused.load(std::memory_order_relaxed);
-        });
-      } else {
-        // AI 처리 시간 시뮬레이션 (실제 OCR 처리 예상 지연: ~40~60ms)
-        m_cv.wait_for(lock, std::chrono::milliseconds(50), [this]() {
-          return !m_running.load() || m_paused.load(std::memory_order_relaxed);
-        });
-      }
-    }
-
-    if (!m_running.load() || m_paused.load(std::memory_order_relaxed))
-      continue;
-
-    // [F4 Fix] 프로덕션에서 가짜 마스킹 박스가 영구 출력되는 데모 회귀 방지를
-    // 위해 디버그용 MOCK 가드를 둡니다.
-#ifdef SC_DEBUG_MOCK
-    MaskPayload payload{};
-    payload.rectCount = 0;
-
-    if (m_callback)
-      m_callback(payload);
-#else
-    // 실운영(Production) 시에는 빈 마스크를 주기적으로 전달하거나 스핀만
-    // 유지시킵니다.
-    MaskPayload payload{};
-    if (m_callback)
-      m_callback(payload);
-#endif
-  }
-}
-
-// ================================================================
-// [Role C] AtomicMaskChannel 구현부
-//
-// [P0 수정] m_pending은 비원자적 구조체이므로 뮤텍스로 보호한다.
-// 이전 코드는 memory_order만으로 data race를 방지하려 했으나,
-// m_pending 쓰기 중에 Render Thread가 읽으면 torn read가 발생한다.
-// ================================================================
-
-// AI 스레드 → Render 스레드 결과 전달. 뮤텍스로 m_pending 기록 보호 후 ready
-// 플래그를 set.
-void AtomicMaskChannel::publish(const MaskPayload &payload) {
-  std::lock_guard<std::mutex> lock(m_mutex);
-  m_pending = payload;
-  m_ready.store(true, std::memory_order_release);
-}
-
-// Render 스레드가 새 마스킹 결과를 꺼낸다. 새 데이터가 없으면 false 반환
-// (lastMask 유지).
-bool AtomicMaskChannel::consume(MaskPayload &out) {
-  if (!m_ready.load(std::memory_order_acquire))
-    return false;
-  std::lock_guard<std::mutex> lock(m_mutex);
-  if (!m_ready.exchange(false, std::memory_order_acq_rel))
-    return false; // 다른 consumer가 먼저 가져간 경우 (현재는 단일이지만 방어적
-                  // 처리)
-  out = m_pending;
-  return true;
-}
-
 // ================================================================
 // [Role B/C] GPU texture -> CPU BGRA pixels 재사용 readback
 // ================================================================
@@ -1509,11 +1386,10 @@ static void securecast_destroy(void *data) {
   filter->winListener.stop();
 #endif
 
-  // AI 워커 먼저 중지 (콜백이 ring buffer에 접근하지 않도록)
+  // OCR/Tracker 워커 먼저 중지 (trackerMgr·ring buffer 해제 전 race 방지)
   stop_tracker_thread(filter); // tracker thread 먼저 중지 (trackerMgr 공유)
   stop_ocr_worker(filter);
   filter->trackerMgr.clear(); // OCR worker 종료 후 tracker 정리
-  filter->mockWorker.stop();
 
   obs_enter_graphics();
   destroy_ocr_stage_surface(filter);
@@ -1558,7 +1434,7 @@ static void securecast_destroy(void *data) {
 //   │                                                   │
 //   │  1. 링 버퍼 지연 초기화 (첫 프레임 한 번만)        │
 //   │  2. 현재 프레임 → Ring Buffer HEAD 에 Push        │
-//   │  3. AtomicMaskChannel에서 최신 AI 결과 Consume    │
+//   │  3. Visual Tracker에서 현재 블러 박스 조회         │
 //   │  4. Ring Buffer TAIL(N프레임 전) 꺼내기           │
 //   │  5a. 버퍼 미충족 → 블랙 홀드 프레임 출력           │
 //   │  5b. 버퍼 충족  → 지연 프레임 + 마스킹 박스 출력   │
@@ -1604,10 +1480,7 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
     }
     filter->lastCompletedOcrFrameId.store(0, std::memory_order_release);
     filter->unverifiedFrameLogCounter = 0;
-    // 첫 초기화 시 AI 워커 + Tracker 스레드 시작
-    filter->mockWorker.start(w, h, [filter](const MaskPayload &payload) {
-      filter->maskChannel.publish(payload);
-    });
+    // 첫 초기화 시 OCR 워커 + Tracker 스레드 시작
     start_ocr_worker(filter);
     start_tracker_thread(filter);
     blog(LOG_INFO,
@@ -1620,10 +1493,9 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
          "Resolution changed (%dx%d -> %dx%d). Reinitializing ring buffer.",
          filter->ringBuffer.getWidth(), filter->ringBuffer.getHeight(), w, h);
 
-    // 1. 워커 중지 (OCR → Tracker → Mock 순서로 중지해야 trackerMgr race 없음)
+    // 1. 워커 중지 (OCR → Tracker 순서로 중지해야 trackerMgr race 없음)
     stop_ocr_worker(filter);
     stop_tracker_thread(filter);
-    filter->mockWorker.stop();
 
     // 2. 링 버퍼 재구성
     filter->ringBuffer.destroy();
@@ -1640,18 +1512,12 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
     filter->lastCompletedOcrFrameId.store(0, std::memory_order_release);
     filter->unverifiedFrameLogCounter = 0;
 
-    // 3. 마스킹 큐 비우기
-    MaskPayload dummy;
-    while (filter->maskChannel.consume(dummy)) {
-    }
+    // 3. 비상 블랙아웃 마스크 초기화
     filter->lastMask = MaskPayload{};
     filter->trackerMgr.clear(); // 해상도 변경 시 기존 박스 좌표 무효화
     filter->trackerFrameSkip_ = 0;
 
     // 4. 새 해상도로 워커 재시작
-    filter->mockWorker.start(w, h, [filter](const MaskPayload &payload) {
-      filter->maskChannel.publish(payload);
-    });
     start_ocr_worker(filter);
     start_tracker_thread(filter);
     blog(LOG_INFO,
@@ -1755,14 +1621,8 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
                                filter->lastSubmittedOcrFrameId.load(std::memory_order_relaxed));
 #endif
 
-  // --- Step 3: maskChannel drain (OCR 좌표는 Visual Tracker가 직접 관리) ---
-  // maskChannel은 더 이상 OCR 박스 전달에 사용하지 않는다.
-  // lastMask는 health.shouldReset() 경로의 풀스크린 비상 블랙아웃 전용으로만
-  // 남긴다.
-  {
-    MaskPayload drainMask{};
-    filter->maskChannel.consume(drainMask); // 채널이 포화되지 않도록 드레인
-  }
+  // OCR 박스 좌표는 Visual Tracker(trackerMgr)가 직접 관리한다.
+  // lastMask는 health.shouldReset() 경로의 풀스크린 비상 블랙아웃 전용.
 
   // [THREAD-SAFE] currentState 갱신 — tracker + blacklist 기반
   MaskPayload blacklistSnapshot;
@@ -2252,7 +2112,6 @@ static void securecast_video_tick(void *data, float seconds) {
           filter->isGameMode.store(true, std::memory_order_release);
           filter->gameModeEntryTimer = 0.0f;
           filter->gameModeExitTimer = 0.0f;
-          filter->mockWorker.setPaused(true);
           blog(LOG_INFO, "[SecureCast] Game mode ON  (CPU: %.0f%%)",
                filter->cpuUsage);
         }
@@ -2265,7 +2124,6 @@ static void securecast_video_tick(void *data, float seconds) {
         if (filter->gameModeExitTimer >= GM_EXIT_TIME) {
           filter->isGameMode.store(false, std::memory_order_release);
           filter->gameModeExitTimer = 0.0f;
-          filter->mockWorker.setPaused(false);
           blog(LOG_INFO,
                "[SecureCast] Game mode OFF (CPU: %.0f%%, 5s cooldown)",
                filter->cpuUsage);

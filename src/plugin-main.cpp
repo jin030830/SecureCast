@@ -42,7 +42,7 @@ OBS_MODULE_USE_DEFAULT_LOCALE("securecast", "en-US")
  * [개발 프로세스 안내]
  * 1. Role A (렌더링): obs_video_render() 과정에서 마스킹 셰이더를 적용합니다.
  * 2. Role B (AI): 분석 엔진을 통해 화면의 개인정보 영역을 탐지하고 MaskPayload를 생성합니다.
- * 3. Role C (파이프라인): FrameRingBuffer를 통해 프레임 지연을 관리하고, AtomicMaskChannel로 데이터를 중계합니다.
+ * 3. Role C (파이프라인): FrameRingBuffer로 프레임 지연을 관리하고, Visual Tracker(trackerMgr)로 마스킹 좌표를 중계합니다.
  * 4. Role D (설정/UI): 사용자 설정값을 관리하며 전체 모듈의 상태(SecurityState)를 제어합니다.
  */
 
