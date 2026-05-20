@@ -112,7 +112,8 @@ struct MaskPayload {
 // 창이 사라진 후 ring buffer에 남은 N프레임 동안 마스킹을 유지하는 잔영 항목.
 struct LingeringWindow {
   TrackedWindow window; // 마지막으로 알려진 창 정보 (bounds 포함)
-  int ticksRemaining;   // SC_RING_BUFFER_SLOTS에서 매 tick 카운트다운
+  int ticksRemaining;   // 매 tick 카운트다운. 초기값은 SC_RING_BUFFER_SLOTS+1
+                        // (=61) — 60프레임 송출 지연 + 1프레임 갭 커버.
 };
 constexpr int SC_MAX_LINGERING = SC_MAX_TRACKED_WINDOWS;
 #endif
@@ -132,16 +133,17 @@ constexpr int SC_MAX_SLOT_OCR_BOXES =
     16; // VisualTrackerManager::MAX_TRACKERS(8)의 2배 여유
 
 // NCC가 박스를 일시적으로 잃었을 때(부분 가림 등) 유지할 프레임 수.
-// 너무 크면 창 최소화 후 빈 화면에 블러 잔상이 남음.
-// 너무 작으면 짧은 가림에도 블러가 깜박임.
+// 송출 지연(SC_RING_BUFFER_SLOTS=60) + 1프레임 갭만 커버하면 충분하다.
 //
-// SC_OCR_LINGER_FRAMES > SC_RING_BUFFER_SLOTS 인 이유:
-//   링 버퍼 슬롯 자체는 60개만 순환하지만, OcrBoxSnapshot은 Slot 내부 구조체로
-//   pushFrame 시점에 그 슬롯에 attach 되어 함께 순환한다. ticksRemaining 카운터
-//   는 같은 hwnd에 대한 새 detection이 도착할 때마다 121로 재설정되므로,
-//   link N프레임 송출 지연(60) 분 + detection 주기 marginal latency(약 60)
-//   동안 OCR 박스가 유지된다. 121을 넘어가도 동일 hwnd 재탐지 시 갱신된다.
-constexpr int SC_OCR_LINGER_FRAMES = SC_RING_BUFFER_SLOTS * 2 + 1;
+// 값 선택 이력:
+//   - 5 (1a051bd, 2026-05-18): 짧은 가림에 깜박임. 너무 짧음.
+//   - 121 = SC_RING_BUFFER_SLOTS*2+1 (시도): 1a051bd가 지적한 "TTL 61이 너무
+//     커서 창 최소화 후 빈 텍스처 위에 블러가 최대 1초간 그려짐"을 4초로
+//     악화시킴. 회귀.
+//   - 61 = SC_RING_BUFFER_SLOTS+1 (현재): 60프레임 송출 지연 + 1프레임 갭을
+//     정확히 커버. 윈도우 사라짐은 win_event_listener의 HIDE/DESTROY/MINIMIZE
+//     push 신호로 즉시 감지되어 lingering이 정리되므로 추가 마진 불필요.
+constexpr int SC_OCR_LINGER_FRAMES = SC_RING_BUFFER_SLOTS + 1;
 
 struct OcrBoxSnapshot {
   BlurRect rects[SC_MAX_SLOT_OCR_BOXES]{};
