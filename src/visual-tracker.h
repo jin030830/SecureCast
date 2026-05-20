@@ -33,8 +33,12 @@ public:
   static constexpr float SCORE_LOST = 0.55f; // P0-2: 0.40→0.55, ghost 억제
   static constexpr float SCORE_REFRESH =
       0.85f; // 이 점수 이상이면 템플릿 갱신 (드리프트 방지)
-  static constexpr int FRAMES_LOST =
-      3; // 연속 실패 이 횟수 초과 시 제거 (100ms@30Hz)
+  // 연속 실패 이 횟수 초과 시 제거.
+  // 3에서 10으로 상향(2025 fix): N프레임 링 버퍼 송출 지연(60)과 OCR linger
+  // TTL(121)에 맞춰, 일시 가림/포커스 이동 중 박스가 성급히 폭발 소실되어
+  // 송출 시점 슬롯이 빈 lingering으로 묶이는 현상을 차단한다. 33ms@30Hz × 10
+  // ≈ 333ms 동안 NCC가 회복할 시간을 준다.
+  static constexpr int FRAMES_LOST = 10;
   static constexpr int SEARCH_NEAR = 30; // lastScore >= SCORE_OK 일 때 반경
   static constexpr int SEARCH_FAR =
       250; // lastScore <  SCORE_OK 일 때 반경 (P0-A: 60→250, 빠른 이동 대응)

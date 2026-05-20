@@ -134,7 +134,14 @@ constexpr int SC_MAX_SLOT_OCR_BOXES =
 // NCC가 박스를 일시적으로 잃었을 때(부분 가림 등) 유지할 프레임 수.
 // 너무 크면 창 최소화 후 빈 화면에 블러 잔상이 남음.
 // 너무 작으면 짧은 가림에도 블러가 깜박임.
-constexpr int SC_OCR_LINGER_FRAMES = 5;
+//
+// SC_OCR_LINGER_FRAMES > SC_RING_BUFFER_SLOTS 인 이유:
+//   링 버퍼 슬롯 자체는 60개만 순환하지만, OcrBoxSnapshot은 Slot 내부 구조체로
+//   pushFrame 시점에 그 슬롯에 attach 되어 함께 순환한다. ticksRemaining 카운터
+//   는 같은 hwnd에 대한 새 detection이 도착할 때마다 121로 재설정되므로,
+//   link N프레임 송출 지연(60) 분 + detection 주기 marginal latency(약 60)
+//   동안 OCR 박스가 유지된다. 121을 넘어가도 동일 hwnd 재탐지 시 갱신된다.
+constexpr int SC_OCR_LINGER_FRAMES = SC_RING_BUFFER_SLOTS * 2 + 1;
 
 struct OcrBoxSnapshot {
   BlurRect rects[SC_MAX_SLOT_OCR_BOXES]{};

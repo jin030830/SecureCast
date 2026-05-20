@@ -67,24 +67,26 @@ static void save_manual_rects(SecureCastFilter *filter,
 // ────────────────────────────────────────────────────────────
 // [Fix #3-A] register_lingering_window — hwnd 기반 lingering upsert 헬퍼
 //
-// 기존 창이 있으면 window 좌표와 TTL(SC_RING_BUFFER_SLOTS+1)을 갱신하고,
-// 없으면 슬롯이 남은 경우에만 신규 추가한다.
-// TTL = SC_RING_BUFFER_SLOTS + 1 로 통일:
-//   N슬롯 지연 분 + 탐지 틱의 render가 captureWindowList를 업데이트하기 전에
-//   pushFrame이 먼저 실행되는 1프레임 갭을 커버.
+// 기존 창이 있으면 window 좌표와 TTL(SC_RING_BUFFER_SLOTS * 2 + 1 = 121)을
+// 갱신하고, 없으면 슬롯이 남은 경우에만 신규 추가한다.
+// TTL = SC_RING_BUFFER_SLOTS * 2 + 1 로 통일:
+//   N슬롯 지연(60) + 탐지 latency 마진(60) + 1프레임 갭(pushFrame 선행) 커버.
+//   링 버퍼 깊이의 2배까지 유지하여 OCR/트래커 일시 lost에도 송출 시점에
+//   60프레임 보호막이 남도록 한다.
 // ────────────────────────────────────────────────────────────
 static void register_lingering_window(SecureCastFilter *filter,
                                       const TrackedWindow &win) {
   for (int li = 0; li < filter->lingeringCount; ++li) {
     if (filter->lingeringWindows[li].window.hwnd == win.hwnd) {
       filter->lingeringWindows[li].window = win;
-      filter->lingeringWindows[li].ticksRemaining = SC_RING_BUFFER_SLOTS + 1;
+      filter->lingeringWindows[li].ticksRemaining =
+          SC_RING_BUFFER_SLOTS * 2 + 1;
       return;
     }
   }
   if (filter->lingeringCount < SC_MAX_LINGERING) {
     filter->lingeringWindows[filter->lingeringCount++] = {
-        win, SC_RING_BUFFER_SLOTS + 1};
+        win, SC_RING_BUFFER_SLOTS * 2 + 1};
   } else {
     blog(LOG_WARNING, "[SecureCast][linger-full] dropping hwnd=%p",
          (void *)win.hwnd);
