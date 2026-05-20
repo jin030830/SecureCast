@@ -1553,96 +1553,243 @@ SecureCastOcrEngine::detect_pii(const std::vector<SecureCastOcrLine> &lines) {
 }
 
 // ============================================================
-// P3: 소형 글씨 다중 패스 OCR
-// 높이 < SMALL_H px 라인을 최대 MAX_PASSES개 2× nearest-neighbor 업스케일 후
-// 재OCR하여 detect_pii 입력 라인을 개선한다.
+// multipass_small_text / split_batch_multipass 공용 헬퍼
+// ============================================================
+namespace {
+
+struct UnionBBox {
+  int x0;
+  int y0;
+  int x1;
+  int y1;
+  float sumArea; // indices가 차지하는 박스 면적 합 (Union 면적 아님)
+};
+
+// indices가 가리키는 라인들의 PAD-팽창 Union BBox를 [0, width)×[0, height)
+// 범위로 클램핑하여 반환한다. sumArea는 각 라인 면적의 단순 합(겹침 무시).
+static UnionBBox compute_union_bbox(const std::vector<SecureCastOcrLine> &lines,
+                                    const std::vector<int> &indices, int pad,
+                                    int width, int height) {
+  UnionBBox b{width, height, 0, 0, 0.0f};
+  for (int idx : indices) {
+    const auto &l = lines[idx];
+    b.x0 = std::min(b.x0, std::max(0, static_cast<int>(l.x) - pad));
+    b.y0 = std::min(b.y0, std::max(0, static_cast<int>(l.y) - pad));
+    b.x1 = std::max(b.x1, std::min(static_cast<int>(l.x + l.w) + pad, width));
+    b.y1 = std::max(b.y1, std::min(static_cast<int>(l.y + l.h) + pad, height));
+    b.sumArea += l.w * l.h;
+  }
+  return b;
+}
+
+// 2× 업스케일된 batch 좌표(batchLines)를 (ux0, uy0) 원본 좌표계로 역투영하여
+// indices에 대응하는 가장 잘 맞는 라인을 IoU 매칭으로 result[idx]에 반영.
+// IoU가 임계치 미만이면 result[idx]는 유지된다(원본 라인 보존).
+static void apply_iou_match(std::vector<SecureCastOcrLine> &result,
+                            const std::vector<int> &indices,
+                            const std::vector<SecureCastOcrLine> &batchLines,
+                            int ux0, int uy0, float iouThreshold = 0.4f) {
+  for (int idx : indices) {
+    const auto &orig = result[idx];
+    float bestIou = iouThreshold;
+    int bestJ = -1;
+    for (int j = 0; j < static_cast<int>(batchLines.size()); ++j) {
+      const auto &bl = batchLines[j];
+      const float bx = ux0 + bl.x * 0.5f;
+      const float by = uy0 + bl.y * 0.5f;
+      const float bw = bl.w * 0.5f, bh = bl.h * 0.5f;
+      const float ix = std::max(orig.x, bx);
+      const float iy = std::max(orig.y, by);
+      const float ix2 = std::min(orig.x + orig.w, bx + bw);
+      const float iy2 = std::min(orig.y + orig.h, by + bh);
+      if (ix2 <= ix || iy2 <= iy)
+        continue;
+      const float inter = (ix2 - ix) * (iy2 - iy);
+      const float uni = orig.w * orig.h + bw * bh - inter;
+      const float iou = uni > 0.0f ? inter / uni : 0.0f;
+      if (iou > bestIou) {
+        bestIou = iou;
+        bestJ = j;
+      }
+    }
+    if (bestJ >= 0) {
+      const auto &bl = batchLines[bestJ];
+      SecureCastOcrLine mapped;
+      mapped.text = bl.text;
+      mapped.x = ux0 + bl.x * 0.5f;
+      mapped.y = uy0 + bl.y * 0.5f;
+      mapped.w = bl.w * 0.5f;
+      mapped.h = bl.h * 0.5f;
+      result[idx] = mapped;
+    }
+  }
+}
+
+} // namespace
+
+// ============================================================
+// P3: 소형 글씨 다중 패스 OCR (Union BBox 평탄화)
+// 높이 < SMALL_H px 라인 전체를 Union BBox 한 영역으로 묶어 2× nearest-neighbor
+// 업스케일 후 단일 batch recognize_text를 호출한다. 결과는 IoU 매칭으로 원본
+// 라인에 다시 투영하여 detect_pii 입력을 개선한다.
+//
+// 안전 가드:
+//   - batch 픽셀 수 > SC_MAX_OCR_BATCH_PX → split_batch_multipass로 분할
+//   - sumArea / unionArea < SC_SPARSE_THRESHOLD (sparse) → 분할 폴백
+//   - 분할도 안전하지 못한 서브셋은 개별 crop OCR로 핀포인트 폴백
 // L2 캐시 갱신용 원본 lines는 호출부에서 따로 유지한다.
 // ============================================================
 std::vector<SecureCastOcrLine> SecureCastOcrEngine::multipass_small_text(
     const std::vector<SecureCastOcrLine> &lines, const uint8_t *pixels,
     int width, int height, int stride) {
   PhaseTimer t_mp(&profile_.acc.multipass);
-  // MAX_PASSES = 6: 성능/OCR 스레드 예산 상한.
-  // 커밋 메시지 "MAX_PASSES 32"는 실험값이며 실제로는 6으로 확정.
-  // 소형 라인 7개 초과분은 Phase 2 union bbox batch OCR로 처리.
-  static constexpr int MAX_PASSES = 6;
   static constexpr int PAD = 4;
 
-  // 2-D: SMALL_H를 직전 사이클 평균 라인 높이 기반으로 동적 결정.
   const float SMALL_H = avgLineHeight_ > 0.0f ? avgLineHeight_ * 0.7f : 20.0f;
 
   auto result = lines;
-  int passes = 0;
-
-  // Phase 1: 최대 MAX_PASSES개까지 개별 2× 업스케일 재OCR
-  std::vector<int> remaining; // MAX_PASSES 초과분 인덱스
+  std::vector<int> small;
   for (int i = 0; i < static_cast<int>(result.size()); ++i) {
-    if (result[i].h >= SMALL_H)
-      continue;
-
-    if (passes >= MAX_PASSES) {
-      remaining.push_back(i);
-      continue;
+    if (result[i].h < SMALL_H) {
+      small.push_back(i);
     }
-
-    const auto &l = result[i];
-    const int cx = std::max(0, static_cast<int>(l.x) - PAD);
-    const int cy = std::max(0, static_cast<int>(l.y) - PAD);
-    const int cr = std::min(static_cast<int>(l.x + l.w) + PAD, width);
-    const int cb = std::min(static_cast<int>(l.y + l.h) + PAD, height);
-    const int cw = cr - cx, ch = cb - cy;
-    if (cw <= 0 || ch <= 0)
-      continue;
-
-    const int upW = cw * 2, upH = ch * 2;
-    std::vector<uint8_t> up(static_cast<size_t>(upW) * upH * 4);
-    for (int uy = 0; uy < upH; ++uy) {
-      for (int ux = 0; ux < upW; ++ux) {
-        const uint8_t *s =
-            pixels + (ptrdiff_t)(cy + uy / 2) * stride + (cx + ux / 2) * 4;
-        uint8_t *d = up.data() + (ptrdiff_t)uy * upW * 4 + ux * 4;
-        d[0] = s[0];
-        d[1] = s[1];
-        d[2] = s[2];
-        d[3] = s[3];
-      }
-    }
-
-    auto reLines = recognize_text(up.data(), upW, upH, upW * 4);
-    ++passes;
-    if (reLines.empty())
-      continue;
-
-    for (auto &rl : reLines) {
-      rl.x = cx + rl.x * 0.5f;
-      rl.y = cy + rl.y * 0.5f;
-      rl.w *= 0.5f;
-      rl.h *= 0.5f;
-    }
-    result[i] = reLines[0];
   }
 
-  // Phase 2: 초과분 → union bbox 2× 업스케일 1회 batch OCR
-  if (!remaining.empty()) {
-    int ux0 = width, uy0 = height, ux1 = 0, uy1 = 0;
-    for (int idx : remaining) {
-      const auto &l = result[idx];
-      ux0 = std::min(ux0, std::max(0, static_cast<int>(l.x) - PAD));
-      uy0 = std::min(uy0, std::max(0, static_cast<int>(l.y) - PAD));
-      ux1 = std::max(ux1, std::min(static_cast<int>(l.x + l.w) + PAD, width));
-      uy1 = std::max(uy1, std::min(static_cast<int>(l.y + l.h) + PAD, height));
-    }
-    const int ucw = ux1 - ux0, uch = uy1 - uy0;
+  if (small.empty())
+    return result;
 
-    // 8 MP 이하 가드 (안전)
-    if (ucw > 0 && uch > 0 &&
-        static_cast<size_t>(ucw * 2) * (uch * 2) <= 8000000u) {
+  // 1단계: Union BBox 계산
+  const UnionBBox ub = compute_union_bbox(result, small, PAD, width, height);
+  const int ucw = ub.x1 - ub.x0, uch = ub.y1 - ub.y0;
+  if (ucw <= 0 || uch <= 0)
+    return result;
+
+  const size_t batchPx = static_cast<size_t>(ucw * 2) * (uch * 2);
+  const float unionArea = static_cast<float>(ucw * uch);
+  const bool isSparse =
+      (unionArea > 0.0f) && (ub.sumArea / unionArea < SC_SPARSE_THRESHOLD);
+
+  // 2단계: 안전 가드 - 배치 픽셀 임계치 초과이거나 sparse 레이아웃이면
+  // split_batch_multipass로 분할 폴백.
+  if (batchPx > SC_MAX_OCR_BATCH_PX || isSparse) {
+    return split_batch_multipass(result, small, pixels, width, height, stride);
+  }
+
+  // 3단계: 기본 밀집/안전 단일 Batch OCR
+  const int bW = ucw * 2, bH = uch * 2;
+  std::vector<uint8_t> batch(static_cast<size_t>(bW) * bH * 4);
+  for (int by = 0; by < bH; ++by) {
+    for (int bx = 0; bx < bW; ++bx) {
+      const uint8_t *s =
+          pixels + (ptrdiff_t)(ub.y0 + by / 2) * stride + (ub.x0 + bx / 2) * 4;
+      uint8_t *d = batch.data() + (ptrdiff_t)by * bW * 4 + bx * 4;
+      d[0] = s[0];
+      d[1] = s[1];
+      d[2] = s[2];
+      d[3] = s[3];
+    }
+  }
+
+  auto batchLines = recognize_text(batch.data(), bW, bH, bW * 4);
+  // 빈 결과면 IoU 매칭이 no-op이 되어 result[idx] 갱신을 건너뛰는 것과
+  // 동일하므로 명시적으로 조기 반환한다. (split_batch_multipass와 정책 통일)
+  if (batchLines.empty())
+    return result;
+
+  apply_iou_match(result, small, batchLines, ub.x0, ub.y0);
+  return result;
+}
+
+std::vector<SecureCastOcrLine> SecureCastOcrEngine::split_batch_multipass(
+    const std::vector<SecureCastOcrLine> &lines,
+    const std::vector<int> &smallIndices, const uint8_t *pixels, int width,
+    int height, int stride) {
+  static constexpr int PAD = 4;
+  auto result = lines;
+  if (smallIndices.empty())
+    return result;
+
+  // 1단계: Y축 좌표 기준 공간 정렬
+  std::vector<int> sortedSmall = smallIndices;
+  std::sort(sortedSmall.begin(), sortedSmall.end(),
+            [&](int a, int b) { return result[a].y < result[b].y; });
+
+  // 2단계: 공간적 N분할 (최대 3분할)
+  int numSplits = 3;
+  size_t itemsPerSplit = (sortedSmall.size() + numSplits - 1) / numSplits;
+
+  for (int s = 0; s < numSplits; ++s) {
+    size_t start = s * itemsPerSplit;
+    if (start >= sortedSmall.size())
+      break;
+    size_t end = std::min(sortedSmall.size(), start + itemsPerSplit);
+
+    std::vector<int> subset(sortedSmall.begin() + start,
+                            sortedSmall.begin() + end);
+    if (subset.empty())
+      continue;
+
+    // 3단계: 서브셋에 대한 union bbox 계산
+    const UnionBBox ub = compute_union_bbox(result, subset, PAD, width, height);
+    const int ucw = ub.x1 - ub.x0, uch = ub.y1 - ub.y0;
+    if (ucw <= 0 || uch <= 0)
+      continue;
+
+    const float subsetArea = static_cast<float>(ucw * uch);
+    const bool subsetSparse =
+        (subsetArea > 0.0f) && (ub.sumArea / subsetArea < SC_SPARSE_THRESHOLD);
+
+    // 4단계: 계층적 sparse fallback
+    // 서브셋 내 원소가 1개이거나, 분할 후에도 여전히 sparse한 경우 개별 crop
+    // OCR로 핀포인트 fallback
+    if (subset.size() == 1 || subsetSparse) {
+      for (int idx : subset) {
+        const auto &l = result[idx];
+        const int cx = std::max(0, static_cast<int>(l.x) - PAD);
+        const int cy = std::max(0, static_cast<int>(l.y) - PAD);
+        const int cr = std::min(static_cast<int>(l.x + l.w) + PAD, width);
+        const int cb = std::min(static_cast<int>(l.y + l.h) + PAD, height);
+        const int cw = cr - cx, ch = cb - cy;
+        if (cw <= 0 || ch <= 0)
+          continue;
+
+        const int upW = cw * 2, upH = ch * 2;
+        std::vector<uint8_t> up(static_cast<size_t>(upW) * upH * 4);
+        for (int uy = 0; uy < upH; ++uy) {
+          for (int ux = 0; ux < upW; ++ux) {
+            const uint8_t *src =
+                pixels + (ptrdiff_t)(cy + uy / 2) * stride + (cx + ux / 2) * 4;
+            uint8_t *d = up.data() + (ptrdiff_t)uy * upW * 4 + ux * 4;
+            d[0] = src[0];
+            d[1] = src[1];
+            d[2] = src[2];
+            d[3] = src[3];
+          }
+        }
+
+        auto reLines = recognize_text(up.data(), upW, upH, upW * 4);
+        if (reLines.empty())
+          continue;
+
+        for (auto &rl : reLines) {
+          rl.x = cx + rl.x * 0.5f;
+          rl.y = cy + rl.y * 0.5f;
+          rl.w *= 0.5f;
+          rl.h *= 0.5f;
+        }
+        result[idx] = reLines[0];
+      }
+    } else {
+      // 배치 픽셀 임계치 초과 시 최종 안전 장치(이 서브셋 OCR 포기).
+      if (static_cast<size_t>(ucw * 2) * (uch * 2) > SC_MAX_OCR_BATCH_PX)
+        continue;
+
       const int bW = ucw * 2, bH = uch * 2;
       std::vector<uint8_t> batch(static_cast<size_t>(bW) * bH * 4);
       for (int by = 0; by < bH; ++by) {
         for (int bx = 0; bx < bW; ++bx) {
-          const uint8_t *s =
-              pixels + (ptrdiff_t)(uy0 + by / 2) * stride + (ux0 + bx / 2) * 4;
+          const uint8_t *s = pixels + (ptrdiff_t)(ub.y0 + by / 2) * stride +
+                             (ub.x0 + bx / 2) * 4;
           uint8_t *d = batch.data() + (ptrdiff_t)by * bW * 4 + bx * 4;
           d[0] = s[0];
           d[1] = s[1];
@@ -1652,43 +1799,10 @@ std::vector<SecureCastOcrLine> SecureCastOcrEngine::multipass_small_text(
       }
 
       auto batchLines = recognize_text(batch.data(), bW, bH, bW * 4);
+      if (batchLines.empty())
+        continue;
 
-      // IoU≥0.4 기준으로 batch 결과를 remaining 라인에 매칭
-      for (int idx : remaining) {
-        const auto &orig = result[idx];
-        float bestIou = 0.4f;
-        int bestJ = -1;
-        for (int j = 0; j < static_cast<int>(batchLines.size()); ++j) {
-          const auto &bl = batchLines[j];
-          // batch 좌표 → 원본 좌표
-          const float bx = ux0 + bl.x * 0.5f;
-          const float by = uy0 + bl.y * 0.5f;
-          const float bw = bl.w * 0.5f, bh = bl.h * 0.5f;
-          const float ix = std::max(orig.x, bx);
-          const float iy = std::max(orig.y, by);
-          const float ix2 = std::min(orig.x + orig.w, bx + bw);
-          const float iy2 = std::min(orig.y + orig.h, by + bh);
-          if (ix2 <= ix || iy2 <= iy)
-            continue;
-          const float inter = (ix2 - ix) * (iy2 - iy);
-          const float uni = orig.w * orig.h + bw * bh - inter;
-          const float iou = uni > 0.0f ? inter / uni : 0.0f;
-          if (iou > bestIou) {
-            bestIou = iou;
-            bestJ = j;
-          }
-        }
-        if (bestJ >= 0) {
-          const auto &bl = batchLines[bestJ];
-          SecureCastOcrLine mapped;
-          mapped.text = bl.text;
-          mapped.x = ux0 + bl.x * 0.5f;
-          mapped.y = uy0 + bl.y * 0.5f;
-          mapped.w = bl.w * 0.5f;
-          mapped.h = bl.h * 0.5f;
-          result[idx] = mapped;
-        }
-      }
+      apply_iou_match(result, subset, batchLines, ub.x0, ub.y0);
     }
   }
 

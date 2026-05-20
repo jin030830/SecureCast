@@ -185,6 +185,20 @@ private:
                        const uint8_t *pixels, int width, int height,
                        int stride);
 
+  std::vector<SecureCastOcrLine>
+  split_batch_multipass(const std::vector<SecureCastOcrLine> &lines,
+                        const std::vector<int> &smallIndices,
+                        const uint8_t *pixels, int width, int height,
+                        int stride);
+
+  // 2× nearest-neighbor 업스케일된 batch가 이 픽셀 수를 넘으면 단일 OCR이
+  // 위험하다고 판단해 분할/스킵한다. Windows.Media.Ocr이 ~16MP에서 stall
+  // 빈도가 급증하는 경험치 기반.
+  static constexpr size_t SC_MAX_OCR_BATCH_PX = 8000000u;
+  // 소형 라인이 Union BBox 내에 차지하는 비율이 이 값 미만이면 sparse 레이아웃
+  // 으로 간주, Y정렬 N분할로 폴백.
+  static constexpr float SC_SPARSE_THRESHOLD = 0.3f;
+
   // === OCR 오류 보정: O/o → 0, I/l → 1 ===
   std::string normalize_numeric_candidate(const std::string &text);
 };
