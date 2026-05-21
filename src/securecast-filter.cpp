@@ -1557,6 +1557,11 @@ static void stop_ocr_worker(SecureCastFilter *filter) {
     filter->ocrWorkerThread.join();
 
   clear_pending_ocr_frame(filter);
+
+  // worker 정지 후 lastSubmitted/lastCompleted 모두 0으로 리셋.
+  // 그렇지 않으면 worker 재시작 전까지 게이트가 영구 unsafe로 묶인다.
+  filter->lastSubmittedOcrFrameId.store(0, std::memory_order_release);
+  filter->lastCompletedOcrFrameId.store(0, std::memory_order_release);
 }
 
 // ================================================================
@@ -1885,6 +1890,7 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
       return;
     }
     filter->lastCompletedOcrFrameId.store(0, std::memory_order_release);
+    filter->lastSubmittedOcrFrameId.store(0, std::memory_order_release);
     filter->unverifiedFrameLogCounter = 0;
     // 첫 초기화 시 AI 워커 + Tracker 스레드 시작
     filter->mockWorker.start(w, h, [filter](const MaskPayload &payload) {
@@ -1920,6 +1926,7 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
       return;
     }
     filter->lastCompletedOcrFrameId.store(0, std::memory_order_release);
+    filter->lastSubmittedOcrFrameId.store(0, std::memory_order_release);
     filter->unverifiedFrameLogCounter = 0;
 
     // 3. 마스킹 큐 비우기
@@ -1970,6 +1977,7 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
     filter->ringBuffer.destroy();
     destroy_last_safe_render(filter);
     filter->lastCompletedOcrFrameId.store(0, std::memory_order_release);
+    filter->lastSubmittedOcrFrameId.store(0, std::memory_order_release);
     filter->unverifiedFrameLogCounter = 0;
 
     gs_effect_t *solid = obs_get_base_effect(OBS_EFFECT_SOLID);
@@ -2264,13 +2272,30 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
         filter->ocrWorkerRunning.load(std::memory_order_acquire) &&
         filter->ocrWorkerIdle.exchange(false, std::memory_order_acq_rel);
     if (claimedOcr) {
+      // release: claim 실패 분기의 load(acquire)와 한 쌍.
+      // relaxed로 두면 다음 video_render에서 lastSubmitted가 아직 0으로
+      // 보일 수 있어 dependent=0 누수가 재발한다.
       filter->lastSubmittedOcrFrameId.store(analysisSlot->frameId,
-                                            std::memory_order_relaxed);
+                                            std::memory_order_release);
       // analysisSlot은 방금 제출 예정이므로 자신을 대표 ID로 설정.
       // OCR readback이 실패해도 dependentOcrFrameId가 살아있으면 render는
       // last-safe로 freeze. 새 PII가 무방비로 송출되는 일은 없음.
       const_cast<FrameRingBuffer::Slot *>(analysisSlot)->dependentOcrFrameId =
           analysisSlot->frameId;
+    } else {
+      // [Bounded Exposure 누수 차단]
+      // claim 실패(=OCR worker busy)한 슬롯이 dependent=0으로 송출되면
+      // 게이트(L2389: dependent<=watermark)를 자동 통과해 무방비 노출.
+      // 가장 최근 submit한 OCR frameId를 의존성으로 박아 그 OCR이 완료될
+      // 때까지 last-safe-frame으로 freeze 유지한다.
+      const uint64_t lastSubmitted =
+          filter->lastSubmittedOcrFrameId.load(std::memory_order_acquire);
+      if (lastSubmitted > 0) {
+        const_cast<FrameRingBuffer::Slot *>(analysisSlot)->dependentOcrFrameId =
+            lastSubmitted;
+      }
+      // lastSubmitted==0(부팅 직후, 아직 어떤 OCR도 submit되지 않음)에는
+      // dependent=0 유지 → 초기 freeze 회피.
     }
 
     std::vector<uint8_t> bgraPixels;
