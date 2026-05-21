@@ -521,9 +521,12 @@ SecureCastOcrEngine::recognize_text(const uint8_t *pixels, int width,
 
       auto buffer = CryptographicBuffer::CreateFromByteArray(packed);
 
+      // OBS BGRA는 Straight Alpha(미리 곱해지지 않음).
+      // Premultiplied 지정 시 Alpha=0 픽셀의 RGB가 0(검정)으로 처리되어
+      // OCR에 빈 이미지가 전달 → effLines=0, avg_ms≈9ms 로 탐지 완전 실패.
       bitmap = SoftwareBitmap::CreateCopyFromBuffer(
           buffer, BitmapPixelFormat::Bgra8, width, height,
-          BitmapAlphaMode::Premultiplied);
+          BitmapAlphaMode::Ignore);
     }
 
     // === STEP 2-1: OCR 실행 ===

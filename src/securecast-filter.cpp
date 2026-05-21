@@ -1396,7 +1396,12 @@ static void ocr_worker_loop(SecureCastFilter *filter) {
             const OcrTierOverride next = OcrTierOverride::TwoThirds;
             filter->ocrOverrideTier_.store(next, std::memory_order_release);
             filter->ocrZeroLineStreak_.store(0, std::memory_order_release);
-            filter->ocrLastEscalateMs_.store(nowMs, std::memory_order_release);
+            // 첫 escalate 시점만 기록. 이후 반복 escalate에서 덮어쓰면
+            // 60초 relaxation 타이머가 절대 만료되지 않으므로 0일 때만 저장.
+            int64_t expected = 0;
+            filter->ocrLastEscalateMs_.compare_exchange_strong(
+                expected, nowMs, std::memory_order_acq_rel,
+                std::memory_order_relaxed);
             blog(LOG_WARNING,
                  "[SC-ocr] self-heal escalate eff=%d ov->%d (3 cycles zero "
                  "lines)",
