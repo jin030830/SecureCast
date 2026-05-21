@@ -1391,10 +1391,9 @@ static void ocr_worker_loop(SecureCastFilter *filter) {
             SecureCastFilter::ocr_effective_tier(curPolicy, curOv);
         if (s >= 3 && curEff != OcrScaleTier::Full) {
           if (!hasActiveBoxes) {
-            // 한 단계 더 안전한 override 설정: Half→TwoThirds, TwoThirds→Full.
-            const OcrTierOverride next = (curEff == OcrScaleTier::Half)
-                                             ? OcrTierOverride::TwoThirds
-                                             : OcrTierOverride::Full;
+            // Full 에스컬레이션 제거: Full 1080p는 ~1036ms로 링 버퍼(1000ms)를
+            // 초과해 오히려 PII 노출 위험 증가. TwoThirds가 최대 안전 모드.
+            const OcrTierOverride next = OcrTierOverride::TwoThirds;
             filter->ocrOverrideTier_.store(next, std::memory_order_release);
             filter->ocrZeroLineStreak_.store(0, std::memory_order_release);
             filter->ocrLastEscalateMs_.store(nowMs, std::memory_order_release);
@@ -2221,18 +2220,16 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
     // --- [OCR 다운스케일 tier 결정] ---
     // policyTier: 해상도 + 로드된 effect에 따라 결정.
     //   Half      : ≥1440p (downsample.effect bilinear 필요)
-    //   TwoThirds : ≥1080p AND SECURECAST_OCR_TWOTHIRDS AND
-    //   ocrDownsampleEffect_ Full      : 그 외 또는 effect 미로드 시 안전 폴백.
+    //   TwoThirds : ≥1080p AND ocrDownsampleEffect_ 로드됨
+    //   Full      : 그 외 또는 effect 미로드 시 안전 폴백.
     // overrideTier: 셀프힐링이 강제하는 안전 모드.
     // effective = min(policy, override)로 더 안전한 쪽 선택.
 #ifdef _WIN32
     auto compute_policy = [&]() -> OcrScaleTier {
       if (w >= 2560 && h >= 1440 && filter->trackerGrayEffect_)
         return OcrScaleTier::Half;
-#ifdef SECURECAST_OCR_TWOTHIRDS
       if (w >= 1920 && h >= 1080 && filter->ocrDownsampleEffect_)
         return OcrScaleTier::TwoThirds;
-#endif
       return OcrScaleTier::Full;
     };
     const OcrScaleTier policyTier = compute_policy();
