@@ -1216,6 +1216,18 @@ SecureCastOcrEngine::detect_pii(const std::vector<SecureCastOcrLine> &lines) {
 
   std::vector<SecureCastOcrBox> boxes;
 
+  // [DBG] OCR 인식 텍스트 확인용 임시 로그 (boxes=0 원인 파악 후 제거).
+  // 30사이클마다 1회, 라인이 있을 때만 출력.
+  {
+    static int dbgDetectLog = 0;
+    if (!lines.empty() && ++dbgDetectLog >= 30) {
+      dbgDetectLog = 0;
+      for (int di = 0; di < static_cast<int>(lines.size()); ++di)
+        blog(LOG_INFO, "[SC-ocr-txt] line[%d]: \"%s\"", di,
+             lines[di].text.c_str());
+    }
+  }
+
   for (int i = 0; i < static_cast<int>(lines.size()); ++i) {
     const auto &line = lines[i];
     const std::string &rawText = line.text;

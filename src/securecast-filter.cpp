@@ -1391,9 +1391,12 @@ static void ocr_worker_loop(SecureCastFilter *filter) {
             SecureCastFilter::ocr_effective_tier(curPolicy, curOv);
         if (s >= 3 && curEff != OcrScaleTier::Full) {
           if (!hasActiveBoxes) {
-            // Full 에스컬레이션 제거: Full 1080p는 ~1036ms로 링 버퍼(1000ms)를
-            // 초과해 오히려 PII 노출 위험 증가. TwoThirds가 최대 안전 모드.
-            const OcrTierOverride next = OcrTierOverride::TwoThirds;
+            // Full 에스컬레이션 복원: 링버퍼 90슬롯(60fps×1.5s≈1500ms)이
+            // Full OCR(≈1036ms@1080p)을 안전하게 커버. TwoThirds로는 작은
+            // 글씨를 놓치는 경우가 있어 한 단계 더 강한 모드로 격상한다.
+            const OcrTierOverride next = (curEff == OcrScaleTier::Half)
+                                             ? OcrTierOverride::TwoThirds
+                                             : OcrTierOverride::Full;
             filter->ocrOverrideTier_.store(next, std::memory_order_release);
             filter->ocrZeroLineStreak_.store(0, std::memory_order_release);
             // 첫 escalate 시점만 기록. 이후 반복 escalate에서 덮어쓰면
@@ -2010,7 +2013,7 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
 
   // [OCR 박스 동기화] trackerMgr.active_boxes()를 slotHead에 봉인.
   // windowSnapshot 패턴과 동일: 이 프레임 텍스처와 박스 좌표를 함께 저장.
-  // 60프레임 후 송출 시 outputSlot->ocrBoxSnapshot 사용 → 1프레임도 어긋나지
+  // 90프레임 후 송출 시 outputSlot->ocrBoxSnapshot 사용 → 1프레임도 어긋나지
   // 않음.
   {
     OcrBoxSnapshot nextSnap{};

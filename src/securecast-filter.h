@@ -69,8 +69,9 @@ class SecureCastOcrEngine;
 constexpr int SC_MAX_BLUR_RECTS =
     32; // 한 프레임에 동시에 마스킹 가능한 최대 영역 수
 constexpr int SC_RING_BUFFER_SLOTS =
-    60; // Bounded Exposure: OCR 최대 레이턴시(≈1000ms) 대비 여유 확보를 위해
-        // 60슬롯으로 증가 (1초 지연)
+    90; // Bounded Exposure: Full OCR(≈1036ms@1080p) + 셀프힐링 마진을 확보하기
+        // 위해 90슬롯(60fps×1.5s)으로 확장. Full 에스컬레이션이 링버퍼 안에서
+        // 안전하게 완료된다.
 
 // ----------------------------------------------------
 // OCR 다운스케일 정책 tier
@@ -113,7 +114,7 @@ struct MaskPayload {
 struct LingeringWindow {
   TrackedWindow window; // 마지막으로 알려진 창 정보 (bounds 포함)
   int ticksRemaining;   // 매 tick 카운트다운. 초기값은 SC_RING_BUFFER_SLOTS+1
-                        // (=61) — 60프레임 송출 지연 + 1프레임 갭 커버.
+                        // (=91) — 90프레임 송출 지연 + 1프레임 갭 커버.
 };
 constexpr int SC_MAX_LINGERING = SC_MAX_TRACKED_WINDOWS;
 #endif
@@ -123,24 +124,24 @@ constexpr int SC_MAX_LINGERING = SC_MAX_TRACKED_WINDOWS;
 //
 // windowSnapshot이 창 좌표를 슬롯 단위로 저장해 송출과 동기화하듯,
 // OCR/Visual Tracker 박스 좌표도 캡처 시점의 슬롯에 함께 저장한다.
-// → 60프레임 후 그 슬롯이 송출될 때 저장된 박스를 사용 = 1프레임 오차.
+// → 90프레임 후 그 슬롯이 송출될 때 저장된 박스를 사용 = 1프레임 오차.
 //
 // lingering 처리:
 //   NCC lost 후에도 ticksRemaining > 0이면 마지막 위치를 유지.
-//   SC_RING_BUFFER_SLOTS(60) 경과 후 슬롯이 자연 순환하여 소멸.
+//   SC_RING_BUFFER_SLOTS(90) 경과 후 슬롯이 자연 순환하여 소멸.
 // ----------------------------------------------------
 constexpr int SC_MAX_SLOT_OCR_BOXES =
     16; // VisualTrackerManager::MAX_TRACKERS(8)의 2배 여유
 
 // NCC가 박스를 일시적으로 잃었을 때(부분 가림 등) 유지할 프레임 수.
-// 송출 지연(SC_RING_BUFFER_SLOTS=60) + 1프레임 갭만 커버하면 충분하다.
+// 송출 지연(SC_RING_BUFFER_SLOTS=90) + 1프레임 갭만 커버하면 충분하다.
 //
 // 값 선택 이력:
 //   - 5 (1a051bd, 2026-05-18): 짧은 가림에 깜박임. 너무 짧음.
 //   - 121 = SC_RING_BUFFER_SLOTS*2+1 (시도): 1a051bd가 지적한 "TTL 61이 너무
 //     커서 창 최소화 후 빈 텍스처 위에 블러가 최대 1초간 그려짐"을 4초로
 //     악화시킴. 회귀.
-//   - 61 = SC_RING_BUFFER_SLOTS+1 (현재): 60프레임 송출 지연 + 1프레임 갭을
+//   - 91 = SC_RING_BUFFER_SLOTS+1 (현재): 90프레임 송출 지연 + 1프레임 갭을
 //     정확히 커버. 윈도우 사라짐은 win_event_listener의 HIDE/DESTROY/MINIMIZE
 //     push 신호로 즉시 감지되어 lingering이 정리되므로 추가 마진 불필요.
 constexpr int SC_OCR_LINGER_FRAMES = SC_RING_BUFFER_SLOTS + 1;
