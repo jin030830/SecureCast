@@ -536,6 +536,27 @@ FrameRingBuffer::peekSlotAtOffset(int framesBack) const {
   return &m_slots[idx];
 }
 
+// [Bounded Exposure backfill]
+// 새 OCR claim 직후 호출. 링 내 슬롯 중 frameId가 newOcrFrameId 미만이면서
+// 현재 dependent도 그보다 작은 것들의 dependent를 newOcrFrameId로 끌어올린다.
+//
+// 시나리오: T=0.5s에 PII 등장(frame30 push, dependent=0).
+//           T=1.0s에 OCR60 claim → backfill(60) → frame30.dependent=60.
+//           T=2.0s에 OCR60 완료(watermark=60) → frame30 송출 시 60<=60 → safe.
+//           OCR60 박스로 블러 적용된 채 송출 → 노출 방지.
+//
+// 이미 더 큰 dependent를 가진 슬롯은 보존 (중첩 OCR 사이클 안전).
+void FrameRingBuffer::backfillDependentOcr(uint64_t newOcrFrameId) {
+  if (newOcrFrameId == 0)
+    return;
+  for (Slot &slot : m_slots) {
+    if (slot.frameId > 0 && slot.frameId < newOcrFrameId &&
+        slot.dependentOcrFrameId < newOcrFrameId) {
+      slot.dependentOcrFrameId = newOcrFrameId;
+    }
+  }
+}
+
 #ifdef _WIN32
 // 최근 maxAgeNs 이내에 캡처된 슬롯들의 windowSnapshot에 win을 소급 추가한다.
 // 새 블랙리스트 창은 감지 지연(scan latency) 동안 캡처된 슬롯의 스냅샷에서
@@ -2176,7 +2197,13 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
       filter->lastSubmittedOcrFrameId.store(analysisSlot->frameId,
                                             std::memory_order_release);
       // analysisSlot은 방금 제출되었으므로, 자신을 대표 ID로 삼음 (const cast 필요)
-      const_cast<FrameRingBuffer::Slot*>(analysisSlot)->dependentOcrFrameId = analysisSlot->frameId;
+      const_cast<FrameRingBuffer::Slot *>(analysisSlot)->dependentOcrFrameId =
+          analysisSlot->frameId;
+      // [Backfill] 이 OCR이 처리할 frameId보다 작은 frameId를 가진 링 내
+      // 슬롯들의 dependent를 새 frameId로 끌어올린다. 새 PII가 등장한 후
+      // push된 슬롯들이 게이트(dependent<=watermark)를 자동 통과하는
+      // 누수를 차단. 이 OCR이 완료될 때까지 freeze 유지.
+      filter->ringBuffer.backfillDependentOcr(analysisSlot->frameId);
     } else {
       // [Bounded Exposure 누수 차단]
       // claim 실패(=OCR worker busy)한 슬롯이 dependent=0으로 송출되면
