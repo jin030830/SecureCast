@@ -149,9 +149,11 @@ private:
   // 간주하고 kEmptyOcrTolerance회까지 캐시를 유지한다 — 정적 화면 깜빡임 차단.
   // dHash 변경·해상도 변경 시 0으로 리셋된다.
   int consecutiveEmptyOcr_ = 0;
-  // mp=300ms 기준 N=3 → 약 600ms 허용 → STALE_OCR_FRAMES(25프레임≈833ms)와
-  // 조화.
-  static constexpr int kEmptyOcrTolerance = 3;
+  // Windows.Media.Ocr이 같은 정적 이미지에서 라인 수/패턴 매칭 결과를
+  // 변동시키는 비결정성이 있어, 3사이클(~900ms)로는 box 1↔0 토글이 자주
+  // 발생. 5사이클(~1.5s)로 상향하여 burst를 흡수.
+  // STALE_OCR_FRAMES(25프레임≈833ms)보다 길어 ghost가 송출될 위험은 없다.
+  static constexpr int kEmptyOcrTolerance = 5;
   // 캐시 보존 로그 throttle 카운터(인스턴스별). 30회마다 1회 출력.
   int preserveLogCounter_ = 0;
 

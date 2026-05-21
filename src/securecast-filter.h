@@ -217,6 +217,15 @@ public:
   // 합집합용).
   const Slot *peekSlotAtOffset(int framesBack) const;
 
+  // [Bounded Exposure backfill]
+  // OCR worker가 새 frameId를 claim한 직후 호출. 링 내 모든 슬롯 중 frameId가
+  // newOcrFrameId 미만이고 dependentOcrFrameId가 그보다 작은 슬롯의 dependent를
+  // newOcrFrameId로 갱신한다. 새 PII가 등장한 후 push된 슬롯들이 "이 슬롯
+  // 이후의 OCR"이 완료될 때까지 unsafe로 게이트되도록 강제한다.
+  //
+  // 호출 thread: render thread 단독 (push/peek와 동일). 외부 동기화 불필요.
+  void backfillDependentOcr(uint64_t newOcrFrameId);
+
   bool isInitialized() const { return m_initialized; }
   uint32_t getWidth() const { return m_width; }
   uint32_t getHeight() const { return m_height; }
