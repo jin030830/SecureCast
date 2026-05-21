@@ -2304,11 +2304,16 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
       // last-safe로 freeze. 새 PII가 무방비로 송출되는 일은 없음.
       const_cast<FrameRingBuffer::Slot *>(analysisSlot)->dependentOcrFrameId =
           analysisSlot->frameId;
-      // [Backfill] 이 OCR이 처리할 frameId보다 작은 frameId를 가진 링 내
-      // 슬롯들의 dependent를 새 frameId로 끌어올린다. 새 PII가 등장한 후
-      // push된 슬롯들이 게이트(dependent<=watermark)를 자동 통과하는
-      // 누수를 차단. 이 OCR이 완료될 때까지 freeze 유지.
-      filter->ringBuffer.backfillDependentOcr(analysisSlot->frameId);
+      // [Backfill — 빈도 1/4]
+      // 매 OCR claim마다 backfill을 호출하면 링 내 모든 슬롯 dependent가
+      // 최신 OCR frameId로 끌어올려져 freeze가 자주 발생.
+      // 4번에 1번만 발동 → 새 PII 보호는 유지하되 freeze 빈도 1/4로 감소.
+      // 사이 3번은 pushFrame이 박은 dependent=lastSubmitted로 자연스럽게
+      // 게이트 통과 (정상 운영 시).
+      if (++filter->ocrBackfillCounter_ >= 4) {
+        filter->ocrBackfillCounter_ = 0;
+        filter->ringBuffer.backfillDependentOcr(analysisSlot->frameId);
+      }
     } else {
       // [Bounded Exposure 누수 차단]
       // claim 실패(=OCR worker busy)한 슬롯이 dependent=0으로 송출되면
@@ -2437,8 +2442,14 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
   uint64_t safeWatermarkId =
       filter->lastCompletedOcrFrameId.load(std::memory_order_acquire);
   uint64_t delayedId = delayedSlot ? delayedSlot->frameId : 0;
+  // 게이트 +2 마진: OCR이 2프레임(≈33ms@60fps) 늦어도 통과 허용.
+  // 60fps 환경에서 OCR 완료 ~ render의 watermark 갱신 사이 1~2프레임 race가
+  // 발생해 4프레임 차이만으로도 freeze 진입하던 문제를 완화. 노출 시간은
+  // 최대 33ms(2프레임)로 제한되어 체감 노출은 거의 없음.
+  static constexpr uint64_t kGateMarginFrames = 2;
   bool isSafeToRender = (safeWatermarkId > 0) && delayedSlot &&
-                        (delayedSlot->dependentOcrFrameId <= safeWatermarkId);
+                        (delayedSlot->dependentOcrFrameId <=
+                         safeWatermarkId + kGateMarginFrames);
 
   if (!delayedSlot || !delayedSlot->getTexture() || !isSafeToRender) {
     if (++filter->unverifiedFrameLogCounter >= 60) {

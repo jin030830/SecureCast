@@ -521,6 +521,11 @@ struct SecureCastFilter {
   // [SC-tracker] 주기 로그 카운터 (150 readback ≈ 5초마다 1회 @ 30Hz)
   int trackerLogCounter = 0;
 
+  // [backfill 빈도 제어] OCR claim 성공 4번에 1번만 backfill 호출.
+  // 매번 호출 시 링 내 모든 슬롯 dependent를 새 frameId로 끌어올려 freeze가
+  // 자주 발생하던 문제 완화. render thread 단독 사용이라 atomic 불필요.
+  int ocrBackfillCounter_ = 0;
+
   // ----- [P1] 30Hz Visual Tracker Thread -----
   // NCC 연산(CPU-only)을 렌더 스레드에서 분리. GPU readback은 렌더 스레드,
   // update_all_gray()는 이 스레드가 담당. register_or_update()는 OCR 워커가
