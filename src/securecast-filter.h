@@ -28,12 +28,9 @@
 #include <vector>
 
 #ifdef _WIN32
-#include "gpu-readback.h"
 #include "overlay-window.h"
 #include "selection-overlay.h"
 #endif
-#include "pipeline-health.h"
-#include "pixel-hash.h"
 #include "securecast-types.h"
 #include "visual-tracker.h"
 
@@ -178,42 +175,22 @@ struct SecureCastFilter {
   SecurityState currentState =
       SecurityState::SAFE; // 현재 보안 등급 (SAFE/PARTIAL/RISK)
 
-  // ----- [Role C 담당: 렌더링 파이프라인 및 GPU Readback] -----
+  // ----- [Role C 담당: 렌더링 파이프라인 (N-Frame Ring Buffer)] -----
   FrameRingBuffer
       ringBuffer; // Bounded Exposure(송출 지연) 구현용 N-프레임 텍스처 버퍼
-  MaskPayload lastMask{}; // health.shouldReset() 비상 경로의 풀스크린 블랙아웃
-                          // 영역 (그 외 마스킹 좌표는 trackerMgr이 직접 관리)
 
 #ifdef _WIN32
-  GpuReadback readback; // GPU 텍스처를 CPU 메모리로 지연 없이 복사하는 다중
-                        // 슬롯 텍스처 풀
   OverlayWindow
       overlay; // [Role D] 스트리머 전용 보안 상태 HUD (OBS 캡처에서 제외됨)
 #endif
-  PixelHashCache fullScreenHash; // FNV-1a 기반으로 화면 변화(Smart Grid)를
-                                 // 감지하여 AI 동작을 제어하는 객체
-
-  std::vector<uint8_t> readbackBuffer; // Readback을 통해 수확한 픽셀 데이터를
-                                       // 저장하는 CPU 버퍼 (Slot 0 + Slot 1)
-  uint64_t frameCounter =
-      0;                 // GPU와 CPU 간의 프레임 정합성을 맞추기 위한 카운터
-  PipelineHealth health; // GPU 스톨 또는 쿼리 실패 감지 시 자가 치유(Reset)를
-                         // 담당하는 헬스 매니저
 
   // ----- [Role D] UI 설정 -----
   mutable std::mutex
       settingsMutex; // GUI 스레드(update)와 렌더 스레드 간 data race 방지
   std::string blacklistApps = ""; // 줄바꿈 구분 앱 이름 목록
-  float blurIntensity = 5.0f;
-  float sensitivity = 0.5f;
 
   // [C2-3 수정] 함수-scope static → 멤버 변수로 이동 (다중 필터 인스턴스 간
   // 공유 방지)
-  int logUnchangedFrames =
-      0; // 미변화 상태 로그 주기 카운터 (120프레임마다 1회)
-  int logStallCount =
-      0; // 파이프라인 포화 경고 로그 주기 카운터 (30프레임마다 1회)
-  int logEnqueueCount = 0; // enqueue 성공 로그 주기 카운터 (300프레임마다 1회)
   int logScanThrottle =
       0; // 블랙리스트 윈도우 스캔 로그 주기 카운터 (10틱 = 1.5초 주기)
 

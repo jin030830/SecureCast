@@ -198,6 +198,12 @@ static BlurRect tracked_window_to_blur_rect(const TrackedWindow &tw,
 // type == 0 (Blur)    : image 텍스처를 box_offset/size 기준으로 5x5 평균
 // type == 1 (Blackout): 단색 검정
 // ================================================================
+
+// 고정 블러 강도 (셰이더 blur_radius — 5x5 탭 간격 배수).
+// PII 가림 강도는 보안에 직결되므로 사용자 조절을 허용하지 않고
+// 검증된 값으로 고정한다.
+static constexpr float SC_BLUR_RADIUS = 8.0f;
+
 static void render_blur_rect(gs_effect_t *fx, gs_texture_t *img_tex,
                              const BlurRect &r, uint32_t src_w,
                              uint32_t src_h) {
@@ -214,7 +220,8 @@ static void render_blur_rect(gs_effect_t *fx, gs_texture_t *img_tex,
     gs_effect_set_vec2(gs_effect_get_param_by_name(fx, "box_offset"), &box_off);
     gs_effect_set_vec2(gs_effect_get_param_by_name(fx, "box_size"), &box_sz);
     gs_effect_set_vec2(gs_effect_get_param_by_name(fx, "image_size"), &img_sz);
-    gs_effect_set_float(gs_effect_get_param_by_name(fx, "blur_radius"), 8.0f);
+    gs_effect_set_float(gs_effect_get_param_by_name(fx, "blur_radius"),
+                        SC_BLUR_RADIUS);
   }
 
   gs_matrix_push();
@@ -1214,15 +1221,6 @@ static void *securecast_create(obs_data_t *settings, obs_source_t *context) {
   filter->trackerAccumulator = 0.0f; // window_tracker tick throttle 누산기
 
   obs_log(LOG_INFO, "[SecureCast] Filter created.");
-  // [핵심 해결] 그래픽 리소스 생성 시 반드시 그래픽 컨텍스트 진입 필요
-  obs_enter_graphics();
-#ifdef _WIN32
-  filter->readback.initialize();
-#endif
-  obs_leave_graphics();
-
-  // [C-3 수정] fullScreenBuffer 미사용 멤버 제거. 실제 해시 입력은
-  // readbackBuffer.data()(슬롯 0)에서 가져옴.
 
 #ifdef _WIN32
   // [Role D] 스트리머 전용 오버레이 HUD 시작 (OBS 캡처에서 자동 제외)
@@ -1410,8 +1408,6 @@ static void securecast_destroy(void *data) {
 #ifdef _WIN32
   // 1-G: half-size OCR 다운스케일 리소스 해제
   destroy_ocr_down_stage(filter);
-  // [C2-5 수정] shutdown 경로에서는 spin-wait가 없는 destroyImmediate() 사용.
-  filter->readback.destroyImmediate();
 #endif
   if (filter->blurEffect) {
     gs_effect_destroy(filter->blurEffect);
@@ -1512,38 +1508,13 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
     filter->lastCompletedOcrFrameId.store(0, std::memory_order_release);
     filter->unverifiedFrameLogCounter = 0;
 
-    // 3. 비상 블랙아웃 마스크 초기화
-    filter->lastMask = MaskPayload{};
+    // 3. 새 해상도로 워커 재시작
     filter->trackerMgr.clear(); // 해상도 변경 시 기존 박스 좌표 무효화
     filter->trackerFrameSkip_ = 0;
-
-    // 4. 새 해상도로 워커 재시작
     start_ocr_worker(filter);
     start_tracker_thread(filter);
     blog(LOG_INFO,
          "[securecast][ocr] Async OCR worker restarted after resize.");
-
-#ifdef _WIN32
-    // [C-6 수정] 해상도 변경 시 readback 풀도 반드시 재구성
-    // ocrW/ocrH 캡으로 인해 expectedBufferSize가 같아 resizePool이 누락되던
-    // 버그 수정
-    {
-      int rW = ((int)w > 1920) ? 1920 : (int)w;
-      int rH = ((int)h > 1080) ? 1080 : (int)h;
-      filter->readback.destroyImmediate();
-      filter->readback.initialize();
-      std::vector<std::pair<int, int>> ss = {{64, 64}, {rW, rH}};
-      filter->readback.resizePool(ss);
-      filter->readbackBuffer.resize(
-          (size_t)(64 * 64 * 4) + (size_t)(rW * rH * 4), 0);
-      filter->fullScreenHash.reset();
-      filter->health.reset();
-      filter->readback.setForceReleasedFlag(true);
-      blog(LOG_INFO,
-           "[SecureCast] Readback pool rebuilt for new resolution %dx%d.", rW,
-           rH);
-    }
-#endif
   }
 
   // --- Panic Mode: pushFrame 이전에 차단 ---
@@ -1622,7 +1593,6 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
 #endif
 
   // OCR 박스 좌표는 Visual Tracker(trackerMgr)가 직접 관리한다.
-  // lastMask는 health.shouldReset() 경로의 풀스크린 비상 블랙아웃 전용.
 
   // [THREAD-SAFE] currentState 갱신 — tracker + blacklist 기반
   MaskPayload blacklistSnapshot;
@@ -1638,11 +1608,10 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
     // [Role D] 수동/알림 블러 활성도 PARTIAL 판정에 포함
     bool manualOrNotifActive =
         filter->manualBlurMask.rectCount > 0 || filter->notifBlurActive;
-    if (filter->health.isCritical() ||
-        filter->ocrIsDown.load(std::memory_order_acquire)) {
+    if (filter->ocrIsDown.load(std::memory_order_acquire)) {
       filter->currentState = SecurityState::RISK;
-    } else if (hasTrackerBoxes || filter->lastMask.rectCount > 0 ||
-               blacklistSnapshot.rectCount > 0 || manualOrNotifActive) {
+    } else if (hasTrackerBoxes || blacklistSnapshot.rectCount > 0 ||
+               manualOrNotifActive) {
       filter->currentState = SecurityState::PARTIAL;
     } else {
       filter->currentState = SecurityState::SAFE;
@@ -1654,79 +1623,6 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
   // non-blocking)
   filter->overlay.setState(newState);
 #endif
-
-#ifdef _WIN32
-  // ---------------------------------------------------------
-  // [C-5 수정] Phase 1(Collect+Hash) 도중에 돌려 delayedSlot early-return 앞에
-  // 실행. 이로써 첫 N프레임 동안도 GPU 수확 시도가 이루어짐. Phase
-  // 2(Enqueue)+3(Submit)은 최신 분석 슬롯 확보 후에 수행 (아래 참조).
-  // ---------------------------------------------------------
-  // OCR 해상도 캡(Cap): 최대 1920x1080 [C-4 수정: totalSlots=2 제거]
-  int ocrW = ((int)w > 1920) ? 1920 : (int)w;
-  int ocrH = ((int)h > 1080) ? 1080 : (int)h;
-
-  size_t expectedBufferSize = (size_t)(64 * 64 * 4) + (size_t)(ocrW * ocrH * 4);
-  if (filter->readbackBuffer.size() != expectedBufferSize) {
-    filter->fullScreenHash.reset();
-    std::vector<std::pair<int, int>> slotSizes = {{64, 64}, {ocrW, ocrH}};
-    filter->readback.resizePool(slotSizes);
-    filter->readbackBuffer.resize(expectedBufferSize, 0);
-  }
-
-  // Phase 1: Collect (이전 프레임 결과 수확 — delayedSlot 없어도 무조건 시도)
-  // [DORMANT] enqueueCopy / submitFrame을 호출하는 경로가 없어 m_pendingCount=0
-  // 고착 → tryCollectPreviousFrame()은 항상 PENDING을 반환하므로
-  // OK / SOFT_RECOVERED 분기는 실행되지 않는다.
-  // 활성화하려면 video_render에서 enqueueCopy → submitFrame 호출 경로를
-  // 연결해야 한다.
-  CollectResult sc_collected = filter->readback.tryCollectPreviousFrame();
-  if (sc_collected == CollectResult::OK ||
-      sc_collected == CollectResult::SOFT_RECOVERED) {
-    if (sc_collected == CollectResult::SOFT_RECOVERED) {
-      filter->health
-          .onForceRelease(); // [F3 Fix] 자체 소프트 복구 시 onForceRelease()를
-                             // 호출하여 가짜 CRITICAL 예방
-    } else {
-      filter->health.onCollectSuccess();
-    }
-    bool forceCheck = filter->readback.wasForceReleased();
-    uint8_t *fullBuf = filter->readbackBuffer.data();
-    if (filter->readback.readStagingBuffer(0, fullBuf, 64 * 4, 64)) {
-      BlurRect gridBox = {0, 0, 64, 64, 0};
-      bool screenChanged =
-          forceCheck ||
-          filter->fullScreenHash.hasChanged(fullBuf, 64 * 64 * 4, 12, &gridBox);
-      if (screenChanged) {
-        if (forceCheck)
-          gridBox = {0, 0, 64, 64, 0};
-        blog(LOG_INFO, "[SecureCast] Change detected! BBox:(%d,%d %dx%d)",
-             gridBox.x, gridBox.y, gridBox.width, gridBox.height);
-      } else {
-        // [C2-3 수정] static → 멤버 변수 사용 (다중 인스턴스 공유 방지)
-        if (++filter->logUnchangedFrames >= 120) {
-          blog(LOG_INFO, "[SecureCast] No change for 120 frames.");
-          filter->logUnchangedFrames = 0;
-        }
-      }
-    } else {
-      blog(LOG_WARNING, "[SecureCast] Failed to read Slot 0 staging buffer.");
-    }
-    filter->readback.releaseFrame();
-  } else {
-    // PENDING(m_pendingCount==0)은 파이프라인 미사용 상태이므로 헬스 실패로
-    // 집계하지 않는다. FAILED만 실제 D3D11 오류이므로 헬스에 반영한다.
-    if (sc_collected == CollectResult::FAILED) {
-      filter->health.onCollectFailure();
-    }
-    if (filter->readback.isPipelineFull()) {
-      // [C2-3 수정] static → 멤버 변수 사용
-      if (filter->logStallCount++ % 30 == 0)
-        blog(LOG_WARNING, "[SecureCast] Pipeline FULL, GPU not responding.");
-    }
-  }
-#endif // _WIN32 Phase1 end
-
-
 
   // --- Step 4~5: N프레임 지연된 슬롯 꺼내기 ---
   const FrameRingBuffer::Slot *delayedSlot =
@@ -1889,9 +1785,9 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
 
   // --- 마스킹 오버레이 ---
   // Role A: outputSlot->windowSnapshot (프레임 캡처 시점의 창 위치 → 프레임과
-  // 동기화됨) Role B/C: lastMask (AI/MockAI 결과)
-  // [Fix #3-D] capacity: manualBlur(32) + lastMask(32) + windowSnapshot×2(32)
-  //            + lingering(16) + trackers(8) + notif/여유(8) = 128
+  // 동기화됨)
+  // [Fix #3-D] capacity: manualBlur(32) + windowSnapshot×2(32)
+  //            + lingering(16) + trackers(8) + notif/여유(8) = 128 (여유 확보)
   // MAX_TRACKERS는 VisualTrackerManager 클래스 static 상수이므로
   // securecast-filter.cpp에서는 직접 사용 불가. 실제 값(8)을 리터럴로 대체.
   static constexpr int kMaxTrackerSlots = 8;
@@ -1988,12 +1884,6 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
   }
 #endif
 
-  // 비상 블랙아웃 (health.shouldReset() 경로에서만 설정됨)
-  for (int i = 0; i < filter->lastMask.rectCount &&
-                  all_count < (int)(sizeof(all_rects) / sizeof(all_rects[0]));
-       i++)
-    all_rects[all_count++] = filter->lastMask.rects[i];
-
   // [Fix #3-E] 렌더 비용 측정 로그 (60프레임마다 1회)
   {
     static int s_render_log_throttle = 0;
@@ -2055,22 +1945,6 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
     gs_matrix_pop();
   }
 
-  // Phase 4: Health Check & Reset
-  if (filter->health.shouldReset()) {
-    blog(LOG_ERROR, "[SecureCast] Pipeline CRITICAL. Resetting.");
-    MaskPayload bo{};
-    bo.rectCount = 1;
-    bo.rects[0] = {0, 0, (int)w, (int)h, 0};
-    filter->lastMask = bo;
-    filter->readback.destroyImmediate();
-    filter->readback.initialize();
-    std::vector<std::pair<int, int>> ss = {{64, 64}, {ocrW, ocrH}};
-    filter->readback.resizePool(ss);
-    filter->health.reset();
-    // [C-9 수정 / F2 Fix] 복구 직후 새 마스크 결과가 들어올 때까지 풀스크린
-    // 블랙아웃(bo)을 안전하게 유지 (Fail-Secure)
-    filter->readback.setForceReleasedFlag(true);
-  }
 #endif
 }
 
@@ -2286,10 +2160,8 @@ static void securecast_video_tick(void *data, float seconds) {
 // ================================================================
 
 #define SC_SETTING_BLACKLIST "sc_blacklist"
-#define SC_SETTING_BLUR_INTENSITY "sc_blur_intensity"
 // #define SC_SETTING_GAME_MODE   "sc_game_mode"  // [v2] 게임 모드 — 현재
 // 스코프 외
-#define SC_SETTING_SENSITIVITY "sc_sensitivity"
 #define SC_SETTING_MANUAL_RECTS "sc_manual_rects"
 
 // manualBlurMask → obs_data_array 직렬화 후 source settings에 write-back.
@@ -2317,8 +2189,6 @@ static void save_manual_rects(SecureCastFilter *filter,
 
 static void securecast_get_defaults(obs_data_t *settings) {
   obs_data_set_default_string(settings, SC_SETTING_BLACKLIST, "");
-  obs_data_set_default_double(settings, SC_SETTING_BLUR_INTENSITY, 5.0);
-  obs_data_set_default_double(settings, SC_SETTING_SENSITIVITY, 0.5);
 
   obs_data_array_t *emptyArr = obs_data_array_create();
   obs_data_set_default_array(settings, SC_SETTING_MANUAL_RECTS, emptyArr);
@@ -2329,10 +2199,6 @@ static obs_properties_t *securecast_get_properties(void *data) {
   obs_properties_t *props = obs_properties_create();
   obs_properties_add_text(props, SC_SETTING_BLACKLIST,
                           "Blacklist Apps (one per line)", OBS_TEXT_MULTILINE);
-  obs_properties_add_float_slider(props, SC_SETTING_BLUR_INTENSITY,
-                                  "Blur Intensity", 1.0, 10.0, 0.5);
-  obs_properties_add_float_slider(props, SC_SETTING_SENSITIVITY,
-                                  "Detection Sensitivity", 0.0, 1.0, 0.05);
 
 #ifdef _WIN32
   // [Role D] 수동 드래그 블러 초기화 버튼
@@ -2366,13 +2232,7 @@ static void securecast_update(void *data, obs_data_t *settings) {
   SecureCastFilter *filter = static_cast<SecureCastFilter *>(data);
   std::lock_guard<std::mutex> lock(filter->settingsMutex);
   filter->blacklistApps = obs_data_get_string(settings, SC_SETTING_BLACKLIST);
-  filter->blurIntensity =
-      (float)obs_data_get_double(settings, SC_SETTING_BLUR_INTENSITY);
-  filter->sensitivity =
-      (float)obs_data_get_double(settings, SC_SETTING_SENSITIVITY);
-  blog(LOG_INFO,
-       "[SecureCast][D] Settings updated — blur=%.1f sensitivity=%.2f",
-       filter->blurIntensity, filter->sensitivity);
+  blog(LOG_INFO, "[SecureCast][D] Settings updated.");
 
   // 수동 블러 rect 역직렬화
   obs_data_array_t *arr = obs_data_get_array(settings, SC_SETTING_MANUAL_RECTS);

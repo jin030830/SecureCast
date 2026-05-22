@@ -204,10 +204,6 @@ target_sources(
     src/securecast-filter.h       # 공유 타입 (SecureCastFilter, BlurRect 등)
     src/securecast-types.h        # 순환 참조 방지용 공용 타입
     src/plugin-support.h          # PLUGIN_NAME / obs_log 선언 (정의는 .c.in)
-    src/pixel-hash.cpp            # Role C: FNV-1a 픽셀 해시 캐시
-    src/pixel-hash.h
-    src/pipeline-health.cpp       # [NEW] 파이프라인 상태 모니터
-    src/pipeline-health.h
     src/ocr-engine.cpp            # Role B: OCR + RE2 기반 PII 탐지
     src/ocr-engine.h              # Role B: OCR 엔진 인터페이스
     src/visual-tracker.cpp        # Role B: NCC 기반 프레임별 박스 추적
@@ -222,8 +218,6 @@ if(WIN32)
       src/window_tracker.h
       src/win_event_listener.cpp  # Role A: SetWinEventHook push 감지
       src/win_event_listener.h
-      src/gpu-readback.cpp        # Role C: GPU-CPU 비동기 Readback
-      src/gpu-readback.h
       src/overlay-window.cpp      # Role D: 스트리머 전용 보안 상태 HUD (캡처 제외)
       src/overlay-window.h
       src/selection-overlay.cpp   # Role D: 드래그 블러 선택 오버레이
