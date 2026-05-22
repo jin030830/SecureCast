@@ -112,6 +112,9 @@ public:
     // 렌더 시 출력 슬롯의 windowSnapshot을 사용해야 프레임 내용과 마스크 위치가
     // 동기화됨.
     TrackedWindowList windowSnapshot{};
+    // 이 프레임 시점의 알림 영역 블러 rect (width 0 = 없음). windowSnapshot과
+    // 같은 이유로 슬롯에 저장 — 지연 송출 프레임과 동기화하기 위함.
+    BlurRect notifRect{};
 #endif
 
     // gs_texrender에서 결과 텍스처를 꺼내는 헬퍼
@@ -134,6 +137,18 @@ public:
                  const TrackedWindowList *wlist, uint64_t dependentOcrFrameId);
 #else
   void pushFrame(uint64_t timestamp, obs_source_t *filter_context, uint64_t dependentOcrFrameId);
+#endif
+
+#ifdef _WIN32
+  // 최근 maxAgeNs(ns) 이내에 캡처된 슬롯들의 windowSnapshot에 win을 소급
+  // 추가한다. 새 블랙리스트 창은 감지 지연 동안 캡처된 슬롯의 스냅샷에서
+  // 빠져 있어, 그 슬롯이 송출될 때 마스킹 없이 노출된다. 이를 보정한다.
+  void backfillRecentSnapshots(const TrackedWindow &win, uint64_t nowNs,
+                               uint64_t maxAgeNs);
+  // 최근 maxAgeNs(ns) 이내에 캡처된 슬롯들의 notifRect를 rect로 설정한다.
+  // 알림 블러를 windowSnapshot과 동일하게 지연 송출 프레임과 동기화한다.
+  void backfillRecentNotifRect(const BlurRect &rect, uint64_t nowNs,
+                               uint64_t maxAgeNs);
 #endif
 
   const Slot *peekDelayedSlot() const;
@@ -215,6 +230,8 @@ struct SecureCastFilter {
   TrackedWindowList prevWindowList{};    // lingering 감지용 직전 스캔 결과
   TrackedWindowList recentlySeenList{};  // 과거에 추적했던 창 목록 (quick
                                          // restore용, 닫힐 때까지 유지)
+  TrackedWindowList prevPushedWindowList{}; // 직전 프레임에 push된 스냅샷
+                                            // (새 창 소급 보정 비교용)
   LingeringWindow lingeringWindows[SC_MAX_LINGERING]{};
   int lingeringCount = 0;
 

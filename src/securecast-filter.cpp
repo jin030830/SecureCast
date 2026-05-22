@@ -430,6 +430,9 @@ void FrameRingBuffer::pushFrame(uint64_t timestamp,
     slot.windowSnapshot = *wlist;
   else
     slot.windowSnapshot = TrackedWindowList{};
+  // notifRect는 매 프레임 video_render의 backfillRecentNotifRect가 채운다.
+  // 슬롯 재사용 시 옛 값이 남지 않도록 여기서 초기화한다.
+  slot.notifRect = BlurRect{};
 #endif
 
   gs_texrender_t *tr = slot.texrender;
@@ -479,6 +482,54 @@ FrameRingBuffer::peekSlotAtOffset(int framesBack) const {
       SC_RING_BUFFER_SLOTS;
   return &m_slots[idx];
 }
+
+#ifdef _WIN32
+// 최근 maxAgeNs 이내에 캡처된 슬롯들의 windowSnapshot에 win을 소급 추가한다.
+// 새 블랙리스트 창은 감지 지연(scan latency) 동안 캡처된 슬롯의 스냅샷에서
+// 빠져 있어, 그 슬롯이 송출될 때 마스킹 없이 노출된다. 이를 보정한다.
+// 슬롯을 최신→과거 순으로 순회하며 maxAgeNs를 넘는 슬롯에서 중단한다.
+void FrameRingBuffer::backfillRecentSnapshots(const TrackedWindow &win,
+                                              uint64_t nowNs,
+                                              uint64_t maxAgeNs) {
+  for (int k = 0; k < m_frameCount; ++k) {
+    int idx =
+        ((m_head - 1 - k) % SC_RING_BUFFER_SLOTS + SC_RING_BUFFER_SLOTS) %
+        SC_RING_BUFFER_SLOTS;
+    Slot &s = m_slots[idx];
+    if (s.timestamp == 0 || nowNs < s.timestamp ||
+        nowNs - s.timestamp > maxAgeNs)
+      break; // 더 과거 슬롯은 갭 범위 밖
+    TrackedWindowList &snap = s.windowSnapshot;
+    bool found = false;
+    for (int i = 0; i < snap.count; ++i) {
+      if (snap.items[i].hwnd == win.hwnd) {
+        snap.items[i] = win; // 좌표 갱신
+        found = true;
+        break;
+      }
+    }
+    if (!found && snap.count < SC_MAX_TRACKED_WINDOWS)
+      snap.items[snap.count++] = win;
+  }
+}
+
+// 최근 maxAgeNs 이내에 캡처된 슬롯들의 notifRect를 rect로 설정한다.
+// 알림 블러도 windowSnapshot처럼 지연 송출 프레임과 동기화하기 위함이다.
+void FrameRingBuffer::backfillRecentNotifRect(const BlurRect &rect,
+                                              uint64_t nowNs,
+                                              uint64_t maxAgeNs) {
+  for (int k = 0; k < m_frameCount; ++k) {
+    int idx =
+        ((m_head - 1 - k) % SC_RING_BUFFER_SLOTS + SC_RING_BUFFER_SLOTS) %
+        SC_RING_BUFFER_SLOTS;
+    Slot &s = m_slots[idx];
+    if (s.timestamp == 0 || nowNs < s.timestamp ||
+        nowNs - s.timestamp > maxAgeNs)
+      break;
+    s.notifRect = rect;
+  }
+}
+#endif
 
 // ================================================================
 // [Role B/C] GPU texture -> CPU BGRA pixels 재사용 readback
@@ -1570,6 +1621,47 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
 #ifdef _WIN32
   filter->ringBuffer.pushFrame(ts, filter->context, &filter->captureWindowList,
                                filter->lastSubmittedOcrFrameId.load(std::memory_order_relaxed));
+
+  // [지연 동기화] 방금 push한 스냅샷에 새로 등장한 블랙리스트 창을 최근
+  // 슬롯들에 소급 추가한다. 감지 지연(scan latency) 동안 캡처돼 스냅샷에서
+  // 빠진 갭 프레임을 보정 — 실시간 lingering으로 현재(지연) 프레임에 미리
+  // 블러를 깔던 방식과 달리, 블러 박스가 송출 화면에서 창과 동시에 뜬다.
+  {
+    const TrackedWindowList &pushed = filter->captureWindowList;
+    const uint64_t maxAgeNs =
+        filter->isGameMode.load(std::memory_order_acquire)
+            ? 550000000ULL  // 게임 모드 스캔 0.5s + 여유
+            : 200000000ULL; // 일반 스캔 0.15s + 여유
+    for (int i = 0; i < pushed.count; ++i) {
+      bool wasPrev = false;
+      for (int j = 0; j < filter->prevPushedWindowList.count; ++j) {
+        if (filter->prevPushedWindowList.items[j].hwnd ==
+            pushed.items[i].hwnd) {
+          wasPrev = true;
+          break;
+        }
+      }
+      if (!wasPrev)
+        filter->ringBuffer.backfillRecentSnapshots(pushed.items[i], ts,
+                                                   maxAgeNs);
+    }
+    filter->prevPushedWindowList = pushed;
+  }
+
+  // [지연 동기화] 알림 블러도 동일하게 — 현재 알림 union rect를 최근 슬롯들의
+  // notifRect에 소급 기록한다. 렌더는 지연 슬롯의 notifRect를 쓰므로, 블러
+  // 박스가 송출 화면에서 알림과 같은 타이밍에 뜬다 (실시간 주입은 ~1초 먼저
+  // 떴음).
+  {
+    BlurRect notif{};
+    {
+      std::lock_guard<std::mutex> lock(filter->settingsMutex);
+      if (filter->notifBlurActive)
+        notif = filter->notifBlurRect;
+    }
+    if (notif.width > 0 && notif.height > 0)
+      filter->ringBuffer.backfillRecentNotifRect(notif, ts, 200000000ULL);
+  }
   // push 이후에 DWM 갱신 → 다음 프레임의 captureWindowList로 저장
   // [Fix #3-B] 사라진 hwnd를 render 경로에서 즉시 lingering에 등록
   //   → tick(slow-scan)보다 훨씬 빠르게 잔영을 보장
@@ -1854,14 +1946,11 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
     }
   }
 #ifdef _WIN32
-  // [Role D] 알림 영역 자동 블러 — 쿨다운 중이면 rect 합산
-  {
-    std::lock_guard<std::mutex> lock(filter->settingsMutex);
-    if (filter->notifBlurActive && filter->notifBlurRect.width > 0 &&
-        filter->notifBlurRect.height > 0 &&
-        all_count < (int)(sizeof(all_rects) / sizeof(all_rects[0]))) {
-      all_rects[all_count++] = filter->notifBlurRect;
-    }
+  // [Role D] 알림 영역 자동 블러 — 지연 슬롯의 notifRect 주입 (송출 동기화).
+  // notifRect는 video_render가 매 프레임 backfillRecentNotifRect로 채운다.
+  if (outputSlot->notifRect.width > 0 && outputSlot->notifRect.height > 0 &&
+      all_count < (int)(sizeof(all_rects) / sizeof(all_rects[0]))) {
+    all_rects[all_count++] = outputSlot->notifRect;
   }
 
   // [Role D] 수동 드래그 블러 — 확정 rects + 드래그 중 미리보기
@@ -2224,20 +2313,8 @@ static void securecast_video_tick(void *data, float seconds) {
       register_lingering_window(filter, filter->prevWindowList.items[pi]);
   }
 
-  // New window detection: 이번 스캔에서 새로 등장한 창을 즉시 lingering에
-  // prime. register_lingering_window로 TTL SC_RING_BUFFER_SLOTS+1 보장.
-  for (int ci = 0; ci < filter->windowList.count; ++ci) {
-    HWND ch = filter->windowList.items[ci].hwnd;
-    bool wasPrev = false;
-    for (int pi = 0; pi < filter->prevWindowList.count; ++pi) {
-      if (filter->prevWindowList.items[pi].hwnd == ch) {
-        wasPrev = true;
-        break;
-      }
-    }
-    if (!wasPrev)
-      register_lingering_window(filter, filter->windowList.items[ci]);
-  }
+  // 새 창은 video_render의 backfillRecentSnapshots로 처리한다 — 실시간
+  // lingering 대신 최근 슬롯 스냅샷을 소급 보정해 이른 블러를 없앤다.
 
   filter->prevWindowList = filter->windowList;
 
