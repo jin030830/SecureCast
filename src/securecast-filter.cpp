@@ -2053,11 +2053,8 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
 // 한계(v1): 주 모니터 한정.
 // ================================================================
 
-// 토스트 탐지 throttle 주기(초)와 탐지 후 블러 유지 시간(초).
-// 유지 시간은 N프레임 송출 지연(ring buffer)보다 충분히 길어야 한다 —
-// 토스트가 화면에서 사라져도 지연된 송출 프레임에는 아직 남아 있기 때문.
+// 토스트 탐지 throttle 주기(초).
 static constexpr float NOTIF_SCAN_INTERVAL_SEC = 0.1f;
-static constexpr float NOTIF_BLUR_HOLD_SEC = 5.0f;
 
 // 토스트 영역에 더하는 여유 마진(px) — 둥근 모서리·슬라이드 애니메이션 대비.
 static constexpr int NOTIF_MARGIN = 16;
@@ -2142,6 +2139,19 @@ static bool detect_notification_toast(RECT *outRect) {
   if (ctx.found && outRect)
     *outRect = ctx.bbox;
   return ctx.found;
+}
+
+// 두 BlurRect의 합집합(bounding box). width<=0이면 빈 영역으로 취급한다.
+static BlurRect blur_rect_union(const BlurRect &a, const BlurRect &b) {
+  if (a.width <= 0 || a.height <= 0)
+    return b;
+  if (b.width <= 0 || b.height <= 0)
+    return a;
+  int x1 = std::min(a.x, b.x);
+  int y1 = std::min(a.y, b.y);
+  int x2 = std::max(a.x + a.width, b.x + b.width);
+  int y2 = std::max(a.y + a.height, b.y + b.height);
+  return {x1, y1, x2 - x1, y2 - y1, 0};
 }
 #endif // _WIN32
 
@@ -2325,55 +2335,42 @@ static void securecast_video_tick(void *data, float seconds) {
           filter->lingeringWindows[--filter->lingeringCount];
   }
 
-  // [Role D] 알림 영역 자동 블러 — 토스트 탐지 (throttle 적용).
-  // 토스트가 보이는 동안 매 스캔마다 쿨다운을 갱신해 블러를 유지하고,
-  // 토스트가 사라지면 아래 카운트다운이 NOTIF_BLUR_HOLD_SEC 후 해제한다.
+  // [Role D] 알림 영역 자동 블러 — 매 스캔 "현재 보이는" 토스트들의 union을
+  // 반영한다. 토스트가 사라지면 union이 즉시 줄어든다(에피소드 유지 X) —
+  // 스택에서 하나씩 닫으면 그 영역이 차례로 빠진다. 직전 스캔 union과 합쳐
+  // 스캔 사이 이동(재배열 슬라이드)을 덮는다. 송출 동기화·지연 노출 방지는
+  // video_render의 슬롯 notifRect 기록이 담당하므로 hold(쿨다운)는 없다.
   filter->notifScanAccumulator += seconds;
   if (filter->notifScanAccumulator >= NOTIF_SCAN_INTERVAL_SEC) {
     filter->notifScanAccumulator = 0.0f;
     RECT toastRect{};
+    BlurRect cur{};
     if (detect_notification_toast(&toastRect)) {
-      // 토스트 영역 + 여유 마진.
-      int x1 = static_cast<int>(toastRect.left) - NOTIF_MARGIN;
-      int y1 = static_cast<int>(toastRect.top) - NOTIF_MARGIN;
-      int x2 = static_cast<int>(toastRect.right) + NOTIF_MARGIN;
-      int y2 = static_cast<int>(toastRect.bottom) + NOTIF_MARGIN;
-      std::lock_guard<std::mutex> lock(filter->settingsMutex);
-      if (filter->notifBlurActive && filter->notifBlurRect.width > 0) {
-        // 진행 중인 알림 에피소드 — 블러 영역을 합집합으로 "확장만" 한다.
-        // 송출은 N프레임 지연되므로, 토스트를 닫거나 스택이 재배열돼
-        // 실시간 위치가 바뀌어도 지연된 송출 프레임에는 토스트가 옛
-        // 위치에 그대로 남아 있다. 영역을 줄이면 그 부분이 노출되므로
-        // 에피소드가 끝날 때(쿨다운 만료)까지 영역을 절대 줄이지 않는다.
-        const BlurRect &p = filter->notifBlurRect;
-        x1 = std::min(x1, p.x);
-        y1 = std::min(y1, p.y);
-        x2 = std::max(x2, p.x + p.width);
-        y2 = std::max(y2, p.y + p.height);
-      } else {
-        blog(LOG_INFO,
-             "[SecureCast][D] Notification toast detected @ (%ld,%ld) %ldx%ld",
-             toastRect.left, toastRect.top, toastRect.right - toastRect.left,
-             toastRect.bottom - toastRect.top);
-      }
-      filter->notifBlurActive = true;
-      filter->notifBlurCooldown = NOTIF_BLUR_HOLD_SEC;
-      filter->notifBlurRect = {x1, y1, x2 - x1, y2 - y1, 0}; // type 0 = Blur
+      cur = {static_cast<int>(toastRect.left) - NOTIF_MARGIN,
+             static_cast<int>(toastRect.top) - NOTIF_MARGIN,
+             static_cast<int>(toastRect.right - toastRect.left) +
+                 2 * NOTIF_MARGIN,
+             static_cast<int>(toastRect.bottom - toastRect.top) +
+                 2 * NOTIF_MARGIN,
+             0}; // type 0 = Blur
     }
-  }
-
-  // [Role D] 알림 영역 자동 블러 쿨다운 카운트다운 (해제까지 카운트다운)
-  {
+    // 현재 union ∪ 직전 N스캔 union. 스캔 간 이동을 덮고, 토스트가 사라진
+    // 뒤에도 블러가 N스캔(약 0.3초)만큼 더 유지된다 → 송출 화면에서 팝업이
+    // 먼저 사라지고 블러가 아주 조금 뒤에 사라진다.
+    BlurRect merged = cur;
+    for (int h = 0; h < SecureCastFilter::SC_NOTIF_LINGER_SCANS; ++h)
+      merged = blur_rect_union(merged, filter->notifScanHist[h]);
+    for (int h = SecureCastFilter::SC_NOTIF_LINGER_SCANS - 1; h > 0; --h)
+      filter->notifScanHist[h] = filter->notifScanHist[h - 1];
+    filter->notifScanHist[0] = cur;
     std::lock_guard<std::mutex> lock(filter->settingsMutex);
-    if (filter->notifBlurActive) {
-      filter->notifBlurCooldown -= seconds;
-      if (filter->notifBlurCooldown <= 0.0f) {
-        filter->notifBlurActive = false;
-        filter->notifBlurCooldown = 0.0f;
-        filter->notifBlurRect = {}; // 에피소드 종료 — 다음 알림은 새로 시작
-        blog(LOG_INFO, "[SecureCast][D] Notification blur expired.");
-      }
-    }
+    const bool active = (merged.width > 0 && merged.height > 0);
+    if (active && !filter->notifBlurActive)
+      blog(LOG_INFO, "[SecureCast][D] Notification toast detected.");
+    else if (!active && filter->notifBlurActive)
+      blog(LOG_INFO, "[SecureCast][D] Notification cleared.");
+    filter->notifBlurActive = active;
+    filter->notifBlurRect = merged;
   }
 #endif
 }

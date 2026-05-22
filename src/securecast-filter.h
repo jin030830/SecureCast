@@ -260,11 +260,16 @@ struct SecureCastFilter {
 #endif
 
   // ----- [Role D] 알림 영역 자동 블러 -----
-  // Windows 토스트 알림 창을 감지하면 그 영역을 NOTIF_BLUR_HOLD_SEC 동안 블러.
-  // video_tick에서 토스트 탐지 + 쿨다운 카운트다운, video_render에서 주입.
+  // 매 스캔 "현재 보이는" 토스트들의 union을 notifBlurRect에 반영한다.
+  // 토스트가 사라지면 union이 즉시 줄어든다. 송출 동기화·지연 노출 방지는
+  // video_render가 매 프레임 슬롯 notifRect에 기록하는 방식으로 처리한다.
   bool notifBlurActive = false;
-  float notifBlurCooldown = 0.0f;    // 탐지 시 갱신, 0 도달 시 해제
-  BlurRect notifBlurRect{};          // 토스트 영역 화면 좌표 (탐지 시 갱신)
+  BlurRect notifBlurRect{};          // 현재+최근 스캔 토스트 union (화면 좌표)
+  // 직전 N스캔의 토스트 union 기록. 현재 스캔과 합쳐, 토스트가 사라진 뒤에도
+  // 블러가 N스캔만큼 더 유지돼 송출 화면에서 "팝업 먼저, 블러 그다음"이 되고
+  // 스택 재배열 슬라이드 중 노출도 막는다.
+  static constexpr int SC_NOTIF_LINGER_SCANS = 3; // 0.1초 스캔 × 3 ≈ 0.3초
+  BlurRect notifScanHist[SC_NOTIF_LINGER_SCANS]{};
   float notifScanAccumulator = 0.0f; // 토스트 탐지 throttle 누산기
 
   // ----- [Role D] 수동 드래그 블러 -----
