@@ -22,6 +22,7 @@
 #include "plugin-support.h" // obs_log
 #ifdef _WIN32
 #include "window_tracker.h" // sc_tracker_tick (Role A: 블랙리스트 앱 좌표 수집)
+#include <dwmapi.h>           // DwmGetWindowAttribute (Role D: 알림 토스트 탐지)
 #include <obs-frontend-api.h> // obs_hotkey_register_frontend
 #endif
 #include "ocr-engine.h" // Role B: OCR engine
@@ -1948,6 +1949,113 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
 #endif
 }
 
+#ifdef _WIN32
+// ================================================================
+// [Role D] 알림 토스트 영역 탐지
+//
+// 알림 토스트는 앱·OS 버전마다 창 클래스가 제각각이라(Windows 토스트,
+// Chrome/Electron 자체 알림 등) 클래스로 식별하지 않는다. 대신 위치+크기
+// 로 판정한다: 보이는·uncloaked 최상위 창 중 주 모니터 작업영역 우하단
+// 모서리에 토스트 크기로 떠 있는 창을 토스트로 간주한다. 자기 자신의
+// 오버레이 HUD는 클래스로 제외한다.
+//
+// 여러 토스트가 스택되면 모두의 합집합(bounding box)을 반환한다.
+// 반환 좌표는 화면(모니터) 좌표 — 블랙리스트 마스킹과 동일 좌표계.
+// 한계(v1): 주 모니터 한정.
+// ================================================================
+
+// 토스트 탐지 throttle 주기(초)와 탐지 후 블러 유지 시간(초).
+// 유지 시간은 N프레임 송출 지연(ring buffer)보다 충분히 길어야 한다 —
+// 토스트가 화면에서 사라져도 지연된 송출 프레임에는 아직 남아 있기 때문.
+static constexpr float NOTIF_SCAN_INTERVAL_SEC = 0.1f;
+static constexpr float NOTIF_BLUR_HOLD_SEC = 5.0f;
+
+// 토스트 영역에 더하는 여유 마진(px) — 둥근 모서리·슬라이드 애니메이션 대비.
+static constexpr int NOTIF_MARGIN = 16;
+
+// 토스트 판정 기하 임계값 (창 클래스 무관, 위치+크기 기반).
+static constexpr int NOTIF_MIN_W = 250;    // 최소 너비
+static constexpr int NOTIF_MAX_W = 620;    // 최대 너비 (DPI 배율 고려)
+static constexpr int NOTIF_MIN_H = 60;     // 최소 높이
+static constexpr int NOTIF_MAX_H = 620;    // 최대 높이 (스택·리치 토스트)
+static constexpr int NOTIF_EDGE_X = 96;    // 우측 모서리 허용 여백(px)
+static constexpr int NOTIF_REGION_Y = 360; // 우하단 영역 세로 범위(px)
+
+struct NotifScanCtx {
+  RECT workArea; // 주 모니터 작업 영역 (작업표시줄 제외)
+  RECT bbox;     // 탐지된 토스트들의 합집합
+  bool found;
+};
+
+static BOOL CALLBACK notif_enum_proc(HWND hwnd, LPARAM lparam) {
+  auto *ctx = reinterpret_cast<NotifScanCtx *>(lparam);
+
+  if (!IsWindowVisible(hwnd))
+    return TRUE;
+
+  // 셸 창(CoreWindow 등)은 평소 DWM cloak 상태 — uncloaked만 관심 대상.
+  int cloaked = 0;
+  if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked,
+                                      sizeof(cloaked))) &&
+      cloaked != 0)
+    return TRUE;
+
+  // DWM 정확 좌표 (그림자 제외). 실패 시 GetWindowRect로 폴백.
+  RECT r{};
+  if (FAILED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &r,
+                                   sizeof(r)))) {
+    if (!GetWindowRect(hwnd, &r))
+      return TRUE;
+  }
+
+  const RECT &wa = ctx->workArea;
+  const int rw = r.right - r.left;
+  const int rh = r.bottom - r.top;
+
+  wchar_t cls[96] = {};
+  GetClassNameW(hwnd, cls, 96);
+
+  // 실제 토스트 휴리스틱 — 창 클래스 무관, 위치+크기 기반.
+  // 알림 토스트는 앱 종류와 무관하게(Windows·Chrome·Discord 등) 우하단
+  // 모서리에 토스트 크기로 뜬다. 우리 자신의 오버레이 HUD는 제외한다.
+  if (wcscmp(cls, L"SecureCastOverlayV1") == 0)
+    return TRUE;
+  if (rw < NOTIF_MIN_W || rw > NOTIF_MAX_W || rh < NOTIF_MIN_H ||
+      rh > NOTIF_MAX_H)
+    return TRUE;                             // 토스트 크기 범위 밖
+  if (r.right < wa.right - NOTIF_EDGE_X)     // 우측 모서리에 안 붙음
+    return TRUE;
+  if (r.bottom < wa.bottom - NOTIF_REGION_Y) // 우하단 영역보다 위
+    return TRUE;
+  if (r.bottom > wa.bottom + 24)             // 작업영역 아래 (sanity)
+    return TRUE;
+
+  // 토스트로 간주 — 합집합 누적 (여러 토스트 스택 대비).
+  if (!ctx->found) {
+    ctx->bbox = r;
+    ctx->found = true;
+  } else {
+    ctx->bbox.left = std::min(ctx->bbox.left, r.left);
+    ctx->bbox.top = std::min(ctx->bbox.top, r.top);
+    ctx->bbox.right = std::max(ctx->bbox.right, r.right);
+    ctx->bbox.bottom = std::max(ctx->bbox.bottom, r.bottom);
+  }
+  return TRUE;
+}
+
+// 주 모니터 우하단의 Windows 토스트 알림 영역을 탐지한다.
+// 발견 시 true + outRect(화면 좌표)를 채운다.
+static bool detect_notification_toast(RECT *outRect) {
+  NotifScanCtx ctx{};
+  if (!SystemParametersInfoW(SPI_GETWORKAREA, 0, &ctx.workArea, 0))
+    return false; // 작업 영역 조회 실패 — 탐지 불가
+  EnumWindows(notif_enum_proc, reinterpret_cast<LPARAM>(&ctx));
+  if (ctx.found && outRect)
+    *outRect = ctx.bbox;
+  return ctx.found;
+}
+#endif // _WIN32
+
 // ---------------------------------------------------------
 // Tick (Slow-Path) — 매 프레임 호출되지만 윈도우 추적은 0.15초마다
 // ---------------------------------------------------------
@@ -2140,7 +2248,44 @@ static void securecast_video_tick(void *data, float seconds) {
           filter->lingeringWindows[--filter->lingeringCount];
   }
 
-  // [Role D] 알림 영역 자동 블러 쿨다운 카운트다운 (3초 경과 시 해제)
+  // [Role D] 알림 영역 자동 블러 — 토스트 탐지 (throttle 적용).
+  // 토스트가 보이는 동안 매 스캔마다 쿨다운을 갱신해 블러를 유지하고,
+  // 토스트가 사라지면 아래 카운트다운이 NOTIF_BLUR_HOLD_SEC 후 해제한다.
+  filter->notifScanAccumulator += seconds;
+  if (filter->notifScanAccumulator >= NOTIF_SCAN_INTERVAL_SEC) {
+    filter->notifScanAccumulator = 0.0f;
+    RECT toastRect{};
+    if (detect_notification_toast(&toastRect)) {
+      // 토스트 영역 + 여유 마진.
+      int x1 = static_cast<int>(toastRect.left) - NOTIF_MARGIN;
+      int y1 = static_cast<int>(toastRect.top) - NOTIF_MARGIN;
+      int x2 = static_cast<int>(toastRect.right) + NOTIF_MARGIN;
+      int y2 = static_cast<int>(toastRect.bottom) + NOTIF_MARGIN;
+      std::lock_guard<std::mutex> lock(filter->settingsMutex);
+      if (filter->notifBlurActive && filter->notifBlurRect.width > 0) {
+        // 진행 중인 알림 에피소드 — 블러 영역을 합집합으로 "확장만" 한다.
+        // 송출은 N프레임 지연되므로, 토스트를 닫거나 스택이 재배열돼
+        // 실시간 위치가 바뀌어도 지연된 송출 프레임에는 토스트가 옛
+        // 위치에 그대로 남아 있다. 영역을 줄이면 그 부분이 노출되므로
+        // 에피소드가 끝날 때(쿨다운 만료)까지 영역을 절대 줄이지 않는다.
+        const BlurRect &p = filter->notifBlurRect;
+        x1 = std::min(x1, p.x);
+        y1 = std::min(y1, p.y);
+        x2 = std::max(x2, p.x + p.width);
+        y2 = std::max(y2, p.y + p.height);
+      } else {
+        blog(LOG_INFO,
+             "[SecureCast][D] Notification toast detected @ (%ld,%ld) %ldx%ld",
+             toastRect.left, toastRect.top, toastRect.right - toastRect.left,
+             toastRect.bottom - toastRect.top);
+      }
+      filter->notifBlurActive = true;
+      filter->notifBlurCooldown = NOTIF_BLUR_HOLD_SEC;
+      filter->notifBlurRect = {x1, y1, x2 - x1, y2 - y1, 0}; // type 0 = Blur
+    }
+  }
+
+  // [Role D] 알림 영역 자동 블러 쿨다운 카운트다운 (해제까지 카운트다운)
   {
     std::lock_guard<std::mutex> lock(filter->settingsMutex);
     if (filter->notifBlurActive) {
@@ -2148,6 +2293,7 @@ static void securecast_video_tick(void *data, float seconds) {
       if (filter->notifBlurCooldown <= 0.0f) {
         filter->notifBlurActive = false;
         filter->notifBlurCooldown = 0.0f;
+        filter->notifBlurRect = {}; // 에피소드 종료 — 다음 알림은 새로 시작
         blog(LOG_INFO, "[SecureCast][D] Notification blur expired.");
       }
     }

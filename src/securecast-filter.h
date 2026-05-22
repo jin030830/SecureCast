@@ -243,11 +243,12 @@ struct SecureCastFilter {
 #endif
 
   // ----- [Role D] 알림 영역 자동 블러 -----
-  // screenChanged 감지 시 우하단 알림 영역에 변화가 있으면 3초간 블러를 유지.
-  // video_tick에서 쿨다운 카운트다운, video_render에서 all_rects에 주입.
+  // Windows 토스트 알림 창을 감지하면 그 영역을 NOTIF_BLUR_HOLD_SEC 동안 블러.
+  // video_tick에서 토스트 탐지 + 쿨다운 카운트다운, video_render에서 주입.
   bool notifBlurActive = false;
-  float notifBlurCooldown = 0.0f; // 3.0f에서 카운트다운, 0에 도달하면 해제
-  BlurRect notifBlurRect{};       // 소스 픽셀 좌표 (변화 감지 시 갱신)
+  float notifBlurCooldown = 0.0f;    // 탐지 시 갱신, 0 도달 시 해제
+  BlurRect notifBlurRect{};          // 토스트 영역 화면 좌표 (탐지 시 갱신)
+  float notifScanAccumulator = 0.0f; // 토스트 탐지 throttle 누산기
 
   // ----- [Role D] 수동 드래그 블러 -----
   // OBS 소스 프리뷰에서 좌클릭 드래그로 영역 지정 → 영구 블러.
