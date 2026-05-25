@@ -75,17 +75,19 @@ static void save_manual_rects(SecureCastFilter *filter,
 //   pushFrame이 먼저 실행되는 1프레임 갭을 커버.
 // ────────────────────────────────────────────────────────────
 static void register_lingering_window(SecureCastFilter *filter,
-                                      const TrackedWindow &win) {
+                                      const TrackedWindow &win,
+                                      bool fromPreview = false) {
   for (int li = 0; li < filter->lingeringCount; ++li) {
     if (filter->lingeringWindows[li].window.hwnd == win.hwnd) {
       filter->lingeringWindows[li].window = win;
       filter->lingeringWindows[li].ticksRemaining = SC_RING_BUFFER_SLOTS + 1;
+      filter->lingeringWindows[li].fromPreview = fromPreview;
       return;
     }
   }
   if (filter->lingeringCount < SC_MAX_LINGERING) {
     filter->lingeringWindows[filter->lingeringCount++] = {
-        win, SC_RING_BUFFER_SLOTS + 1};
+        win, SC_RING_BUFFER_SLOTS + 1, fromPreview};
   } else {
     blog(LOG_WARNING, "[SecureCast][linger-full] dropping hwnd=%p",
          (void *)win.hwnd);
@@ -1945,6 +1947,57 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
       }
     }
   }
+
+  // [작업표시줄 hover 미리보기 가드]
+  //   peek 검출 신호: TaskListThumbnailWnd 존재 OR 마우스가 작업표시줄 위.
+  //   두 신호 중 하나라도 참이면 peek 상태로 간주해 recentlySeenList의 모든
+  //   블랙리스트 앱 last-known bounds를 lingering으로 강제 등록한다.
+  //
+  //   이유: Aero Peek는 DWM이 직접 썸네일을 렌더하는 경우가 있어 카톡 HWND
+  //   자체가 cloak되거나 z-order 변경 없이 화면에만 노출되는 케이스가 있다.
+  //   HWND 추적만으론 잡히지 않아 mouse-over-taskbar를 보조 신호로 사용.
+  //
+  //   thumbnail strip이 보이면 그 strip bounds도 함께 lingering (소형 썸네일
+  //   영역 가림). previewActiveNs로 slot.timestamp 컷오프 → peek 끝나면 자연
+  //   소멸.
+  {
+    // peek 발동 두 조건 모두 충족 시에만 트리거:
+    //   (A) 마우스가 직전에 작업표시줄 위에 있었다 (썸네일이 실제로 떠 있음)
+    //   (B) 마우스가 현재 썸네일 영역(작업표시줄 인접 ~400px 띠)에 있다
+    // (A) 없이 (B)만으로 판정하면 화면 하단을 그냥 지나가도 발동돼서 빈 영역에
+    // 블러 박스가 뜬다. (A)는 ~2초 grace로 유지.
+    const bool mouseOverTaskbar = sc_mouse_over_taskbar();
+    const bool mouseInZone = sc_mouse_over_thumbnail_zone();
+    const uint64_t nowTick = GetTickCount64();
+    if (mouseOverTaskbar)
+      filter->lastOverTaskbarTick = nowTick;
+    constexpr uint64_t kThumbnailVisibleHystMs = 2000;
+    const bool thumbnailLikelyVisible =
+        filter->lastOverTaskbarTick != 0 &&
+        (nowTick - filter->lastOverTaskbarTick) < kThumbnailVisibleHystMs;
+
+    const bool peekTrigger = mouseInZone && thumbnailLikelyVisible;
+    if (peekTrigger)
+      filter->lastInThumbnailZoneTick = nowTick;
+    constexpr uint64_t kPreviewHystMs = 1500;
+    const bool zoneHystActive =
+        filter->lastInThumbnailZoneTick != 0 &&
+        (nowTick - filter->lastInThumbnailZoneTick) < kPreviewHystMs;
+    const bool previewActive = peekTrigger || zoneHystActive;
+
+    if (previewActive) {
+      TrackedWindowList aliveBl{};
+      sc_find_all_alive_blacklist_windows(&aliveBl);
+      if (aliveBl.count > 0) {
+        filter->previewActiveNs = os_gettime_ns();
+        // 살아있는 블랙리스트 앱의 화면상 bounds(iconic이면 restored 위치)에
+        // lingering 등록. peek 끝나면 previewActiveNs 컷오프로 자연 소멸.
+        for (int i = 0; i < aliveBl.count; ++i)
+          register_lingering_window(filter, aliveBl.items[i],
+                                    /*fromPreview=*/true);
+      }
+    }
+  }
 #else
   filter->ringBuffer.pushFrame(ts, filter->context, &trackerSnap,
                                filter->lastSubmittedOcrFrameId.load(std::memory_order_relaxed));
@@ -2197,19 +2250,26 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
   }
   // Lingering rects: 사라진 창의 N프레임 잔영 (ring buffer에 남은 과거 프레임
   // 커버).
-  // [최소화 잔상 컷오프] MINIMIZEEND가 발화된 창은 그 시각 이후에 캡처된 슬롯
-  // (= outputSlot.timestamp > endNs)에서는 lingering을 그리지 않는다. 종료 후
-  // ring buffer가 캡처한 프레임에는 실제로 창이 없으므로, 블러를 그리면 빈
-  // 영역 위에 잔상 박스만 남는다.
+  // 컷오프 분기:
+  //   fromPreview=true (taskbar hover 가드): previewActiveNs 이후 캡처된 슬롯은
+  //     peek이 끝난 뒤 프레임이라 그리지 않음 — 빈 영역 잔상 방지.
+  //   fromPreview=false (정상 lingering): MINIMIZEEND가 있으면 endNs 이후 슬롯은
+  //     skip — 동일 원리.
   for (int li = 0; li < filter->lingeringCount &&
                    all_count + SC_MAX_VISIBLE_SUBRECTS <= kAllRectsCap;
        ++li) {
-    const HWND lh = filter->lingeringWindows[li].window.hwnd;
-    const uint64_t endNs = sc_get_minimize_end_ns(lh);
-    if (endNs != 0 && outputSlot->timestamp > endNs)
-      continue;
-    int n = tracked_window_to_blur_rects(filter->lingeringWindows[li].window, w,
-                                         h, &all_rects[all_count],
+    const auto &linger = filter->lingeringWindows[li];
+    if (linger.fromPreview) {
+      if (filter->previewActiveNs != 0 &&
+          outputSlot->timestamp > filter->previewActiveNs)
+        continue;
+    } else {
+      const uint64_t endNs = sc_get_minimize_end_ns(linger.window.hwnd);
+      if (endNs != 0 && outputSlot->timestamp > endNs)
+        continue;
+    }
+    int n = tracked_window_to_blur_rects(linger.window, w, h,
+                                         &all_rects[all_count],
                                          SC_MAX_VISIBLE_SUBRECTS);
     all_count += n;
   }

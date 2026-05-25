@@ -192,6 +192,15 @@ extern "C" int sc_compute_visible_subrects(HWND target, RECT target_bounds,
 		if (is_task_switcher_window(wroot))
 			continue;
 
+		// DWM cloak 검사 — Aero Peek 등에서 시각적으로 투명 처리된 창은 z-order
+		// 위에 있어도 픽셀상 가리지 않으므로 차감 대상에서 제외해야 한다.
+		// 0=일반, 그 외(CLOAKED_APP/SHELL/INHERITED)는 보이지 않음.
+		DWORD cloaked = 0;
+		if (SUCCEEDED(DwmGetWindowAttribute(w, DWMWA_CLOAKED, &cloaked,
+		                                     sizeof(cloaked))) &&
+		    cloaked != 0)
+			continue;
+
 		RECT cov{};
 		if (FAILED(DwmGetWindowAttribute(w, DWMWA_EXTENDED_FRAME_BOUNDS,
 		                                  &cov, sizeof(cov)))) {
@@ -625,4 +634,202 @@ extern "C" uint64_t sc_get_minimize_end_ns(HWND hwnd)
 	if (it == g_minimizingWindows.end())
 		return 0;
 	return it->second.endNs;
+}
+
+namespace {
+
+// EnumWindows callback for sc_find_all_alive_blacklist_windows.
+// 가시성/크기/visibility 필터 모두 생략 — 살아있는 블랙리스트 exe HWND라면 추가.
+BOOL CALLBACK enum_all_blacklist_proc(HWND hwnd, LPARAM lparam)
+{
+	auto *out = reinterpret_cast<TrackedWindowList *>(lparam);
+	if (out->count >= SC_MAX_TRACKED_WINDOWS)
+		return FALSE;
+
+	// 닫힌 창은 패스 (EnumWindows는 보통 살아있는 것만 주지만 방어적).
+	if (!IsWindow(hwnd))
+		return TRUE;
+
+	// 프로세스 → exe 매칭.
+	DWORD pid = 0;
+	GetWindowThreadProcessId(hwnd, &pid);
+	if (pid == 0)
+		return TRUE;
+	HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+	if (!proc)
+		return TRUE;
+	wchar_t exe_path[MAX_PATH] = {};
+	DWORD path_size = MAX_PATH;
+	bool ok = QueryFullProcessImageNameW(proc, 0, exe_path, &path_size) != 0;
+	CloseHandle(proc);
+	if (!ok)
+		return TRUE;
+	wchar_t exe_name[64] = {};
+	path_basename(exe_path, exe_name, sizeof(exe_name) / sizeof(exe_name[0]));
+	if (iequals(exe_name, kUwpHost))
+		return TRUE;
+	if (!is_blacklisted(exe_name))
+		return TRUE;
+
+	// Bounds 산출:
+	//   iconic이면 GetWindowPlacement.rcNormalPosition (workspace 좌표)을 모니터
+	//   origin 보정해서 화면 좌표로 변환.
+	//   non-iconic이면 DWM EXTENDED_FRAME_BOUNDS 우선, 실패하면 GetWindowRect.
+	RECT bounds{};
+	bool gotBounds = false;
+	if (IsIconic(hwnd)) {
+		WINDOWPLACEMENT wp{};
+		wp.length = sizeof(wp);
+		if (GetWindowPlacement(hwnd, &wp)) {
+			HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+			MONITORINFO mi{};
+			mi.cbSize = sizeof(mi);
+			if (mon && GetMonitorInfo(mon, &mi)) {
+				const LONG dx = mi.rcWork.left - mi.rcMonitor.left;
+				const LONG dy = mi.rcWork.top - mi.rcMonitor.top;
+				bounds.left = wp.rcNormalPosition.left + mi.rcMonitor.left + dx;
+				bounds.top = wp.rcNormalPosition.top + mi.rcMonitor.top + dy;
+				bounds.right = wp.rcNormalPosition.right + mi.rcMonitor.left + dx;
+				bounds.bottom = wp.rcNormalPosition.bottom + mi.rcMonitor.top + dy;
+				gotBounds = true;
+			}
+		}
+	}
+	if (!gotBounds) {
+		if (FAILED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS,
+		                                  &bounds, sizeof(bounds)))) {
+			if (!GetWindowRect(hwnd, &bounds))
+				return TRUE;
+		}
+	}
+	if (bounds.right <= bounds.left || bounds.bottom <= bounds.top)
+		return TRUE;
+
+	auto &slot = out->items[out->count++];
+	slot.hwnd = hwnd;
+	slot.bounds = bounds;
+	slot.visibleCount = 1;
+	slot.visibleRects[0] = bounds;
+	for (size_t i = 0; i < sizeof(slot.exe_name) / sizeof(slot.exe_name[0]); ++i) {
+		slot.exe_name[i] = exe_name[i];
+		if (!exe_name[i])
+			break;
+	}
+	return TRUE;
+}
+
+} // namespace
+
+extern "C" void sc_find_all_alive_blacklist_windows(TrackedWindowList *out)
+{
+	if (!out)
+		return;
+	out->count = 0;
+	EnumWindows(enum_all_blacklist_proc, reinterpret_cast<LPARAM>(out));
+}
+
+extern "C" bool sc_mouse_over_taskbar()
+{
+	POINT pt{};
+	if (!GetCursorPos(&pt))
+		return false;
+
+	// 주 모니터 작업표시줄.
+	HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
+	if (tray) {
+		RECT r{};
+		if (GetWindowRect(tray, &r) && PtInRect(&r, pt))
+			return true;
+	}
+
+	// 보조 모니터들의 작업표시줄 (멀티모니터).
+	HWND tray2 = nullptr;
+	while ((tray2 = FindWindowExW(nullptr, tray2, L"Shell_SecondaryTrayWnd",
+	                               nullptr)) != nullptr) {
+		RECT r{};
+		if (GetWindowRect(tray2, &r) && PtInRect(&r, pt))
+			return true;
+	}
+	return false;
+}
+
+namespace {
+
+// 작업표시줄의 화면 안쪽 방향 인접 영역(thumbnail 영역) RECT 산출.
+// 작업표시줄이 모니터 어느 변에 붙어있든 자동 판정해 zoneDepth만큼 안쪽 띠 반환.
+// 작업표시줄 자체 영역은 제외(= peek 검출은 thumbnail 영역에서만 발동).
+bool tray_thumbnail_zone(HWND tray, int zoneDepth, RECT *outZone)
+{
+	if (!tray || !outZone)
+		return false;
+	RECT trayRect{};
+	if (!GetWindowRect(tray, &trayRect))
+		return false;
+	HMONITOR mon = MonitorFromWindow(tray, MONITOR_DEFAULTTONEAREST);
+	MONITORINFO mi{};
+	mi.cbSize = sizeof(mi);
+	if (!mon || !GetMonitorInfo(mon, &mi))
+		return false;
+
+	constexpr int kEdgeTol = 12; // 모니터 경계 매칭 허용 오차 (DPI/그림자 보정)
+
+	auto clamp = [](LONG v, LONG lo, LONG hi) {
+		return v < lo ? lo : (v > hi ? hi : v);
+	};
+
+	if (trayRect.bottom >= mi.rcMonitor.bottom - kEdgeTol) {
+		// 하단 작업표시줄 → 위쪽 띠
+		outZone->left = trayRect.left;
+		outZone->right = trayRect.right;
+		outZone->bottom = trayRect.top;
+		outZone->top = clamp(trayRect.top - zoneDepth, mi.rcMonitor.top,
+		                      mi.rcMonitor.bottom);
+	} else if (trayRect.top <= mi.rcMonitor.top + kEdgeTol) {
+		// 상단 작업표시줄 → 아래쪽 띠
+		outZone->left = trayRect.left;
+		outZone->right = trayRect.right;
+		outZone->top = trayRect.bottom;
+		outZone->bottom = clamp(trayRect.bottom + zoneDepth, mi.rcMonitor.top,
+		                         mi.rcMonitor.bottom);
+	} else if (trayRect.left <= mi.rcMonitor.left + kEdgeTol) {
+		// 좌측 작업표시줄 → 오른쪽 띠
+		outZone->top = trayRect.top;
+		outZone->bottom = trayRect.bottom;
+		outZone->left = trayRect.right;
+		outZone->right = clamp(trayRect.right + zoneDepth, mi.rcMonitor.left,
+		                        mi.rcMonitor.right);
+	} else {
+		// 우측 작업표시줄 → 왼쪽 띠
+		outZone->top = trayRect.top;
+		outZone->bottom = trayRect.bottom;
+		outZone->right = trayRect.left;
+		outZone->left = clamp(trayRect.left - zoneDepth, mi.rcMonitor.left,
+		                       mi.rcMonitor.right);
+	}
+	return outZone->right > outZone->left && outZone->bottom > outZone->top;
+}
+
+} // namespace
+
+extern "C" bool sc_mouse_over_thumbnail_zone()
+{
+	POINT pt{};
+	if (!GetCursorPos(&pt))
+		return false;
+	constexpr int kZoneDepth = 400; // 작업표시줄에서 화면 안쪽으로 픽셀
+
+	HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
+	if (tray) {
+		RECT zone{};
+		if (tray_thumbnail_zone(tray, kZoneDepth, &zone) && PtInRect(&zone, pt))
+			return true;
+	}
+	HWND tray2 = nullptr;
+	while ((tray2 = FindWindowExW(nullptr, tray2, L"Shell_SecondaryTrayWnd",
+	                               nullptr)) != nullptr) {
+		RECT zone{};
+		if (tray_thumbnail_zone(tray2, kZoneDepth, &zone) && PtInRect(&zone, pt))
+			return true;
+	}
+	return false;
 }

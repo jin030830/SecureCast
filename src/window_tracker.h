@@ -114,6 +114,28 @@ int sc_poll_minimizing_windows(ScMinimizingEntry *out, int maxOut,
 // 루프에서 slot.timestamp와 비교해 ghost blur를 잘라내는 데 사용.
 uint64_t sc_get_minimize_end_ns(HWND hwnd);
 
+// 현재 마우스 커서가 작업표시줄 영역 (주 + 보조 모니터) 위에 있는지 검사.
+// Aero Peek은 TaskListThumbnailWnd가 안 보일 수도 있고 DWM 썸네일로 직접 렌더
+// 되어 HWND 추적이 안 되는 경우도 있어, 마우스 위치를 peek 상태의 보조 신호로
+// 사용. 검출되는 동안 recentlySeenList lingering을 등록해 안전하게 가린다.
+bool sc_mouse_over_taskbar();
+
+// 마우스 커서가 작업표시줄 바로 옆 "썸네일 영역"(작업표시줄에서 화면 안쪽으로
+// ~400px 띠) 안에 있는지 검사. 단순히 작업표시줄 위에 있는 상태(소형 썸네일만
+// 떠 있는 단계)와 구분해, 사용자가 실제로 썸네일/peek 영역으로 마우스를 옮긴
+// 시점만 peek 발동 신호로 사용. 작업표시줄이 화면 어느 가장자리에 붙어있든
+// 자동 보정.
+bool sc_mouse_over_thumbnail_zone();
+
+// 살아있는 모든 블랙리스트 프로세스의 top-level HWND를 즉시 enum해서 out에 채움.
+// sc_scan_blacklisted_windows와 달리 가시성/크기/visibleRects 필터 없음 —
+// 최소화 상태(iconic) 또는 cloaked 상태인 창도 포함. peek가 그런 창을 잠시
+// 화면에 띄울 때 lingering 등록 대상으로 쓰기 위함.
+// 각 항목의 bounds: iconic이면 GetWindowPlacement.rcNormalPosition을 화면 좌표로
+// 변환한 값(=복원 시 표시될 위치), 아니면 DWM EXTENDED_FRAME_BOUNDS.
+// 반환값: out->count에 채워진 개수.
+void sc_find_all_alive_blacklist_windows(TrackedWindowList *out);
+
 // `target` 창의 bounds를 z-order 위의 다른 top-level 창들로 잘라서 실제
 // 화면에 노출된 disjoint 사각형들을 out에 채워 반환한다.
 // 반환값: out에 채워진 사각형 개수 (0 = 완전히 가려짐).

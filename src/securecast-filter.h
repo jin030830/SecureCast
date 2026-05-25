@@ -79,11 +79,16 @@ struct MaskPayload {
 
 #ifdef _WIN32
 // 창이 사라진 후 ring buffer에 남은 N프레임 동안 마스킹을 유지하는 잔영 항목.
+// fromPreview: 작업표시줄 hover/peek 가드(마우스가 작업표시줄→썸네일 영역으로
+//   이동 시 발동)로 등록된 항목. 렌더 시 minimize cutoff(endNs) 대신
+//   filter->previewActiveNs로 slot.timestamp 컷오프 — peek이 끝난 후 캡처된
+//   슬롯에는 그려지지 않아 빈 영역에 잔상 박스가 남지 않음.
 struct LingeringWindow {
   TrackedWindow window; // 마지막으로 알려진 창 정보 (bounds 포함)
   int ticksRemaining;   // SC_RING_BUFFER_SLOTS에서 매 tick 카운트다운
+  bool fromPreview;     // taskbar 미리보기 가드용 (cutoff 분기)
 };
-constexpr int SC_MAX_LINGERING = SC_MAX_TRACKED_WINDOWS;
+constexpr int SC_MAX_LINGERING = SC_MAX_TRACKED_WINDOWS * 2;
 #endif
 
 // ----------------------------------------------------
@@ -243,6 +248,18 @@ struct SecureCastFilter {
                                             // (새 창 소급 보정 비교용)
   LingeringWindow lingeringWindows[SC_MAX_LINGERING]{};
   int lingeringCount = 0;
+  // 작업표시줄 hover 미리보기가 마지막으로 보였던 OBS 시각(나노초).
+  // fromPreview=true lingering의 컷오프 기준 — slot.timestamp가 이 값보다
+  // 크면(=preview가 끝난 뒤 캡처된 프레임) 그리지 않아 잔상 방지.
+  uint64_t previewActiveNs = 0;
+  // 마지막으로 마우스가 썸네일 영역(작업표시줄 바로 위 ~400px 띠) 위에
+  // 있었던 시각. peek 트리거 hysteresis용. mouse off 시에도 잠시 active 유지해
+  // 부드러운 전환.
+  uint64_t lastInThumbnailZoneTick = 0;
+  // 마지막으로 마우스가 작업표시줄 본체에 있었던 시각. peek 트리거의 사전조건:
+  // 썸네일이 실제로 떠 있다는 것은 직전에 마우스가 작업표시줄에 있었다는 뜻.
+  // 이 없이 zone만으로 판정하면 단순히 화면 하단을 지나가도 발동돼버림.
+  uint64_t lastOverTaskbarTick = 0;
 
   // ----- [Game Mode] CPU 사용률 기반 자동 전환 -----
   float cpuSampleAccumulator = 0.0f; // 1초 샘플링 누산기
