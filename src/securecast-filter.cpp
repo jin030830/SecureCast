@@ -152,11 +152,16 @@ static float sampleCpuUsage(FILETIME *prevIdle, FILETIME *prevKernel,
 //   4. 15% BBox 팽창 후 소스 경계로 clamp
 // ================================================================
 #ifdef _WIN32
-static BlurRect tracked_window_to_blur_rect(const TrackedWindow &tw,
-                                            uint32_t src_w, uint32_t src_h) {
+// 모니터 절대좌표의 단일 RECT를 OBS 소스 픽셀 좌표의 BlurRect로 변환.
+// `anchor`는 모니터 정보 조회용(보통 창 전체 bounds — visible sub-rect를 그대로
+// 넘기면 작은 sub-rect 하나가 두 모니터에 걸친 경우 정확히 잡지 못할 수 있다).
+// `expand`가 true면 비대칭 BBox 팽창을 적용(빠른 창 이동 시 trailing edge 커버용).
+// false면 입력 좌표 그대로 변환 — z-order 차감 결과처럼 앞 창과 정확히 경계가
+// 맞는 사각형에 사용. 팽창을 적용하면 앞 창 영역으로 새어들 수 있다.
+static BlurRect rect_to_blur_rect(const RECT &monitor_rect, const RECT &anchor,
+                                  uint32_t src_w, uint32_t src_h, bool expand) {
   BlurRect r{};
-  // MonitorFromRect을 사용해야 lingering window(이미 닫힌 hwnd)에도 동작한다.
-  HMONITOR hmon = MonitorFromRect(&tw.bounds, MONITOR_DEFAULTTONEAREST);
+  HMONITOR hmon = MonitorFromRect(&anchor, MONITOR_DEFAULTTONEAREST);
   if (!hmon)
     return r;
 
@@ -173,23 +178,61 @@ static BlurRect tracked_window_to_blur_rect(const TrackedWindow &tw,
   float sx = (float)src_w / mon_w;
   float sy = (float)src_h / mon_h;
 
-  int x = (int)((tw.bounds.left - mi.rcMonitor.left) * sx);
-  int y = (int)((tw.bounds.top - mi.rcMonitor.top) * sy);
-  int bw = (int)((tw.bounds.right - tw.bounds.left) * sx);
-  int bh = (int)((tw.bounds.bottom - tw.bounds.top) * sy);
+  int x = (int)((monitor_rect.left - mi.rcMonitor.left) * sx);
+  int y = (int)((monitor_rect.top - mi.rcMonitor.top) * sy);
+  int bw = (int)((monitor_rect.right - monitor_rect.left) * sx);
+  int bh = (int)((monitor_rect.bottom - monitor_rect.top) * sy);
 
-  // 비대칭 BBox 팽창 — 위쪽(타이틀바 위)은 최소, 좌/우/아래는 빠른 이동 여유
-  // 포함. 위: 1%  / 좌우: 5% (이동 시 trailing edge 커버) / 아래: 3%
-  int exp_top = (int)(bh * 0.01f);
-  int exp_sides = (int)(bw * 0.025f);
-  int exp_bottom = (int)(bh * 0.015f);
-  x = std::max(0, x - exp_sides);
-  y = std::max(0, y - exp_top);
-  bw = std::min((int)src_w - x, bw + exp_sides * 2);
-  bh = std::min((int)src_h - y, bh + exp_top + exp_bottom);
+  if (expand) {
+    // 비대칭 BBox 팽창 — 위쪽(타이틀바 위)은 최소, 좌/우/아래는 빠른 이동 여유
+    // 포함. 위: 1% / 좌우: 2.5% / 아래: 1.5%
+    int exp_top = (int)(bh * 0.01f);
+    int exp_sides = (int)(bw * 0.025f);
+    int exp_bottom = (int)(bh * 0.015f);
+    x = std::max(0, x - exp_sides);
+    y = std::max(0, y - exp_top);
+    bw = std::min((int)src_w - x, bw + exp_sides * 2);
+    bh = std::min((int)src_h - y, bh + exp_top + exp_bottom);
+  } else {
+    // 클램프만.
+    if (x < 0) { bw += x; x = 0; }
+    if (y < 0) { bh += y; y = 0; }
+    bw = std::min(bw, (int)src_w - x);
+    bh = std::min(bh, (int)src_h - y);
+  }
 
   r = {x, y, bw, bh, 0}; // type 0 = Blur (Blackout과 시각적으로 구분 가능)
   return r;
+}
+
+// TrackedWindow의 visibleRects(z-order 차감 후 노출된 부분들)를 BlurRect 배열로
+// 변환해 out에 채워 반환. visibleCount == 0이면 전체 bounds를 1개로 폴백(레거시
+// 호환 — visible 계산이 안 된 경로용).
+// visibleRects 경로는 팽창 OFF — 차감 결과는 앞 창과 정확히 경계가 맞으므로
+// 팽창하면 앞 창 영역으로 새어들어 같이 블러된다.
+// 폴백(전체 bounds) 경로는 팽창 ON — 추적 지연 보완.
+// 반환값: out에 채운 BlurRect 개수.
+static int tracked_window_to_blur_rects(const TrackedWindow &tw, uint32_t src_w,
+                                        uint32_t src_h, BlurRect *out,
+                                        int max_out) {
+  if (max_out <= 0)
+    return 0;
+  int count = 0;
+  if (tw.visibleCount > 0) {
+    const int n = (tw.visibleCount < max_out) ? tw.visibleCount : max_out;
+    for (int i = 0; i < n; ++i) {
+      BlurRect br = rect_to_blur_rect(tw.visibleRects[i], tw.bounds, src_w,
+                                       src_h, /*expand=*/false);
+      if (br.width > 0 && br.height > 0)
+        out[count++] = br;
+    }
+  } else {
+    BlurRect br = rect_to_blur_rect(tw.bounds, tw.bounds, src_w, src_h,
+                                     /*expand=*/true);
+    if (br.width > 0 && br.height > 0)
+      out[count++] = br;
+  }
+  return count;
 }
 #endif
 
@@ -1174,17 +1217,24 @@ static void ocr_worker_loop(SecureCastFilter *filter) {
           int32_t monL, monT;
         };
         std::vector<SrcRect> srcRects;
-        srcRects.reserve(windowSnapshot.count);
+        srcRects.reserve(static_cast<size_t>(windowSnapshot.count) *
+                         SC_MAX_VISIBLE_SUBRECTS);
         for (int i = 0; i < windowSnapshot.count; ++i) {
-          BlurRect br = tracked_window_to_blur_rect(
-              windowSnapshot.items[i], static_cast<uint32_t>(width),
-              static_cast<uint32_t>(height));
-          if (br.width > 0 && br.height > 0) {
+          const TrackedWindow &tw = windowSnapshot.items[i];
+          // visibleRects 각각을 별도 SrcRect로 등록 — PII 박스가 가려진 부분에
+          // 있으면 그 박스의 owner는 카톡이 아니라 위 앞 창이므로 매칭 안 시킴.
+          // monL/monT(트래커 anchor)는 전체 bounds 원점으로 통일해 창 이동 시
+          // 트래커 좌표 보정이 깨지지 않게 한다.
+          BlurRect brs[SC_MAX_VISIBLE_SUBRECTS];
+          int n = tracked_window_to_blur_rects(tw, static_cast<uint32_t>(width),
+                                               static_cast<uint32_t>(height),
+                                               brs, SC_MAX_VISIBLE_SUBRECTS);
+          for (int k = 0; k < n; ++k) {
+            const BlurRect &br = brs[k];
             srcRects.push_back(
-                {br.x, br.y, br.x + br.width, br.y + br.height,
-                 windowSnapshot.items[i].hwnd,
-                 static_cast<int32_t>(windowSnapshot.items[i].bounds.left),
-                 static_cast<int32_t>(windowSnapshot.items[i].bounds.top)});
+                {br.x, br.y, br.x + br.width, br.y + br.height, tw.hwnd,
+                 static_cast<int32_t>(tw.bounds.left),
+                 static_cast<int32_t>(tw.bounds.top)});
           }
         }
         for (size_t b = 0; b < vtBoxes.size(); ++b) {
@@ -2034,24 +2084,29 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
   // --- 마스킹 오버레이 ---
   // Role A: outputSlot->windowSnapshot (프레임 캡처 시점의 창 위치 → 프레임과
   // 동기화됨)
-  // [Fix #3-D] capacity: manualBlur(32) + windowSnapshot×2(32)
-  //            + lingering(16) + trackers(8) + notif/여유(8) = 128 (여유 확보)
+  // capacity: 각 TrackedWindow가 visible 차감으로 최대 SC_MAX_VISIBLE_SUBRECTS개
+  //           서브 사각형으로 쪼개질 수 있으므로 windowSnapshot×2와 lingering에
+  //           sub-rect 계수를 곱한다.
   // MAX_TRACKERS는 VisualTrackerManager 클래스 static 상수이므로
   // securecast-filter.cpp에서는 직접 사용 불가. 실제 값(8)을 리터럴로 대체.
   static constexpr int kMaxTrackerSlots = 8;
-  BlurRect all_rects[SC_MAX_BLUR_RECTS * 2 + SC_MAX_TRACKED_WINDOWS * 2 +
-                     SC_MAX_LINGERING + kMaxTrackerSlots + 8];
+  BlurRect all_rects[SC_MAX_BLUR_RECTS * 2 +
+                     SC_MAX_TRACKED_WINDOWS * SC_MAX_VISIBLE_SUBRECTS * 2 +
+                     SC_MAX_LINGERING * SC_MAX_VISIBLE_SUBRECTS +
+                     kMaxTrackerSlots + 8];
+  const int kAllRectsCap =
+      static_cast<int>(sizeof(all_rects) / sizeof(all_rects[0]));
   int all_count = 0;
 
 #ifdef _WIN32
   // N프레임 전 스냅샷 (현재 렌더링 중인 지연 프레임과 동기화)
   for (int i = 0; i < outputSlot->windowSnapshot.count &&
-                  all_count < (int)(sizeof(all_rects) / sizeof(all_rects[0]));
+                  all_count + SC_MAX_VISIBLE_SUBRECTS <= kAllRectsCap;
        i++) {
-    BlurRect r =
-        tracked_window_to_blur_rect(outputSlot->windowSnapshot.items[i], w, h);
-    if (r.width > 0 && r.height > 0)
-      all_rects[all_count++] = r;
+    int n = tracked_window_to_blur_rects(outputSlot->windowSnapshot.items[i], w,
+                                         h, &all_rects[all_count],
+                                         SC_MAX_VISIBLE_SUBRECTS);
+    all_count += n;
   }
   // N-1프레임 전 스냅샷 합집합: 한 프레임 이동 궤적 전체를 마스킹 (빠른 드래그
   // 노출 방지)
@@ -2059,26 +2114,25 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
     const FrameRingBuffer::Slot *slotN1 =
         filter->ringBuffer.peekSlotAtOffset(SC_RING_BUFFER_SLOTS - 1);
     if (slotN1) {
-      for (int i = 0;
-           i < slotN1->windowSnapshot.count &&
-           all_count < (int)(sizeof(all_rects) / sizeof(all_rects[0]));
+      for (int i = 0; i < slotN1->windowSnapshot.count &&
+                      all_count + SC_MAX_VISIBLE_SUBRECTS <= kAllRectsCap;
            i++) {
-        BlurRect r =
-            tracked_window_to_blur_rect(slotN1->windowSnapshot.items[i], w, h);
-        if (r.width > 0 && r.height > 0)
-          all_rects[all_count++] = r;
+        int n = tracked_window_to_blur_rects(slotN1->windowSnapshot.items[i], w,
+                                             h, &all_rects[all_count],
+                                             SC_MAX_VISIBLE_SUBRECTS);
+        all_count += n;
       }
     }
   }
   // Lingering rects: 사라진 창의 N프레임 잔영 (ring buffer에 남은 과거 프레임
   // 커버)
   for (int li = 0; li < filter->lingeringCount &&
-                   all_count < (int)(sizeof(all_rects) / sizeof(all_rects[0]));
+                   all_count + SC_MAX_VISIBLE_SUBRECTS <= kAllRectsCap;
        ++li) {
-    BlurRect r =
-        tracked_window_to_blur_rect(filter->lingeringWindows[li].window, w, h);
-    if (r.width > 0 && r.height > 0)
-      all_rects[all_count++] = r;
+    int n = tracked_window_to_blur_rects(filter->lingeringWindows[li].window, w,
+                                         h, &all_rects[all_count],
+                                         SC_MAX_VISIBLE_SUBRECTS);
+    all_count += n;
   }
 #endif
   // OCR 박스 — Visual Tracker가 제공하는 NCC 추적 위치
@@ -2429,26 +2483,27 @@ static void securecast_video_tick(void *data, float seconds) {
   // (boxes_for_output_snapshot).
 
   // [Role D] windowList 스캔 결과를 blacklistMask에 반영 (video_render에서
-  // 최우선 차단에 사용)
+  // 최우선 차단에 사용). 각 창의 visibleRects(앞 창에 가려진 부분 제외)만
+  // 마스크로 넘긴다 — 앞 창이 대부분 가린 상태에서 노출된 띠도 정확히 블러.
   {
     std::lock_guard<std::mutex> lock(filter->blacklistMutex);
-    filter->blacklistMask.rectCount =
-        (filter->windowList.count > SC_MAX_BLUR_RECTS)
-            ? SC_MAX_BLUR_RECTS
-            : filter->windowList.count;
-    for (int i = 0; i < filter->blacklistMask.rectCount; ++i) {
-      filter->blacklistMask.rects[i] = {
-          (int)filter->windowList.items[i].bounds.left,
-          (int)filter->windowList.items[i].bounds.top,
-          (int)(filter->windowList.items[i].bounds.right -
-                filter->windowList.items[i].bounds.left),
-          (int)(filter->windowList.items[i].bounds.bottom -
-                filter->windowList.items[i].bounds.top),
-          0};
+    int outCount = 0;
+    for (int i = 0;
+         i < filter->windowList.count && outCount < SC_MAX_BLUR_RECTS; ++i) {
+      const TrackedWindow &tw = filter->windowList.items[i];
+      const int n = (tw.visibleCount > 0) ? tw.visibleCount : 1;
+      for (int v = 0; v < n && outCount < SC_MAX_BLUR_RECTS; ++v) {
+        const RECT &r = (tw.visibleCount > 0) ? tw.visibleRects[v] : tw.bounds;
+        filter->blacklistMask.rects[outCount++] = {
+            (int)r.left, (int)r.top, (int)(r.right - r.left),
+            (int)(r.bottom - r.top), 0};
+      }
     }
+    filter->blacklistMask.rectCount = outCount;
     if (filter->windowList.count > 0 && filter->logScanThrottle++ % 10 == 0)
-      blog(LOG_INFO, "[SecureCast] %d blacklisted windows in blacklistMask.",
-           filter->windowList.count);
+      blog(LOG_INFO,
+           "[SecureCast] %d blacklisted windows → %d visible rects in blacklistMask.",
+           filter->windowList.count, outCount);
   }
 
   // recentlySeenList 유지: windowList 항목을 upsert, 완전히 닫힌 HWND 제거.

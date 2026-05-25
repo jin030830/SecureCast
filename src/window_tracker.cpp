@@ -104,33 +104,136 @@ bool is_task_switcher_window(HWND hwnd)
 	return false;
 }
 
-// 창이 다른 앱에 완전히 가려져 있는지 확인 (뒤로 보내기 감지).
-// 중앙 1점이 아니라 5점(중앙 + 4코너 25% 안쪽)을 샘플링해,
-// 하나라도 hwnd가 최상위이면 true 반환.
-// 완전히 다른 앱에 덮여야(5점 모두 다른 창) 추적 해제.
-bool is_window_top_at_center(HWND hwnd, const RECT &rect)
+// 차집합 알고리즘 작업 버퍼 크기. 차감을 거듭하면 이론상 4^N까지 늘 수 있으나
+// 실제 데스크탑 시나리오에서는 대부분 16 이내. 64면 5~6개 앞 창이 복잡하게
+// 겹쳐도 안전하게 표현 가능.
+constexpr int VISIBILITY_WORK_CAP = 64;
+
+// 사각형 A에서 사각형 B를 뺀 결과를 out에 최대 maxOut개까지 채워 반환.
+// 결과는 최대 4개의 disjoint 사각형 (top / bottom 띠 + left / right 가운데 띠).
+// 반환값: 채운 개수. 교차 없으면 A를 그대로 1개 반환. B가 A를 완전 덮으면 0.
+int rect_subtract(const RECT &A, const RECT &B, RECT *out, int maxOut)
 {
-	const LONG w4 = (rect.right  - rect.left) / 4;
-	const LONG h4 = (rect.bottom - rect.top)  / 4;
-	const POINT samples[5] = {
-		{ (rect.left + rect.right) / 2,  (rect.top + rect.bottom) / 2 }, // center
-		{ rect.left  + w4,               rect.top  + h4               }, // top-left
-		{ rect.right - w4,               rect.top  + h4               }, // top-right
-		{ rect.left  + w4,               rect.bottom - h4             }, // bottom-left
-		{ rect.right - w4,               rect.bottom - h4             }, // bottom-right
-	};
-	for (const POINT &pt : samples) {
-		HWND topAt = WindowFromPoint(pt);
-		if (!topAt)
-			return true;
-		HWND topRoot = GetAncestor(topAt, GA_ROOT);
-		if (topRoot == hwnd)
-			return true;
-		if (is_task_switcher_window(topRoot))
-			return true;
+	RECT I;
+	I.left   = (A.left   > B.left)   ? A.left   : B.left;
+	I.top    = (A.top    > B.top)    ? A.top    : B.top;
+	I.right  = (A.right  < B.right)  ? A.right  : B.right;
+	I.bottom = (A.bottom < B.bottom) ? A.bottom : B.bottom;
+	if (I.left >= I.right || I.top >= I.bottom) {
+		if (maxOut < 1)
+			return 0;
+		out[0] = A;
+		return 1;
 	}
-	return false; // 5개 샘플점 모두 다른 앱에 가려짐 → 뒤로 보내기로 간주
+	int n = 0;
+	if (A.top    < I.top    && n < maxOut) out[n++] = {A.left, A.top,    A.right, I.top};
+	if (A.bottom > I.bottom && n < maxOut) out[n++] = {A.left, I.bottom, A.right, A.bottom};
+	if (A.left   < I.left   && n < maxOut) out[n++] = {A.left,  I.top,   I.left,  I.bottom};
+	if (A.right  > I.right  && n < maxOut) out[n++] = {I.right, I.top,   A.right, I.bottom};
+	return n;
 }
+
+// rects[]의 bounding box를 단일 사각형으로 반환 (union 폴백용).
+RECT rect_union_all(const RECT *rects, int n)
+{
+	RECT u = rects[0];
+	for (int i = 1; i < n; ++i) {
+		if (rects[i].left   < u.left)   u.left   = rects[i].left;
+		if (rects[i].top    < u.top)    u.top    = rects[i].top;
+		if (rects[i].right  > u.right)  u.right  = rects[i].right;
+		if (rects[i].bottom > u.bottom) u.bottom = rects[i].bottom;
+	}
+	return u;
+}
+
+} // namespace
+
+// =============================================================================
+// sc_compute_visible_subrects
+//
+// target의 bounds에서, target보다 z-order가 위인 모든 top-level 창의 rect를
+// 차례로 빼서, 화면에 실제로 노출된 disjoint 사각형들을 구한다.
+//
+// 핵심:
+//   - GetWindow(w, GW_HWNDPREV)는 z-order에서 한 칸 "위"의 형제 창을 반환.
+//     top-level 창들은 desktop의 형제이므로, target에서 GW_HWNDPREV로 거슬러
+//     올라가며 nullptr를 만날 때까지 순회하면 위에 있는 모든 top-level 창을 enum.
+//   - WindowFromPoint 5점 샘플링보다 훨씬 정확. 작은 가시 영역(가장자리 띠)도
+//     올바르게 산출되어 그 영역만 블러할 수 있다.
+//   - Task switcher / Alt+Tab 같은 일시적 전환 UI는 차감에서 제외 — 전환 중에도
+//     아래 민감 앱이 가려진 것으로 간주하면 마스킹이 잠시 사라져 노출 발생.
+// =============================================================================
+extern "C" int sc_compute_visible_subrects(HWND target, RECT target_bounds,
+                                            RECT *out, int maxOut)
+{
+	if (!out || maxOut <= 0)
+		return 0;
+	if (target_bounds.right <= target_bounds.left ||
+	    target_bounds.bottom <= target_bounds.top)
+		return 0;
+
+	RECT working[VISIBILITY_WORK_CAP];
+	int wc = 0;
+	working[wc++] = target_bounds;
+
+	for (HWND w = GetWindow(target, GW_HWNDPREV); w != nullptr;
+	     w = GetWindow(w, GW_HWNDPREV)) {
+		if (!IsWindowVisible(w))
+			continue;
+		HWND wroot = GetAncestor(w, GA_ROOT);
+		if (wroot == target)
+			continue; // target 자신은 스킵
+		// Alt+Tab/Task View는 전환 중 일시적 — 가린 것으로 보지 않음.
+		if (is_task_switcher_window(wroot))
+			continue;
+
+		RECT cov{};
+		if (FAILED(DwmGetWindowAttribute(w, DWMWA_EXTENDED_FRAME_BOUNDS,
+		                                  &cov, sizeof(cov)))) {
+			if (!GetWindowRect(w, &cov))
+				continue;
+		}
+		// 너무 작은 창(툴팁/인디케이터)은 차감 안 함 — 사용자 인식상 "가린" 게
+		// 아니므로 마스킹 유지가 더 안전.
+		if (cov.right - cov.left < 8 || cov.bottom - cov.top < 8)
+			continue;
+
+		RECT next[VISIBILITY_WORK_CAP];
+		int nc = 0;
+		bool overflow = false;
+		for (int i = 0; i < wc; ++i) {
+			if (nc + 4 > VISIBILITY_WORK_CAP) {
+				overflow = true;
+				break;
+			}
+			nc += rect_subtract(working[i], cov, &next[nc],
+			                     VISIBILITY_WORK_CAP - nc);
+		}
+		if (overflow) {
+			// 폴백: 현재 작업 사각형들을 한 박스로 union해서 다음 차감 계속.
+			// 시각적 정밀도는 떨어지지만 노출 누락은 없음.
+			RECT u = rect_union_all(working, wc);
+			wc = rect_subtract(u, cov, working, VISIBILITY_WORK_CAP);
+		} else {
+			for (int i = 0; i < nc; ++i)
+				working[i] = next[i];
+			wc = nc;
+		}
+		if (wc == 0)
+			return 0;
+	}
+
+	// maxOut을 초과하면 union 폴백으로 단일 사각형 반환.
+	if (wc > maxOut) {
+		out[0] = rect_union_all(working, wc);
+		return 1;
+	}
+	for (int i = 0; i < wc; ++i)
+		out[i] = working[i];
+	return wc;
+}
+
+namespace {
 
 // EnumWindows의 콜백. 시스템의 모든 최상위 윈도우에 대해 한 번씩 호출됨.
 // 반환:
@@ -187,15 +290,23 @@ BOOL CALLBACK enum_proc(HWND hwnd, LPARAM lparam)
 	if (!is_blacklisted(exe_name))
 		return TRUE;
 
-	// Z-order: 창 중앙이 다른 앱에 가려져 있으면 (뒤로 보내기 상태) 추적 대상 제외.
-	// 카톡이 OBS 뒤로 가도 IsWindowVisible=true라 이 체크 없이는 계속 추적된다.
-	if (!is_window_top_at_center(hwnd, rect))
+	// Z-order: z-order 위 창들로 잘라낸 실제 가시영역을 산출.
+	// 완전히 가려져 있으면(visible == 0) 추적 대상 제외.
+	// 일부만 가려져 있으면 그 띠/패치만 visibleRects에 담는다 — 다운스트림 렌더는
+	// 이를 순회해 노출된 부분만 블러한다.
+	RECT visRects[SC_MAX_VISIBLE_SUBRECTS];
+	int visCount = sc_compute_visible_subrects(hwnd, rect, visRects,
+	                                            SC_MAX_VISIBLE_SUBRECTS);
+	if (visCount == 0)
 		return TRUE;
 
 	// 매칭 성공 → out 슬롯에 정보 복사.
 	auto &slot = out->items[out->count++];
 	slot.hwnd = hwnd;
 	slot.bounds = rect;
+	slot.visibleCount = visCount;
+	for (int v = 0; v < visCount; ++v)
+		slot.visibleRects[v] = visRects[v];
 	for (size_t i = 0; i < sizeof(slot.exe_name) / sizeof(slot.exe_name[0]); ++i) {
 		slot.exe_name[i] = exe_name[i];
 		if (!exe_name[i])
@@ -227,12 +338,19 @@ extern "C" void sc_update_tracked_bounds(TrackedWindowList *list)
 		                                    &rect, sizeof(rect))))
 			list->items[i].bounds = rect;
 
-		// 다른 앱 창이 앞으로 와서 이 창을 가리면 즉시 추적 해제.
-		// 뒤로 보내기는 IsWindowVisible=true를 유지하므로 위의 체크만으로는 감지 불가.
-		if (!is_window_top_at_center(hwnd, list->items[i].bounds)) {
+		// z-order 위 창들로 잘라낸 가시영역을 매 프레임 재계산.
+		// 완전히 가려져 있으면(0개) 즉시 추적 해제 — 뒤로 보내기/다른 앱 덮음 둘 다 커버.
+		RECT visRects[SC_MAX_VISIBLE_SUBRECTS];
+		int visCount = sc_compute_visible_subrects(hwnd, list->items[i].bounds,
+		                                            visRects,
+		                                            SC_MAX_VISIBLE_SUBRECTS);
+		if (visCount == 0) {
 			list->items[i] = list->items[--list->count];
 			continue;
 		}
+		list->items[i].visibleCount = visCount;
+		for (int v = 0; v < visCount; ++v)
+			list->items[i].visibleRects[v] = visRects[v];
 	}
 }
 
@@ -284,6 +402,9 @@ static BOOL CALLBACK enum_all_proc(HWND hwnd, LPARAM lparam)
 	item.hwnd = hwnd;
 	item.bounds = bounds;
 	item.exe_name[0] = L'\0'; // owner 매칭에 불필요
+	// allWindows는 owner 매칭(bounds 사용)에만 쓰여 visible 계산이 불필요.
+	// 다만 struct 멤버가 unset이면 후속 코드가 잘못 읽을 수 있어 zero-init.
+	item.visibleCount = 0;
 	return TRUE;
 }
 

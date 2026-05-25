@@ -26,15 +26,28 @@
 extern "C" {
 #endif
 
+// 한 창의 가시영역(visible sub-rectangles)을 표현할 수 있는 최대 슬롯 수.
+// 단일 차감이면 최대 4개(top/bottom/left/right 띠)면 충분하지만, 작업표시줄,
+// 시스템 알림, 트레이 등 z-order 위 다른 창들이 누적 차감되면 분할이 더 잘게
+// 쪼개진다. 16이면 일반 데스크탑 환경(2~3개 앞 창)까지 안전하게 표현 가능.
+// 16을 초과하면 union 폴백으로 bounding box 1개 반환 (과블러).
+#define SC_MAX_VISIBLE_SUBRECTS 16
+
 // 블랙리스트 매칭에 성공한 창 1개의 정보.
-// hwnd       : Win32 윈도우 핸들 (이후 EnumChildWindows로 자식 탐색 시 사용)
-// exe_name   : 실행 파일 베이스네임 (예: "KakaoTalk.exe") — 디버그/로그용
-// bounds     : DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS) 로 얻은 화면 좌표.
-//              GetWindowRect와 달리 윈도우 그림자/DPI 보정값을 제외한 "보이는" 영역.
+// hwnd          : Win32 윈도우 핸들 (이후 EnumChildWindows로 자식 탐색 시 사용)
+// exe_name      : 실행 파일 베이스네임 (예: "KakaoTalk.exe") — 디버그/로그용
+// bounds        : DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS) 로 얻은 화면 좌표.
+//                 GetWindowRect와 달리 윈도우 그림자/DPI 보정값을 제외한 "보이는" 영역.
+// visibleRects  : 앞 창(z-order 위)들에 가려진 영역을 뺀 실제 화면에 노출된 사각형들.
+//                 visibleCount == 0 이면 완전히 가려진 상태(슬롯에서 제거 대상).
+//                 1 이상이면 그 N개 사각형만 블러하면 시각적으로 정확.
+// visibleCount  : visibleRects의 유효 개수.
 struct TrackedWindow {
 	HWND hwnd;
 	wchar_t exe_name[64];
 	RECT bounds;
+	RECT visibleRects[SC_MAX_VISIBLE_SUBRECTS];
+	int visibleCount;
 };
 
 // 한 번의 스캔에서 잡힐 수 있는 최대 창 개수.
@@ -60,6 +73,16 @@ void sc_scan_blacklisted_windows(TrackedWindowList *out);
 // 첫 contains를 우선해 z-order 최상단 선택.
 // 호출자는 video_render(렌더 스레드)에서만 호출할 것 — Win32 DWM 의존.
 void sc_enum_all_visible_windows(TrackedWindowList *out);
+
+// `target` 창의 bounds를 z-order 위의 다른 top-level 창들로 잘라서 실제
+// 화면에 노출된 disjoint 사각형들을 out에 채워 반환한다.
+// 반환값: out에 채워진 사각형 개수 (0 = 완전히 가려짐).
+// maxOut 슬롯이 부족할 만큼 잘게 쪼개지면 안전한 폴백으로 잔여 사각형들의
+// union(bounding box)을 1개 사각형으로 반환한다 — 시각적으로 약간 과블러될 수
+// 있으나 노출 누락은 발생하지 않는다.
+// 호출자는 video_tick / video_render 컨텍스트에서만 호출할 것.
+int sc_compute_visible_subrects(HWND target, RECT target_bounds, RECT *out,
+                                int maxOut);
 
 // Fast-path 좌표 갱신: 이미 list에 들어있는 HWND들에 대해 DWM으로 bounds만 재조회.
 // EnumWindows / OpenProcess 없이 DWM query만 수행하므로 매 프레임 호출 가능.
