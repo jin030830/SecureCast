@@ -74,6 +74,46 @@ void sc_scan_blacklisted_windows(TrackedWindowList *out);
 // 호출자는 video_render(렌더 스레드)에서만 호출할 것 — Win32 DWM 의존.
 void sc_enum_all_visible_windows(TrackedWindowList *out);
 
+// ============================================================
+// 최소화 애니메이션 가드 (Role A 부속)
+//
+// 창을 최소화할 때 ~200~300ms의 shrink 애니메이션이 일어나는 동안 DWM
+// bounds가 축소되어 블러 박스가 함께 줄어들고, OCR 트래커 박스는 원래
+// 위치에 고정돼 텍스트 가장자리가 잠깐 노출되는 현상을 막기 위한 모듈.
+//
+// 동작: SetWinEventHook으로 EVENT_SYSTEM_MINIMIZESTART/END를 받아,
+// 최소화 직전 bounds를 캡처해 글로벌 맵에 보관한다. filter는 매 fast
+// 업데이트마다 sc_poll_minimizing_windows로 이벤트를 폴링해 해당 HWND에
+// pre-bounds 기반 lingering 블러를 등록.
+//
+// init/shutdown은 refcount 기반 — 여러 filter 인스턴스가 동시에 사용 가능.
+// ============================================================
+struct ScMinimizingEntry {
+	HWND hwnd;
+	RECT preBounds;
+	// MINIMIZEEND가 발화된 시각 (os_gettime_ns 기준 나노초). 0이면 아직
+	// 애니메이션 진행 중. > 0이면 종료된 상태 — lingering은 slot.timestamp가
+	// 이 값보다 큰(=종료 이후 캡처) 프레임에는 적용하지 말아야 잔상이 사라진다.
+	uint64_t endNs;
+};
+
+// 글로벌 훅을 획득/해제. filter create/destroy에서 1:1로 호출.
+void sc_minimize_tracker_init();
+void sc_minimize_tracker_shutdown();
+
+// 현재 활성화된 minimize 이벤트(최근 maxAgeMs 이내)를 out에 채워 반환.
+// 반환값: out에 채운 개수. 호출이 entry를 제거하지는 않으므로 매 프레임
+// 호출해 lingering을 refresh할 수 있다. ageMs 초과 entry는 자동 evict.
+// MINIMIZEEND 발화된 entry도 short grace period 동안 함께 반환되어 호출자가
+// cutoff 처리에 사용할 수 있다.
+int sc_poll_minimizing_windows(ScMinimizingEntry *out, int maxOut,
+                                uint64_t maxAgeMs);
+
+// 주어진 HWND에 대해 마지막으로 관측된 MINIMIZEEND의 OBS 시각(나노초).
+// 발화되지 않았거나 grace period가 지나 evict됐으면 0 반환. lingering 렌더
+// 루프에서 slot.timestamp와 비교해 ghost blur를 잘라내는 데 사용.
+uint64_t sc_get_minimize_end_ns(HWND hwnd);
+
 // `target` 창의 bounds를 z-order 위의 다른 top-level 창들로 잘라서 실제
 // 화면에 노출된 disjoint 사각형들을 out에 채워 반환한다.
 // 반환값: out에 채워진 사각형 개수 (0 = 완전히 가려짐).

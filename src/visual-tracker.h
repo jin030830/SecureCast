@@ -106,6 +106,11 @@ public:
   // 렌더 스레드에서 현재 블러 좌표 조회 (복사 반환)
   std::vector<VtOcrBox> active_boxes() const;
 
+  // 현재 활성 트래커들이 가지고 있는 owner HWND들의 unique 셋(void* 형태).
+  // 최소화 가드에서 비-블랙리스트 owner 창도 lingering 등록 대상에 포함시키기
+  // 위해 사용. 트래커가 없거나 모두 owner=nullptr면 빈 벡터 반환.
+  std::vector<void *> active_owner_windows() const;
+
   // [Window anchor] 송출 프레임 동기화 버전. 트래커의 ownerWin이 output_snapshot
   // 안에 있으면, OCR 등록 시점 창 위치(refWindow)와 현재 송출 슬롯 창 위치의
   // delta를 모니터→소스 좌표로 환산해 refX/refY에 더해 반환. owner 없는 트래커는

@@ -1170,6 +1170,32 @@ void VisualTrackerManager::clear() {
   nextId_ = 0;
 }
 
+std::vector<void *> VisualTrackerManager::active_owner_windows() const {
+  std::shared_lock<std::shared_mutex> lock(stateMtx_);
+  std::vector<void *> result;
+  result.reserve(trackers_.size());
+  for (const auto &tr : trackers_) {
+    if (!tr.ownerWin)
+      continue;
+    // ghost 게이트와 동일 조건으로 죽은 트래커 제외.
+    const bool nccDeadlyLost = tr.framesSinceMatch >= FRAMES_LOST &&
+                               tr.framesSinceOcrValidate >= STALE_OCR_FRAMES;
+    if (nccDeadlyLost)
+      continue;
+    // unique 보장 (트래커가 많지 않아 O(n^2)로 충분).
+    bool dup = false;
+    for (void *w : result) {
+      if (w == tr.ownerWin) {
+        dup = true;
+        break;
+      }
+    }
+    if (!dup)
+      result.push_back(tr.ownerWin);
+  }
+  return result;
+}
+
 // [Window anchor v4] pushFrame 직전 호출. 슬롯에 저장될 박스 좌표를 미리 계산.
 // owner 바인딩된 트래커: 현재 DWM bounds 조회 → refX + (curWindow - refWindow) * scale.
 //   ★ 이 경로로 좌표가 잡히면 NCC ghost-kill 게이트를 우회한다. 빠른 드래그 시

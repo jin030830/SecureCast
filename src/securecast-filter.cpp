@@ -1466,6 +1466,8 @@ static void *securecast_create(obs_data_t *settings, obs_source_t *context) {
   // CPU 샘플링 기준점 초기화 (첫 샘플에서 diff가 0이 되지 않도록)
   GetSystemTimes(&filter->prevIdleTime, &filter->prevKernelTime,
                  &filter->prevUserTime);
+  // 최소화 애니메이션 가드 — pre-minimize bounds 캡처용 시스템 훅 등록.
+  sc_minimize_tracker_init();
 #endif
 
   // Panic 핫키 등록 (Ctrl+Shift+F12 기본 바인딩)
@@ -1612,6 +1614,8 @@ static void securecast_destroy(void *data) {
   // [Role D] 오버레이 HUD 먼저 종료 (메시지 루프 스레드 join)
   filter->overlay.destroy();
   filter->winListener.stop();
+  // 최소화 가드 훅 refcount 감소 (마지막 filter면 실제 unhook).
+  sc_minimize_tracker_shutdown();
 #endif
 
   // OCR/Tracker 워커 먼저 중지 (trackerMgr·ring buffer 해제 전 race 방지)
@@ -1874,6 +1878,73 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
       register_lingering_window(filter, before.items[i]);
   }
   filter->captureWindowList = filter->windowList;
+
+  // [최소화 가드] EVENT_SYSTEM_MINIMIZESTART로 캡처된 pre-bounds를 lingering에
+  // 강제 등록. 애니메이션 동안 DWM bounds가 줄어들거나 트래커 박스가 원래
+  // 위치에 고정돼 텍스트 가장자리가 노출되는 현상을 막는다.
+  //
+  // 대상: (1) 블랙리스트 windowList의 HWND, (2) trackerMgr의 OCR owner 창.
+  // 무관한 일반 창의 최소화 이벤트는 무시(불필요한 블러 방지).
+  // bounds 선택: 훅이 캡처한 pre-bounds와 filter가 직전 프레임에 가지고 있던
+  // `before` bounds 중 면적이 더 큰 것을 채택 — 훅 콜백 진입 시점에 이미
+  // animation이 시작돼 DWM bounds가 작아져 있을 수 있으므로 filter의 최신 캐시가
+  // 더 안전한 경우가 많음.
+  // ageMaxMs는 애니메이션(~300ms) + ring buffer 지연(~1s) + 여유. 매 프레임
+  // upsert로 TTL refresh, MINIMIZEEND/age 초과 시 evict.
+  {
+    constexpr int MAX_POLL = 16;
+    constexpr uint64_t kMaxAgeMs = 1500;
+    ScMinimizingEntry minz[MAX_POLL];
+    const int mn = sc_poll_minimizing_windows(minz, MAX_POLL, kMaxAgeMs);
+    if (mn > 0) {
+      const std::vector<void *> ownerWins =
+          filter->trackerMgr.active_owner_windows();
+      for (int i = 0; i < mn; ++i) {
+        HWND mh = minz[i].hwnd;
+        bool relevant = false;
+        RECT cached{};
+        bool hasCached = false;
+        // (1) 블랙리스트 — before(직전 프레임 bounds 보존).
+        for (int j = 0; j < before.count; ++j) {
+          if (before.items[j].hwnd == mh) {
+            relevant = true;
+            cached = before.items[j].bounds;
+            hasCached = true;
+            break;
+          }
+        }
+        // (2) OCR 트래커 owner.
+        if (!relevant) {
+          for (void *w : ownerWins) {
+            if (reinterpret_cast<HWND>(w) == mh) {
+              relevant = true;
+              break;
+            }
+          }
+        }
+        if (!relevant)
+          continue;
+
+        // 두 bounds 중 면적 큰 것 채택.
+        auto area = [](const RECT &r) -> long long {
+          long long w = r.right - r.left;
+          long long h = r.bottom - r.top;
+          return (w > 0 && h > 0) ? (w * h) : 0;
+        };
+        RECT pre = minz[i].preBounds;
+        if (hasCached && area(cached) > area(pre))
+          pre = cached;
+
+        TrackedWindow tw{};
+        tw.hwnd = mh;
+        tw.bounds = pre;
+        tw.visibleCount = 1;
+        tw.visibleRects[0] = pre;
+        tw.exe_name[0] = L'\0';
+        register_lingering_window(filter, tw);
+      }
+    }
+  }
 #else
   filter->ringBuffer.pushFrame(ts, filter->context, &trackerSnap,
                                filter->lastSubmittedOcrFrameId.load(std::memory_order_relaxed));
@@ -2125,10 +2196,18 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
     }
   }
   // Lingering rects: 사라진 창의 N프레임 잔영 (ring buffer에 남은 과거 프레임
-  // 커버)
+  // 커버).
+  // [최소화 잔상 컷오프] MINIMIZEEND가 발화된 창은 그 시각 이후에 캡처된 슬롯
+  // (= outputSlot.timestamp > endNs)에서는 lingering을 그리지 않는다. 종료 후
+  // ring buffer가 캡처한 프레임에는 실제로 창이 없으므로, 블러를 그리면 빈
+  // 영역 위에 잔상 박스만 남는다.
   for (int li = 0; li < filter->lingeringCount &&
                    all_count + SC_MAX_VISIBLE_SUBRECTS <= kAllRectsCap;
        ++li) {
+    const HWND lh = filter->lingeringWindows[li].window.hwnd;
+    const uint64_t endNs = sc_get_minimize_end_ns(lh);
+    if (endNs != 0 && outputSlot->timestamp > endNs)
+      continue;
     int n = tracked_window_to_blur_rects(filter->lingeringWindows[li].window, w,
                                          h, &all_rects[all_count],
                                          SC_MAX_VISIBLE_SUBRECTS);

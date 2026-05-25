@@ -22,11 +22,16 @@
 #include "plugin-support.h"   // obs_log
 
 #include <obs.h>
+#include <util/platform.h>    // os_gettime_ns
 
 #include <windows.h>
 #include <dwmapi.h>     // DwmGetWindowAttribute
 #include <psapi.h>      // QueryFullProcessImageNameW (psapi 또는 kernel32 양쪽 노출)
 #include <wctype.h>     // towlower
+
+#include <atomic>
+#include <mutex>
+#include <unordered_map>
 
 namespace {
 
@@ -447,4 +452,177 @@ extern "C" void sc_tracker_tick(float seconds, float *accumulator, TrackedWindow
 			w.bounds.left, w.bounds.top, w.bounds.right, w.bounds.bottom,
 			w.bounds.right - w.bounds.left, w.bounds.bottom - w.bounds.top);
 	}
+}
+
+// =============================================================================
+// 최소화 애니메이션 가드 — WinEvent 훅 구현
+//
+// SetWinEventHook(WINEVENT_OUTOFCONTEXT)은 별도 시스템 스레드에서 콜백을
+// 호출하므로 모든 글로벌 상태는 mutex로 보호한다. 콜백 진입 시점이 애니메이션
+// "직전"이므로 DwmGetWindowAttribute로 받는 bounds가 pre-minimize 좌표다.
+//
+// 여러 SecureCast filter 인스턴스가 동시에 살아있을 수 있으므로 init/shutdown은
+// atomic refcount 기반. ref 0→1로 올라갈 때만 SetWinEventHook, 1→0으로 내려갈
+// 때만 UnhookWinEvent.
+// =============================================================================
+namespace {
+
+struct MinimizeState {
+	uint64_t startTick;   // GetTickCount64 ms — age-based eviction
+	uint64_t endNs;       // os_gettime_ns at MINIMIZEEND. 0 = animation 진행 중.
+	uint64_t endTick;     // GetTickCount64 at MINIMIZEEND. grace-period 계산용.
+	RECT preBounds;
+};
+
+constexpr uint64_t kMinimizeEndGraceMs = 1500; // MINIMIZEEND 후 entry 유지 시간
+                                                // (ring buffer 지연 + 여유)
+
+std::mutex g_minimizeMutex;
+std::unordered_map<HWND, MinimizeState> g_minimizingWindows;
+HWINEVENTHOOK g_minimizeHook = nullptr;
+std::atomic<int> g_minimizeRefCount{0};
+
+// 콜백 시점에는 이미 minimize 애니메이션이 시작돼 DWM bounds가 mid-shrink일 수
+// 있다. 따라서 (1) DWM EXTENDED_FRAME_BOUNDS, (2) GetWindowRect,
+// (3) GetWindowPlacement.rcNormalPosition 세 값을 모두 받아 면적이 가장 큰 것을
+// pre-minimize bounds로 채택. 면적이 0/음수면 polling 시점에 filter가 caller
+// windowList에서 보강해주도록 빈 RECT로 등록(폴링 측에서 detection 가능).
+RECT pick_pre_minimize_bounds(HWND hwnd)
+{
+	RECT dwm{}, rc{}, normal{};
+	bool dwmOK = SUCCEEDED(DwmGetWindowAttribute(
+		hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &dwm, sizeof(dwm)));
+	bool rcOK = GetWindowRect(hwnd, &rc) != 0;
+
+	WINDOWPLACEMENT wp{};
+	wp.length = sizeof(wp);
+	bool wpOK = GetWindowPlacement(hwnd, &wp) != 0;
+	if (wpOK) {
+		// rcNormalPosition은 workspace(작업영역) 좌표 — 작업표시줄 등을 보정한
+		// 모니터 origin을 더해야 화면 좌표가 된다.
+		HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+		MONITORINFO mi{};
+		mi.cbSize = sizeof(mi);
+		if (mon && GetMonitorInfo(mon, &mi)) {
+			const LONG dx = mi.rcWork.left - mi.rcMonitor.left;
+			const LONG dy = mi.rcWork.top - mi.rcMonitor.top;
+			normal.left = wp.rcNormalPosition.left + mi.rcMonitor.left + dx;
+			normal.top = wp.rcNormalPosition.top + mi.rcMonitor.top + dy;
+			normal.right = wp.rcNormalPosition.right + mi.rcMonitor.left + dx;
+			normal.bottom = wp.rcNormalPosition.bottom + mi.rcMonitor.top + dy;
+		} else {
+			wpOK = false;
+		}
+	}
+
+	auto area = [](const RECT &r) -> LONGLONG {
+		LONGLONG w = r.right - r.left;
+		LONGLONG h = r.bottom - r.top;
+		return (w > 0 && h > 0) ? (w * h) : 0;
+	};
+
+	const LONGLONG aDwm = dwmOK ? area(dwm) : 0;
+	const LONGLONG aRc = rcOK ? area(rc) : 0;
+	const LONGLONG aWp = wpOK ? area(normal) : 0;
+
+	RECT best{};
+	LONGLONG bestA = 0;
+	if (aDwm > bestA) { best = dwm; bestA = aDwm; }
+	if (aRc > bestA)  { best = rc;  bestA = aRc; }
+	if (aWp > bestA)  { best = normal; bestA = aWp; }
+	return best;
+}
+
+void CALLBACK MinimizeEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd,
+                                 LONG idObject, LONG idChild, DWORD, DWORD)
+{
+	// 창 자체에 대한 이벤트만 (자식 컨트롤 제외).
+	if (idObject != OBJID_WINDOW || idChild != CHILDID_SELF || !hwnd)
+		return;
+
+	if (event == EVENT_SYSTEM_MINIMIZESTART) {
+		RECT pre = pick_pre_minimize_bounds(hwnd);
+		const bool valid = pre.right > pre.left && pre.bottom > pre.top;
+		if (!valid)
+			return;
+		std::lock_guard<std::mutex> lock(g_minimizeMutex);
+		g_minimizingWindows[hwnd] = {GetTickCount64(), 0, 0, pre};
+	} else if (event == EVENT_SYSTEM_MINIMIZEEND) {
+		// erase 대신 endNs를 기록 — 종료 후에도 filter가 grace 기간 동안 polling으로
+		// endNs를 받아 lingering 컷오프 처리에 사용. grace 만료 시 evict.
+		const uint64_t nowNs = os_gettime_ns();
+		const uint64_t nowTick = GetTickCount64();
+		std::lock_guard<std::mutex> lock(g_minimizeMutex);
+		auto it = g_minimizingWindows.find(hwnd);
+		if (it != g_minimizingWindows.end()) {
+			it->second.endNs = nowNs;
+			it->second.endTick = nowTick;
+		}
+	}
+}
+
+} // namespace
+
+extern "C" void sc_minimize_tracker_init()
+{
+	if (g_minimizeRefCount.fetch_add(1, std::memory_order_acq_rel) != 0)
+		return; // 이미 등록됨
+	g_minimizeHook = SetWinEventHook(
+		EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND,
+		nullptr, MinimizeEventProc, 0, 0,
+		WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+}
+
+extern "C" void sc_minimize_tracker_shutdown()
+{
+	if (g_minimizeRefCount.fetch_sub(1, std::memory_order_acq_rel) != 1)
+		return; // 아직 다른 참조가 있음
+	if (g_minimizeHook) {
+		UnhookWinEvent(g_minimizeHook);
+		g_minimizeHook = nullptr;
+	}
+	std::lock_guard<std::mutex> lock(g_minimizeMutex);
+	g_minimizingWindows.clear();
+}
+
+extern "C" int sc_poll_minimizing_windows(ScMinimizingEntry *out, int maxOut,
+                                          uint64_t maxAgeMs)
+{
+	if (!out || maxOut <= 0)
+		return 0;
+	const uint64_t now = GetTickCount64();
+	std::lock_guard<std::mutex> lock(g_minimizeMutex);
+	int count = 0;
+	for (auto it = g_minimizingWindows.begin();
+	     it != g_minimizingWindows.end();) {
+		const auto &st = it->second;
+		// (1) 종료된 entry는 grace 만료 시 evict.
+		// (2) 종료되지 않은 entry는 startTick 기준 age 만료 시 evict
+		//     (MINIMIZEEND가 누락되는 경우 누적 방지).
+		const bool ended = st.endNs != 0;
+		const bool expired =
+			ended ? (now - st.endTick > kMinimizeEndGraceMs)
+			      : (now - st.startTick > maxAgeMs);
+		if (expired) {
+			it = g_minimizingWindows.erase(it);
+			continue;
+		}
+		if (count < maxOut) {
+			out[count].hwnd = it->first;
+			out[count].preBounds = st.preBounds;
+			out[count].endNs = st.endNs;
+			++count;
+		}
+		++it;
+	}
+	return count;
+}
+
+extern "C" uint64_t sc_get_minimize_end_ns(HWND hwnd)
+{
+	std::lock_guard<std::mutex> lock(g_minimizeMutex);
+	auto it = g_minimizingWindows.find(hwnd);
+	if (it == g_minimizingWindows.end())
+		return 0;
+	return it->second.endNs;
 }
