@@ -116,6 +116,10 @@ public:
     // 같은 이유로 슬롯에 저장 — 지연 송출 프레임과 동기화하기 위함.
     BlurRect notifRect{};
 #endif
+    // [Window anchor v2] 이 프레임이 push될 시점의 트래커 박스 스냅샷
+    // (tracker 좌표 공간; render에서 trackerCoordScale_로 환산).
+    // 송출 프레임과 같이 지연되므로 텍스트와 블러가 동시에 움직임.
+    std::vector<VtOcrBox> trackerSnapshot;
 
     // gs_texrender에서 결과 텍스처를 꺼내는 헬퍼
     gs_texture_t *getTexture() const {
@@ -132,11 +136,16 @@ public:
 
   // gs_texrender_begin/end를 사용하여 안전하게 프레임을 캡처.
   // wlist: 이 프레임 캡처 시점의 창 좌표 스냅샷 (null 허용).
+  // trackerSnap: 이 프레임 시점의 트래커 박스 스냅샷 (null 허용; 트래커 좌표 공간).
 #ifdef _WIN32
   void pushFrame(uint64_t timestamp, obs_source_t *filter_context,
-                 const TrackedWindowList *wlist, uint64_t dependentOcrFrameId);
+                 const TrackedWindowList *wlist,
+                 const std::vector<VtOcrBox> *trackerSnap,
+                 uint64_t dependentOcrFrameId);
 #else
-  void pushFrame(uint64_t timestamp, obs_source_t *filter_context, uint64_t dependentOcrFrameId);
+  void pushFrame(uint64_t timestamp, obs_source_t *filter_context,
+                 const std::vector<VtOcrBox> *trackerSnap,
+                 uint64_t dependentOcrFrameId);
 #endif
 
 #ifdef _WIN32
@@ -345,6 +354,15 @@ struct SecureCastFilter {
   int ocrPendingWidth = 0;
   int ocrPendingHeight = 0;
   int ocrPendingStride = 0;
+#ifdef _WIN32
+  // [Window anchor] OCR 프레임 push 시점의 windowList 스냅샷. OCR worker가
+  // PII 박스→owner HWND 매칭에 사용한다 (video_tick과의 race 회피).
+  TrackedWindowList ocrPendingWindowSnapshot{};
+  // [Window anchor v6] OCR 프레임 캡처 시점의 모든 가시 top-level 창 enum.
+  // WindowFromPoint 실시간 호출 대신 이걸로 owner를 매칭해야 OCR 실행 지연 동안
+  // 창이 움직였어도 정확한 owner를 잡는다.
+  TrackedWindowList ocrPendingAllWindows{};
+#endif
 
   // back-pressure: idle이면 즉시 새 프레임 수용, busy면 GPU readback 건너뜀
   std::atomic<bool> ocrWorkerIdle{true};

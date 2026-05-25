@@ -19,12 +19,26 @@
 // 스레드 안전: 내부 뮤텍스로 보호. 렌더/OCR 양쪽에서 안전하게 호출 가능.
 // ============================================================
 
+// 전방 선언: window_tracker.h의 TrackedWindowList (HWND-bounds 배열).
+// .cpp에서 windows.h/window_tracker.h를 포함해 실 멤버 접근.
+struct TrackedWindowList;
+
 // OCR 결과를 Tracker에 전달하는 경량 구조체.
 // ocr-engine.h의 SecureCastOcrBox와 동일 레이아웃이지만
 // 순환 include를 피하기 위해 별도 선언.
 struct VtOcrBox {
   const char *type; // "RRN", "PHONE", "EMAIL", ... (string literal)
   float x, y, w, h; // 픽셀 좌표 (top-left + 크기)
+};
+
+// [Window anchor] OCR 박스의 owner 창 정보. 렌더 시점에 송출 프레임의
+// windowSnapshot에서 같은 hwnd를 찾아 ref 좌표와의 delta만큼 블러를 평행이동.
+// 모니터 절대좌표(DWM bounds)를 사용 — register 시점에는 OCR 워커가 windowList
+// 스냅샷에서 추출해 채운다. hwnd == nullptr 이면 owner 없음(=NCC 좌표 그대로).
+struct VtBoxOwner {
+  void *hwnd = nullptr;
+  int32_t windowL = 0;
+  int32_t windowT = 0;
 };
 
 class VisualTrackerManager {
@@ -81,8 +95,33 @@ public:
   void register_or_update_gray(const std::vector<VtOcrBox> &ocr_boxes,
                                const uint8_t *gray, int gw, int gh);
 
+  // [Window anchor] OCR worker가 각 PII 박스에 대해 owner 정보(HWND + DWM bounds
+  // top-left)를 함께 전달하는 오버로드. owners.size()가 ocr_boxes.size()와 같아야
+  // 하며 다르면 owner 정보 없음으로 처리(=기존 동작).
+  // ref 좌표/창 위치는 신규 등록 + 기존 매칭 모두에서 매번 갱신.
+  void register_or_update_gray(const std::vector<VtOcrBox> &ocr_boxes,
+                               const std::vector<VtBoxOwner> &owners,
+                               const uint8_t *gray, int gw, int gh);
+
   // 렌더 스레드에서 현재 블러 좌표 조회 (복사 반환)
   std::vector<VtOcrBox> active_boxes() const;
+
+  // [Window anchor] 송출 프레임 동기화 버전. 트래커의 ownerWin이 output_snapshot
+  // 안에 있으면, OCR 등록 시점 창 위치(refWindow)와 현재 송출 슬롯 창 위치의
+  // delta를 모니터→소스 좌표로 환산해 refX/refY에 더해 반환. owner 없는 트래커는
+  // 기존 active_boxes()와 동일하게 tr.x/tr.y 사용. 결과는 active_boxes()의
+  // ghost-kill 게이트와 동일한 조건을 거친 후 송출용 좌표.
+  std::vector<VtOcrBox>
+  boxes_for_output_snapshot(const TrackedWindowList *output_snapshot,
+                            uint32_t src_w, uint32_t src_h) const;
+
+  // [Window anchor v4] pushFrame 직전에 호출. owner 창 바인딩된 트래커는
+  // refWindow(OCR 시점)와 현재 DWM bounds의 delta를 즉시 계산해 박스 좌표를
+  // 갱신. owner 없는 트래커는 NCC tr.x/tr.y 그대로. 결과는 슬롯에 저장되어
+  // 송출 시점에 그대로 사용 — 동일 프레임의 창 위치와 일치하므로 NCC lag도
+  // 사라진다. src_w/src_h는 트래커 좌표 공간(half-res 모드면 절반).
+  std::vector<VtOcrBox>
+  snapshot_for_push(uint32_t src_w, uint32_t src_h) const;
 
   void clear();
 
@@ -116,6 +155,17 @@ private:
     // 1-A: register_or_update가 템플릿을 갱신할 때마다 증가.
     // Phase C 커밋 시 이 값이 같아야만 템플릿 필드를 덮어쓴다 (충돌 방지).
     uint32_t templateTs = 0;
+
+    // [Window anchor] OCR 시점에 바인딩된 owner 창 (HWND, void*로 보관해
+    // 헤더에서 windows.h 의존 회피). nullptr이면 anchor 없이 NCC만 사용.
+    void *ownerWin = nullptr;
+    // OCR이 이 트래커를 등록/재확인한 시점의 박스 좌표(source-space, px).
+    // 렌더는 이 ref + (송출 프레임 창 위치 - refWindow) delta를 사용.
+    float refX = 0.0f, refY = 0.0f;
+    // OCR 등록/재확인 시점의 owner 창 DWM bounds top-left (모니터 절대좌표).
+    // 렌더 시 송출 슬롯의 windowSnapshot에서 같은 hwnd의 bounds와 비교해 delta 산출.
+    int32_t refWindowL = 0;
+    int32_t refWindowT = 0;
 
     // [Fix #2] OCR worker가 register_or_update를 호출할 때마다 증가.
     // Phase C에서 ocrRevision이 lt와 it에서 다르면

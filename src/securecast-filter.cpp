@@ -411,10 +411,12 @@ void FrameRingBuffer::destroy() {
 void FrameRingBuffer::pushFrame(uint64_t timestamp,
                                 obs_source_t *filter_context,
                                 const TrackedWindowList *wlist,
+                                const std::vector<VtOcrBox> *trackerSnap,
                                 uint64_t dependentOcrFrameId)
 #else
 void FrameRingBuffer::pushFrame(uint64_t timestamp,
                                 obs_source_t *filter_context,
+                                const std::vector<VtOcrBox> *trackerSnap,
                                 uint64_t dependentOcrFrameId)
 #endif
 {
@@ -431,9 +433,15 @@ void FrameRingBuffer::pushFrame(uint64_t timestamp,
   else
     slot.windowSnapshot = TrackedWindowList{};
   // notifRect는 매 프레임 video_render의 backfillRecentNotifRect가 채운다.
-  // 슬롯 재사용 시 옛 값이 남지 않도록 여기서 초기화한다.
+  // 슬롯 재사용 시 옛 값이 남지 않도록 여기서 initialize.
   slot.notifRect = BlurRect{};
 #endif
+
+  // [Window anchor v2] 트래커 박스 스냅샷 저장 (재사용 슬롯의 옛 값 클리어).
+  if (trackerSnap)
+    slot.trackerSnapshot = *trackerSnap;
+  else
+    slot.trackerSnapshot.clear();
 
   gs_texrender_t *tr = slot.texrender;
   gs_texrender_reset(tr);
@@ -910,11 +918,20 @@ static void clear_pending_ocr_frame(SecureCastFilter *filter) {
   filter->ocrPendingWidth = 0;
   filter->ocrPendingHeight = 0;
   filter->ocrPendingStride = 0;
+#ifdef _WIN32
+  filter->ocrPendingWindowSnapshot.count = 0;
+#endif
 }
 
 static void submit_ocr_frame(SecureCastFilter *filter,
                              std::vector<uint8_t> &&pixels, int width,
-                             int height, int stride, uint64_t frameId) {
+                             int height, int stride, uint64_t frameId
+#ifdef _WIN32
+                             ,
+                             const TrackedWindowList &windowSnapshot,
+                             const TrackedWindowList &allWindows
+#endif
+) {
   if (!filter || pixels.empty() || width <= 0 || height <= 0 || stride <= 0 ||
       frameId == 0)
     return;
@@ -930,6 +947,12 @@ static void submit_ocr_frame(SecureCastFilter *filter,
     filter->ocrPendingHeight = height;
     filter->ocrPendingStride = stride;
     filter->ocrFramePending = true;
+#ifdef _WIN32
+    // [Window anchor] OCR 워커가 PII↔HWND 매칭에 사용할 windowList 스냅샷.
+    filter->ocrPendingWindowSnapshot = windowSnapshot;
+    // [Window anchor v6] 캡처 시점의 모든 가시 top-level 창.
+    filter->ocrPendingAllWindows = allWindows;
+#endif
   }
 
   filter->ocrWorkerCv.notify_one();
@@ -958,6 +981,10 @@ static void ocr_worker_loop(SecureCastFilter *filter) {
     int height = 0;
     int stride = 0;
     uint64_t frameId = 0;
+#ifdef _WIN32
+    TrackedWindowList windowSnapshot{};
+    TrackedWindowList allWindows{};
+#endif
 
     {
       std::unique_lock<std::mutex> lock(filter->ocrWorkerMutex);
@@ -976,6 +1003,14 @@ static void ocr_worker_loop(SecureCastFilter *filter) {
       width = filter->ocrPendingWidth;
       height = filter->ocrPendingHeight;
       stride = filter->ocrPendingStride;
+#ifdef _WIN32
+      // [Window anchor] 프레임 push 시점의 windowList 스냅샷 인수.
+      windowSnapshot = filter->ocrPendingWindowSnapshot;
+      filter->ocrPendingWindowSnapshot.count = 0;
+      // [Window anchor v6] 캡처 시점의 모든 가시 top-level 창.
+      allWindows = filter->ocrPendingAllWindows;
+      filter->ocrPendingAllWindows.count = 0;
+#endif
 
       filter->ocrPendingFrameId = 0;
       filter->ocrPendingWidth = 0;
@@ -1124,8 +1159,101 @@ static void ocr_worker_loop(SecureCastFilter *filter) {
       std::vector<uint8_t> grayForTracker;
       VisualTrackerManager::bgra_to_gray(pixels.data(), width, height, stride,
                                          grayForTracker);
-      filter->trackerMgr.register_or_update_gray(vtBoxes, grayForTracker.data(),
-                                                 width, height);
+
+      // [Window anchor] PII 박스 → owner HWND 매칭.
+      //   1차: windowSnapshot(블랙리스트 앱)에서 contains 매칭
+      //   2차: WindowFromPoint로 어떤 일반 창이든 owner 탐색
+      // 모니터 변환은 snapshot 첫 항목 or 주모니터를 source의 모니터로 가정.
+      std::vector<VtBoxOwner> owners(vtBoxes.size());
+#ifdef _WIN32
+      // 1차: 블랙리스트 창 매칭.
+      if (windowSnapshot.count > 0) {
+        struct SrcRect {
+          int x0, y0, x1, y1;
+          HWND hwnd;
+          int32_t monL, monT;
+        };
+        std::vector<SrcRect> srcRects;
+        srcRects.reserve(windowSnapshot.count);
+        for (int i = 0; i < windowSnapshot.count; ++i) {
+          BlurRect br = tracked_window_to_blur_rect(
+              windowSnapshot.items[i], static_cast<uint32_t>(width),
+              static_cast<uint32_t>(height));
+          if (br.width > 0 && br.height > 0) {
+            srcRects.push_back(
+                {br.x, br.y, br.x + br.width, br.y + br.height,
+                 windowSnapshot.items[i].hwnd,
+                 static_cast<int32_t>(windowSnapshot.items[i].bounds.left),
+                 static_cast<int32_t>(windowSnapshot.items[i].bounds.top)});
+          }
+        }
+        for (size_t b = 0; b < vtBoxes.size(); ++b) {
+          const float cx = vtBoxes[b].x + vtBoxes[b].w * 0.5f;
+          const float cy = vtBoxes[b].y + vtBoxes[b].h * 0.5f;
+          for (const auto &sr : srcRects) {
+            if (cx >= static_cast<float>(sr.x0) &&
+                cx < static_cast<float>(sr.x1) &&
+                cy >= static_cast<float>(sr.y0) &&
+                cy < static_cast<float>(sr.y1)) {
+              owners[b].hwnd = reinterpret_cast<void *>(sr.hwnd);
+              owners[b].windowL = sr.monL;
+              owners[b].windowT = sr.monT;
+              break;
+            }
+          }
+        }
+      }
+
+      // 2차: 1차에서 owner 못 찾은 박스에 대해 캡처-시점 가시창 목록에서 매칭.
+      // (이전엔 WindowFromPoint 실시간 호출 — OCR 실행 ~250ms 사이에 창이 움직였으면
+      //  엉뚱한 정적 owner를 잡아서 trail/잔상 박스를 만들었음. allWindows는 캡처
+      //  시점에 enum된 목록이라 그 시점의 z-order/위치 그대로.)
+      if (allWindows.count > 0) {
+        HMONITOR srcMon = MonitorFromRect(&allWindows.items[0].bounds,
+                                          MONITOR_DEFAULTTONEAREST);
+        if (!srcMon) {
+          POINT origin{0, 0};
+          srcMon = MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY);
+        }
+        MONITORINFO mi{};
+        mi.cbSize = sizeof(MONITORINFO);
+        if (srcMon && GetMonitorInfo(srcMon, &mi)) {
+          const int mon_w = mi.rcMonitor.right - mi.rcMonitor.left;
+          const int mon_h = mi.rcMonitor.bottom - mi.rcMonitor.top;
+          if (mon_w > 0 && mon_h > 0 && width > 0 && height > 0) {
+            const float sx = static_cast<float>(mon_w) / width;
+            const float sy = static_cast<float>(mon_h) / height;
+            for (size_t b = 0; b < vtBoxes.size(); ++b) {
+              if (owners[b].hwnd)
+                continue; // 1차에서 매칭됨
+              // source-coord 박스 중심 → 모니터 절대 좌표
+              const float cx = vtBoxes[b].x + vtBoxes[b].w * 0.5f;
+              const float cy = vtBoxes[b].y + vtBoxes[b].h * 0.5f;
+              const long monX = mi.rcMonitor.left +
+                                static_cast<long>(cx * sx);
+              const long monY = mi.rcMonitor.top +
+                                static_cast<long>(cy * sy);
+              // allWindows는 Z-order 위→아래 — 첫 contains가 가장 위에 있는 창.
+              for (int i = 0; i < allWindows.count; ++i) {
+                const RECT &r = allWindows.items[i].bounds;
+                if (monX >= r.left && monX < r.right && monY >= r.top &&
+                    monY < r.bottom) {
+                  owners[b].hwnd =
+                      reinterpret_cast<void *>(allWindows.items[i].hwnd);
+                  owners[b].windowL = r.left;
+                  owners[b].windowT = r.top;
+                  break;
+                }
+              }
+            }
+          }
+        }
+      }
+#endif
+
+      filter->trackerMgr.register_or_update_gray(vtBoxes, owners,
+                                                 grayForTracker.data(), width,
+                                                 height);
     }
 
     const int boxCount = static_cast<int>(ocrBoxes.size());
@@ -1618,8 +1746,24 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
   // captureWindowList(직전 프레임에서 저장한 DWM 좌표)를 스냅샷으로 쓰면
   // 픽셀 내용과 마스크 위치가 정확히 동기화된다.
   uint64_t ts = obs_get_video_frame_time();
+  // [Window anchor v4] push 직전에 owner-anchored 박스 좌표를 즉시 계산해
+  // 슬롯에 저장. owner 바인딩된 트래커는 현재 DWM bounds 기준으로 refX/refY +
+  // delta로 정확한 좌표 계산 → NCC lag 없이 그 프레임의 창 위치와 일치. 슬롯이
+  // 지연 dequeue되므로 송출 화면의 텍스트와 정확히 같이 움직임.
+  const float tScalePush = filter->trackerCoordScale_;
+  const uint32_t srcWTrkPush =
+      (tScalePush > 0.0f)
+          ? static_cast<uint32_t>(static_cast<float>(w) / tScalePush)
+          : w;
+  const uint32_t srcHTrkPush =
+      (tScalePush > 0.0f)
+          ? static_cast<uint32_t>(static_cast<float>(h) / tScalePush)
+          : h;
+  const auto trackerSnap =
+      filter->trackerMgr.snapshot_for_push(srcWTrkPush, srcHTrkPush);
 #ifdef _WIN32
   filter->ringBuffer.pushFrame(ts, filter->context, &filter->captureWindowList,
+                               &trackerSnap,
                                filter->lastSubmittedOcrFrameId.load(std::memory_order_relaxed));
 
   // [지연 동기화] 방금 push한 스냅샷에 새로 등장한 블랙리스트 창을 최근
@@ -1681,7 +1825,7 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
   }
   filter->captureWindowList = filter->windowList;
 #else
-  filter->ringBuffer.pushFrame(ts, filter->context,
+  filter->ringBuffer.pushFrame(ts, filter->context, &trackerSnap,
                                filter->lastSubmittedOcrFrameId.load(std::memory_order_relaxed));
 #endif
 
@@ -1835,8 +1979,19 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
 
       if (ocrSubmit) {
         // markAnalysisSubmitted 호출 삭제됨
+#ifdef _WIN32
+        // [Window anchor v6] 캡처 시점에 모든 가시 top-level 창 enum.
+        // OCR 워커는 이 캡처-시점 목록으로 owner를 정확히 매칭한다.
+        TrackedWindowList allWindows{};
+        sc_enum_all_visible_windows(&allWindows);
+#endif
         submit_ocr_frame(filter, std::move(ocrPixels), ocrW, ocrH, ocrStride,
-                         analysisSlot->frameId);
+                         analysisSlot->frameId
+#ifdef _WIN32
+                         ,
+                         filter->captureWindowList, allWindows
+#endif
+        );
 
         if (++filter->trackerLogCounter >= 150) {
           filter->trackerLogCounter = 0;
@@ -1929,9 +2084,13 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
   // OCR 박스 — Visual Tracker가 제공하는 NCC 추적 위치
   // [좌표계 동기화] use1GPath 모드에서는 트래커가 half-res 공간에서 추적하므로
   // trackerCoordScale_(=2.0f)를 곱해 원본 해상도로 좌표를 복원한다.
+  // [Window anchor v4] 블러 박스를 ring buffer 슬롯에 함께 저장해서 송출 프레임과
+  // 정확히 같이 지연시킨다. 실시간 창 위치는 일절 사용하지 않음 — 송출되는
+  // 프레임은 캡처 시점의 픽셀이고, 그 시점의 트래커 박스를 그대로 사용해야
+  // 텍스트와 블러가 동일 시간축에서 움직인다.
   {
     const float tScale = filter->trackerCoordScale_;
-    const auto trackerBoxes = filter->trackerMgr.active_boxes();
+    const auto &trackerBoxes = outputSlot->trackerSnapshot;
     for (const auto &tb : trackerBoxes) {
       if (all_count >= (int)(sizeof(all_rects) / sizeof(all_rects[0])))
         break;
@@ -2265,6 +2424,9 @@ static void securecast_video_tick(void *data, float seconds) {
                                  : SCAN_INTERVAL_NORMAL;
   sc_tracker_tick(seconds, &filter->trackerAccumulator, &filter->windowList,
                   scanInterval);
+  // [Window anchor] 실시간 트래커 좌표 보정은 제거. 송출 프레임 동기화는
+  // video_render에서 outputSlot->windowSnapshot 기반으로 수행한다
+  // (boxes_for_output_snapshot).
 
   // [Role D] windowList 스캔 결과를 blacklistMask에 반영 (video_render에서
   // 최우선 차단에 사용)

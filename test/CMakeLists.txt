@@ -89,6 +89,11 @@ target_compile_features(test_tracker PRIVATE cxx_std_17)
 target_include_directories(test_tracker PRIVATE
     $<TARGET_PROPERTY:OBS::libobs,INTERFACE_INCLUDE_DIRECTORIES>)
 
+# [Window anchor] visual-tracker.cpp 가 DwmGetWindowAttribute 호출 → dwmapi link 필요.
+if(WIN32)
+    target_link_libraries(test_tracker PRIVATE dwmapi)
+endif()
+
 add_test(
     NAME tracker
     COMMAND test_tracker

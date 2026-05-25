@@ -246,6 +246,58 @@ extern "C" void sc_scan_blacklisted_windows(TrackedWindowList *out)
 	EnumWindows(enum_proc, reinterpret_cast<LPARAM>(out));
 }
 
+namespace {
+
+struct EnumAllCtx {
+	TrackedWindowList *out;
+	DWORD selfPid;
+};
+
+// 가시 top-level 창을 모두 캡처. 자기 자신(OBS) 프로세스는 제외.
+// EnumWindows는 Z-order 위→아래 순으로 호출하므로 out도 자연스레 위쪽이 앞.
+static BOOL CALLBACK enum_all_proc(HWND hwnd, LPARAM lparam)
+{
+	auto *ctx = reinterpret_cast<EnumAllCtx *>(lparam);
+	if (ctx->out->count >= SC_MAX_TRACKED_WINDOWS)
+		return FALSE; // 슬롯 가득
+
+	if (!IsWindowVisible(hwnd))
+		return TRUE;
+
+	// 자기 프로세스 필터 (OBS preview 등이 PII 위에 잠깐 떠도 owner로 잡지 않게)
+	DWORD pid = 0;
+	GetWindowThreadProcessId(hwnd, &pid);
+	if (pid == ctx->selfPid)
+		return TRUE;
+
+	RECT bounds{};
+	if (FAILED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS,
+	                                 &bounds, sizeof(bounds))))
+		return TRUE;
+
+	const long w = bounds.right - bounds.left;
+	const long h = bounds.bottom - bounds.top;
+	if (w < MIN_WINDOW_DIMENSION || h < MIN_WINDOW_DIMENSION)
+		return TRUE; // 너무 작은 창은 무시
+
+	auto &item = ctx->out->items[ctx->out->count++];
+	item.hwnd = hwnd;
+	item.bounds = bounds;
+	item.exe_name[0] = L'\0'; // owner 매칭에 불필요
+	return TRUE;
+}
+
+} // namespace
+
+extern "C" void sc_enum_all_visible_windows(TrackedWindowList *out)
+{
+	if (!out)
+		return;
+	out->count = 0;
+	EnumAllCtx ctx{out, GetCurrentProcessId()};
+	EnumWindows(enum_all_proc, reinterpret_cast<LPARAM>(&ctx));
+}
+
 // 60fps tick에서 매번 호출되어도 실제 무거운 EnumWindows는 0.15초마다 1회만 실행.
 // 매칭된 창은 일단 obs_log로만 출력 — 후속 단계에서 BlurRect로 변환 후 셰이더에 전달.
 extern "C" void sc_tracker_tick(float seconds, float *accumulator, TrackedWindowList *out, float interval)

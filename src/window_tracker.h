@@ -54,6 +54,13 @@ struct TrackedWindowList {
 // (DwmGetWindowAttribute는 caller 스레드 컨텍스트로 동작).
 void sc_scan_blacklisted_windows(TrackedWindowList *out);
 
+// [Window anchor v6] 캡처 시점의 모든 가시 top-level 창을 enum.
+// OBS 자기 자신 프로세스는 PID로 필터링 (preview 창 등 OCR owner 오인 방지).
+// 결과는 Z-order 위쪽부터 채워짐 — 같은 source 위치에 여러 창 겹칠 때 매칭은
+// 첫 contains를 우선해 z-order 최상단 선택.
+// 호출자는 video_render(렌더 스레드)에서만 호출할 것 — Win32 DWM 의존.
+void sc_enum_all_visible_windows(TrackedWindowList *out);
+
 // Fast-path 좌표 갱신: 이미 list에 들어있는 HWND들에 대해 DWM으로 bounds만 재조회.
 // EnumWindows / OpenProcess 없이 DWM query만 수행하므로 매 프레임 호출 가능.
 //

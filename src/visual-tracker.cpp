@@ -10,6 +10,18 @@
 // OBS 로깅 (blog, LOG_DEBUG, LOG_WARNING 등)
 #include <util/base.h>
 
+// [Window anchor] DWM 모니터 변환용 Win32 의존. dwmapi.lib는 CMakeLists에서
+// 이미 link됨. 헤더에는 두지 않고 .cpp에서만 사용.
+// NOMINMAX: windows.h가 정의하는 min/max 매크로가 std::min/std::max와 충돌하지
+// 않도록 차단 (이 파일은 std::min/max를 광범위하게 사용).
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <dwmapi.h>
+#include "window_tracker.h" // TrackedWindowList (HWND, RECT 사용 위해 windows.h 이후 include)
+#endif
+
 // SIMD intrinsics
 // x64 MSVC: <intrin.h>가 SSSE3·AVX2·FMA를 모두 포함.
 // FMA + AVX2는 Haswell(2013) 이상에서 지원. 런타임에 명시적으로 호출하므로
@@ -515,10 +527,10 @@ void VisualTrackerManager::update_one_pyramid(Tracker &tr, const uint8_t *gray,
 
   // [Fix #5] NEAR 탐색 실패 시 FAR 재시도 (near→far fallback)
   if (radius1 < SEARCH_FAR && best.score < SCORE_LOST) {
-    auto far = ncc_pyramid_search(tr, gray, gw, gh, quarterGray, qw, qh, predX,
-                                  predY, SEARCH_FAR);
-    if (far.score > best.score) {
-      best = far;
+    auto farBest = ncc_pyramid_search(tr, gray, gw, gh, quarterGray, qw, qh,
+                                      predX, predY, SEARCH_FAR);
+    if (farBest.score > best.score) {
+      best = farBest;
       static int s_fallback_throttle = 0;
       if (++s_fallback_throttle >= 60) {
         s_fallback_throttle = 0;
@@ -696,9 +708,29 @@ void VisualTrackerManager::update_all_gray(const uint8_t *gray, int gw,
     }
 
     // dead tracker 제거 (역순: erase 시 인덱스 shift 방지)
+    // [Window anchor v4] owner 창이 살아있는 트래커는 NCC 실패해도 보존.
+    // 빠른 드래그 시 NCC가 못 따라가도 owner 창의 DWM bounds로 좌표 계산이
+    // 가능. 5초간 OCR 갱신이 없으면 텍스트 소멸로 보고 제거 (드래그 중에는
+    // OCR이 motion blur로 자주 실패 → 더 긴 유예 필요).
+    constexpr int kOwnerBoundExpiry = HARD_EXPIRY * 5; // ~5초 @ 30Hz
     for (int i = (int)trackers_.size() - 1; i >= 0; --i) {
-      if (trackers_[i].framesSinceMatch >= FRAMES_LOST ||
-          trackers_[i].framesSinceOcrValidate >= HARD_EXPIRY)
+      const auto &tr = trackers_[i];
+      bool ownerAlive = false;
+#ifdef _WIN32
+      if (tr.ownerWin) {
+        HWND h = reinterpret_cast<HWND>(tr.ownerWin);
+        ownerAlive = IsWindow(h);
+      }
+#endif
+      const bool nccLost = tr.framesSinceMatch >= FRAMES_LOST;
+      const bool ocrExpired = tr.framesSinceOcrValidate >= HARD_EXPIRY;
+      const bool ocrExpiredLong =
+          tr.framesSinceOcrValidate >= kOwnerBoundExpiry;
+      // owner alive: 오직 ocrExpiredLong(5초) 일 때만 제거. NCC 실패는 무시.
+      // owner 없음: 기존 조건 (NCC 실패 OR OCR 만료 1초).
+      const bool shouldErase =
+          ownerAlive ? ocrExpiredLong : (nccLost || ocrExpired);
+      if (shouldErase)
         trackers_.erase(trackers_.begin() + i);
     }
   }
@@ -856,11 +888,23 @@ void VisualTrackerManager::register_or_update(
 }
 
 // 1-E: pre-converted gray 버퍼를 사용하는 버전 — BGRA→gray 중복 변환 없음.
+// [Window anchor] owner 정보 없는 호출은 빈 owners 벡터로 새 오버로드에 위임.
 void VisualTrackerManager::register_or_update_gray(
     const std::vector<VtOcrBox> &ocr_boxes, const uint8_t *gray, int gw,
     int gh) {
+  static const std::vector<VtBoxOwner> kNoOwners;
+  register_or_update_gray(ocr_boxes, kNoOwners, gray, gw, gh);
+}
+
+void VisualTrackerManager::register_or_update_gray(
+    const std::vector<VtOcrBox> &ocr_boxes,
+    const std::vector<VtBoxOwner> &owners, const uint8_t *gray, int gw,
+    int gh) {
   if (ocr_boxes.empty() || !gray)
     return;
+
+  // 박스 수와 일치할 때만 owner 정보 사용. 불일치는 owner 정보 없음으로 처리.
+  const bool useOwners = owners.size() == ocr_boxes.size();
 
   lastOcrUpdateTsMs_.store(
       static_cast<uint64_t>(
@@ -877,6 +921,67 @@ void VisualTrackerManager::register_or_update_gray(
   std::vector<bool> matchedOcr(N, false);
   std::vector<bool> matchedTr(M, false);
 
+  // [Window anchor v5] 각 트래커의 "유효 매칭 위치" 계산:
+  // - owner 창 살아있고 DWM bounds 조회 성공: refX + (현재 owner bounds delta)
+  //   → 빠른 드래그여도 anchored 위치가 OCR 검출 위치와 매칭됨.
+  // - 그 외: NCC tr.x/tr.y (기존 동작).
+  // 이 위치를 IoU/거리 매칭에 사용해 신규 트래커 생성 폭주를 막는다 (잔상 원인).
+  struct TrEffPos {
+    float x, y;
+    bool isAnchored;
+    int32_t curWinL, curWinT;
+  };
+  std::vector<TrEffPos> effPos(M);
+  for (int m = 0; m < M; ++m) {
+    const auto &tr = trackers_[m];
+    effPos[m] = {tr.x, tr.y, false, 0, 0};
+#ifdef _WIN32
+    if (tr.ownerWin) {
+      HWND h = reinterpret_cast<HWND>(tr.ownerWin);
+      if (IsWindow(h)) {
+        RECT cur{};
+        if (SUCCEEDED(DwmGetWindowAttribute(h, DWMWA_EXTENDED_FRAME_BOUNDS,
+                                            &cur, sizeof(cur)))) {
+          HMONITOR mon = MonitorFromRect(&cur, MONITOR_DEFAULTTONEAREST);
+          MONITORINFO mi{};
+          mi.cbSize = sizeof(MONITORINFO);
+          if (mon && GetMonitorInfo(mon, &mi)) {
+            const int mw = mi.rcMonitor.right - mi.rcMonitor.left;
+            const int mh = mi.rcMonitor.bottom - mi.rcMonitor.top;
+            if (mw > 0 && mh > 0) {
+              const float sx = static_cast<float>(gw) / static_cast<float>(mw);
+              const float sy = static_cast<float>(gh) / static_cast<float>(mh);
+              effPos[m].x = tr.refX + (cur.left - tr.refWindowL) * sx;
+              effPos[m].y = tr.refY + (cur.top - tr.refWindowT) * sy;
+              effPos[m].curWinL = cur.left;
+              effPos[m].curWinT = cur.top;
+              effPos[m].isAnchored = true;
+            }
+          }
+        }
+      }
+    }
+#endif
+  }
+
+  // IoU 매칭에 사용할 anchored 위치 기반 IoU 계산 람다.
+  auto iou_with_pos = [](const VtOcrBox &ob, float trX, float trY, float trW,
+                         float trH) -> float {
+    const float ax1 = ob.x, ay1 = ob.y;
+    const float ax2 = ob.x + ob.w, ay2 = ob.y + ob.h;
+    const float bx1 = trX, by1 = trY;
+    const float bx2 = trX + trW, by2 = trY + trH;
+    const float ix1 = std::max(ax1, bx1);
+    const float iy1 = std::max(ay1, by1);
+    const float ix2 = std::min(ax2, bx2);
+    const float iy2 = std::min(ay2, by2);
+    if (ix2 <= ix1 || iy2 <= iy1)
+      return 0.0f;
+    const float inter = (ix2 - ix1) * (iy2 - iy1);
+    const float un = ob.w * ob.h + trW * trH - inter;
+    return un > 0.0f ? inter / un : 0.0f;
+  };
+
   // [Fix #7-B2] IoU 0.30 → 0.20 + 거리 fallback (gray 버전)
   for (int n = 0; n < N; ++n) {
     float bestIou = 0.20f;
@@ -885,7 +990,10 @@ void VisualTrackerManager::register_or_update_gray(
     for (int m = 0; m < M; ++m) {
       if (matchedTr[m])
         continue;
-      const float iou = box_iou(ocr_boxes[n], trackers_[m]);
+      const float trEffX = effPos[m].x;
+      const float trEffY = effPos[m].y;
+      const float iou = iou_with_pos(ocr_boxes[n], trEffX, trEffY,
+                                     trackers_[m].bw, trackers_[m].bh);
       if (iou > bestIou) {
         bestIou = iou;
         bestM = m;
@@ -895,8 +1003,8 @@ void VisualTrackerManager::register_or_update_gray(
             std::strcmp(ocr_boxes[n].type, trackers_[m].type) == 0) {
           const float cx1 = ocr_boxes[n].x + ocr_boxes[n].w * 0.5f;
           const float cy1 = ocr_boxes[n].y + ocr_boxes[n].h * 0.5f;
-          const float cx2 = trackers_[m].x + trackers_[m].bw * 0.5f;
-          const float cy2 = trackers_[m].y + trackers_[m].bh * 0.5f;
+          const float cx2 = trEffX + trackers_[m].bw * 0.5f;
+          const float cy2 = trEffY + trackers_[m].bh * 0.5f;
           const float d = std::hypot(cx1 - cx2, cy1 - cy2);
           const float thresh =
               0.5f * std::min(trackers_[m].bw, trackers_[m].bh);
@@ -948,6 +1056,26 @@ void VisualTrackerManager::register_or_update_gray(
         precompute_tmpl_stats(tr);
         ++tr.templateTs;
       }
+
+      // [Window anchor v5] refX/refY는 새 OCR 측정으로 갱신.
+      // ownerWin은 보존 (초기 정적 OCR의 정확한 binding 유지 — 모션 중
+      // WindowFromPoint의 잘못된 결과로 덮어쓰지 않기 위함).
+      // refWindow는 effPos에서 이미 queried한 현재 owner bounds로 갱신해
+      // (refX, refWindow) 쌍이 동일 시점 snapshot이 되도록 유지.
+      tr.refX = ocr_boxes[n].x;
+      tr.refY = ocr_boxes[n].y;
+      if (effPos[bestM].isAnchored) {
+        // 기존 owner 살아있음 — bounds 갱신만, ownerWin은 그대로.
+        tr.refWindowL = effPos[bestM].curWinL;
+        tr.refWindowT = effPos[bestM].curWinT;
+      } else if (useOwners && tr.ownerWin == nullptr && owners[n].hwnd) {
+        // 기존 owner 없었음 → OCR 측에서 잡은 owner로 신규 binding.
+        tr.ownerWin = owners[n].hwnd;
+        tr.refWindowL = owners[n].windowL;
+        tr.refWindowT = owners[n].windowT;
+      }
+      // 그 외(owner 있었는데 죽음, 또는 새 owner도 없음): refX/refY만 갱신,
+      // 다음 사이클에 owner 재바인딩 시도.
     }
   }
 
@@ -989,6 +1117,15 @@ void VisualTrackerManager::register_or_update_gray(
     tr.framesSinceOcrValidate = 0;
     tr.vx = 0.0f;
     tr.vy = 0.0f;
+    // [Window anchor] 신규 트래커: ref 좌표 = 현재 OCR 박스 위치, refWindow =
+    // 현재 owner 창 DWM bounds top-left. owner 없으면 anchor 비활성(NCC만).
+    tr.refX = box.x;
+    tr.refY = box.y;
+    if (useOwners) {
+      tr.ownerWin = owners[n].hwnd;
+      tr.refWindowL = owners[n].windowL;
+      tr.refWindowT = owners[n].windowT;
+    }
     precompute_tmpl_stats(tr);
     trackers_.push_back(std::move(tr));
   }
@@ -1031,4 +1168,225 @@ void VisualTrackerManager::clear() {
   std::unique_lock<std::shared_mutex> lock(stateMtx_);
   trackers_.clear();
   nextId_ = 0;
+}
+
+// [Window anchor v4] pushFrame 직전 호출. 슬롯에 저장될 박스 좌표를 미리 계산.
+// owner 바인딩된 트래커: 현재 DWM bounds 조회 → refX + (curWindow - refWindow) * scale.
+//   ★ 이 경로로 좌표가 잡히면 NCC ghost-kill 게이트를 우회한다. 빠른 드래그 시
+//     NCC가 따라가지 못해 framesSinceMatch가 증가하더라도 owner 창의 위치가 곧
+//     진실이므로 블러를 절대 풀지 않는다 (사용자 보고: 이동 시 블러 해제 문제).
+// owner 없거나 anchor 실패: NCC tr.x/tr.y + ghost-kill 게이트 (스크롤·텍스트 소멸 케이스).
+std::vector<VtOcrBox>
+VisualTrackerManager::snapshot_for_push(uint32_t src_w, uint32_t src_h) const {
+  std::shared_lock<std::shared_mutex> lock(stateMtx_);
+  std::vector<VtOcrBox> result;
+  result.reserve(trackers_.size());
+
+  int ghostHidden = 0;
+  for (const auto &tr : trackers_) {
+    float outX = tr.x;
+    float outY = tr.y;
+    bool ownerAnchored = false;
+
+#ifdef _WIN32
+    if (tr.ownerWin && src_w > 0 && src_h > 0) {
+      HWND target = reinterpret_cast<HWND>(tr.ownerWin);
+      if (IsWindow(target)) {
+        RECT cur{};
+        if (SUCCEEDED(DwmGetWindowAttribute(target,
+                                            DWMWA_EXTENDED_FRAME_BOUNDS, &cur,
+                                            sizeof(cur)))) {
+          HMONITOR hmon = MonitorFromRect(&cur, MONITOR_DEFAULTTONEAREST);
+          MONITORINFO mi{};
+          mi.cbSize = sizeof(MONITORINFO);
+          if (hmon && GetMonitorInfo(hmon, &mi)) {
+            const int mon_w = mi.rcMonitor.right - mi.rcMonitor.left;
+            const int mon_h = mi.rcMonitor.bottom - mi.rcMonitor.top;
+            if (mon_w > 0 && mon_h > 0) {
+              const float sx =
+                  static_cast<float>(src_w) / static_cast<float>(mon_w);
+              const float sy =
+                  static_cast<float>(src_h) / static_cast<float>(mon_h);
+              outX = tr.refX + (cur.left - tr.refWindowL) * sx;
+              outY = tr.refY + (cur.top - tr.refWindowT) * sy;
+              // 소스 경계 clamp.
+              if (outX < 0)
+                outX = 0;
+              if (outY < 0)
+                outY = 0;
+              if (outX + tr.bw > static_cast<float>(src_w))
+                outX = static_cast<float>(src_w) - tr.bw;
+              if (outY + tr.bh > static_cast<float>(src_h))
+                outY = static_cast<float>(src_h) - tr.bh;
+              ownerAnchored = true;
+            }
+          }
+        }
+      }
+    }
+#else
+    (void)src_w;
+    (void)src_h;
+#endif
+
+    // owner anchor 실패 시에만 ghost-kill 적용. anchor가 잡힌 트래커는 NCC 상태
+    // 무관하게 항상 출력 — 창 위치가 곧 텍스트 위치를 결정하므로.
+    if (!ownerAnchored) {
+      const bool nccDeadlyLost = tr.framesSinceMatch >= FRAMES_LOST &&
+                                 tr.framesSinceOcrValidate >= STALE_OCR_FRAMES;
+      if (nccDeadlyLost) {
+        ++ghostHidden;
+        continue;
+      }
+    }
+
+    result.push_back({tr.type, outX, outY, tr.bw, tr.bh});
+  }
+
+  if (ghostHidden > 0) {
+    static int s_ghost_push_throttle = 0;
+    if (++s_ghost_push_throttle >= 60) {
+      s_ghost_push_throttle = 0;
+      blog(LOG_DEBUG, "[SecureCast][ghost-push] gate hidden %d tracker(s)",
+           ghostHidden);
+    }
+  }
+  return result;
+}
+
+// [Window anchor v3] 윈도우 트레일 블러.
+// 트래커가 ownerWin 바인딩되어 있으면:
+//   1) 송출 프레임 시점 위치 (outputSlot.windowSnapshot의 같은 hwnd bounds)
+//   2) 현재 실시간 위치 (DwmGetWindowAttribute로 즉시 조회)
+//   두 위치의 union 박스에 1.5x 여백 적용 → 송출 프레임의 텍스트와 현재 창
+//   사이 어느 지점에 텍스트가 있어도 다 덮음. 빠른 드래그에서도 노출 없음.
+// owner 없으면 tr.x/tr.y 그대로 (NCC 위치).
+std::vector<VtOcrBox> VisualTrackerManager::boxes_for_output_snapshot(
+    const TrackedWindowList *output_snapshot, uint32_t src_w,
+    uint32_t src_h) const {
+  std::shared_lock<std::shared_mutex> lock(stateMtx_);
+  std::vector<VtOcrBox> result;
+  result.reserve(trackers_.size());
+
+  int ghostHidden = 0;
+  for (const auto &tr : trackers_) {
+    const bool nccDeadlyLost = tr.framesSinceMatch >= FRAMES_LOST &&
+                               tr.framesSinceOcrValidate >= STALE_OCR_FRAMES;
+    if (nccDeadlyLost) {
+      ++ghostHidden;
+      continue;
+    }
+
+    float outX = tr.x;
+    float outY = tr.y;
+    float outW = tr.bw;
+    float outH = tr.bh;
+
+#ifdef _WIN32
+    if (tr.ownerWin && src_w > 0 && src_h > 0) {
+      HWND target = reinterpret_cast<HWND>(tr.ownerWin);
+
+      // 1) 송출 프레임 시점의 창 bounds (snapshot에서 찾기).
+      RECT snapBounds{};
+      bool hasSnap = false;
+      if (output_snapshot) {
+        for (int i = 0; i < output_snapshot->count; ++i) {
+          if (output_snapshot->items[i].hwnd == target) {
+            snapBounds = output_snapshot->items[i].bounds;
+            hasSnap = true;
+            break;
+          }
+        }
+      }
+
+      // 2) 현재 실시간 창 bounds (DWM 직접 조회).
+      RECT curBounds{};
+      bool hasCur = IsWindow(target) &&
+                    SUCCEEDED(DwmGetWindowAttribute(target,
+                                                    DWMWA_EXTENDED_FRAME_BOUNDS,
+                                                    &curBounds, sizeof(curBounds)));
+
+      if (hasSnap || hasCur) {
+        // 모니터 정보 (둘 중 가용한 bounds로 조회).
+        const RECT &refForMon = hasCur ? curBounds : snapBounds;
+        HMONITOR hmon = MonitorFromRect(&refForMon, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi{};
+        mi.cbSize = sizeof(MONITORINFO);
+        if (hmon && GetMonitorInfo(hmon, &mi)) {
+          const int mon_w = mi.rcMonitor.right - mi.rcMonitor.left;
+          const int mon_h = mi.rcMonitor.bottom - mi.rcMonitor.top;
+          if (mon_w > 0 && mon_h > 0) {
+            const float sx =
+                static_cast<float>(src_w) / static_cast<float>(mon_w);
+            const float sy =
+                static_cast<float>(src_h) / static_cast<float>(mon_h);
+
+            // 두 위치(가용한 것들) union 계산. ref 위치 = refX/refY,
+            // ref 창 = refWindowL/T. 새 위치 = ref + (창 delta * src_scale).
+            float xmin = 1e9f, ymin = 1e9f, xmax = -1e9f, ymax = -1e9f;
+            auto addPos = [&](int32_t winL, int32_t winT) {
+              const float bx = tr.refX + (winL - tr.refWindowL) * sx;
+              const float by = tr.refY + (winT - tr.refWindowT) * sy;
+              if (bx < xmin)
+                xmin = bx;
+              if (by < ymin)
+                ymin = by;
+              if (bx + tr.bw > xmax)
+                xmax = bx + tr.bw;
+              if (by + tr.bh > ymax)
+                ymax = by + tr.bh;
+            };
+            if (hasSnap)
+              addPos(snapBounds.left, snapBounds.top);
+            if (hasCur)
+              addPos(curBounds.left, curBounds.top);
+
+            if (xmin < xmax && ymin < ymax) {
+              // 1.5x 여백 (각 변에 25% 확장).
+              const float baseW = xmax - xmin;
+              const float baseH = ymax - ymin;
+              const float padX = baseW * 0.25f;
+              const float padY = baseH * 0.25f;
+              xmin -= padX;
+              ymin -= padY;
+              xmax += padX;
+              ymax += padY;
+
+              // 소스 경계 clamp.
+              if (xmin < 0.0f)
+                xmin = 0.0f;
+              if (ymin < 0.0f)
+                ymin = 0.0f;
+              if (xmax > static_cast<float>(src_w))
+                xmax = static_cast<float>(src_w);
+              if (ymax > static_cast<float>(src_h))
+                ymax = static_cast<float>(src_h);
+
+              outX = xmin;
+              outY = ymin;
+              outW = xmax - xmin;
+              outH = ymax - ymin;
+            }
+          }
+        }
+      }
+    }
+#else
+    (void)output_snapshot;
+    (void)src_w;
+    (void)src_h;
+#endif
+
+    result.push_back({tr.type, outX, outY, outW, outH});
+  }
+
+  if (ghostHidden > 0) {
+    static int s_ghost_throttle = 0;
+    if (++s_ghost_throttle >= 60) {
+      s_ghost_throttle = 0;
+      blog(LOG_DEBUG, "[SecureCast][ghost-snap] gate hidden %d tracker(s)",
+           ghostHidden);
+    }
+  }
+  return result;
 }
