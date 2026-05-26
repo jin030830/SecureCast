@@ -20,6 +20,7 @@
 #include <windows.h>
 #include <dwmapi.h>
 #include "window_tracker.h" // TrackedWindowList (HWND, RECT 사용 위해 windows.h 이후 include)
+#include "scroll_motion_hook.h" // 글로벌 휠/키 hook 시각 query
 #endif
 
 // SIMD intrinsics
@@ -733,6 +734,54 @@ void VisualTrackerManager::update_all_gray(const uint8_t *gray, int gw,
       if (shouldErase)
         trackers_.erase(trackers_.begin() + i);
     }
+
+    // 트래커 stability 평가 — 모션 hysteresis 종료 조건. 모든 활성 트래커가
+    // 새 위치를 안정적으로 매칭 중이면 stable. 박스 확장은 stable=false 동안
+    // 유지되어 NCC가 새 위치 따라잡기 전까지 노출 방지.
+    bool stable = true;
+    for (const auto &tr : trackers_) {
+      if (tr.lastScore < SCORE_OK || tr.framesSinceMatch > 0) {
+        stable = false;
+        break;
+      }
+    }
+    allTrackersStable_.store(stable, std::memory_order_release);
+  }
+}
+
+void VisualTrackerManager::expand_boxes_if_motion(std::vector<VtOcrBox> &boxes,
+                                                  uint32_t src_w,
+                                                  uint32_t src_h) const {
+  (void)src_w; // 수직 확장만 — 인터페이스 일관성을 위해 받음
+  // 신호 소스: 글로벌 mouse/keyboard low-level hook이 휠/PageUp/Down/Home/End
+  // 발생 시 paint 이전에 시각을 기록한다. EMA 사후 신호와 달리 첫 모션부터
+  // 즉시 활성 (사용자 입력 → OS hook → 콜백 < paint).
+  const int64_t last = securecast::last_scroll_motion_time_ms();
+  if (last <= 0)
+    return;
+  const auto now = std::chrono::steady_clock::now();
+  const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             now.time_since_epoch())
+                             .count();
+  const int64_t since = now_ms - last;
+  // safety cap: 비정상 (트래커 영원히 unstable) 시나리오에서 무한 확장 방지.
+  if (since >= MOTION_MAX_HOLD_MS)
+    return;
+  // 최소 hold 후엔 트래커가 모두 stable이면 즉시 종료. unstable이면 유지 →
+  // "완벽 추적 전까지 원래 크기 복귀 안 함" 보장.
+  if (since >= MOTION_MIN_HOLD_MS &&
+      allTrackersStable_.load(std::memory_order_acquire))
+    return;
+  for (auto &b : boxes) {
+    const float origTop = b.y;
+    const float newY = origTop - MOTION_BLUR_EXPAND_PX;
+    b.y = newY < 0.0f ? 0.0f : newY;
+    const float gainedTop = origTop - b.y; // 위로 실제 확장된 양 (0~60)
+    b.h += gainedTop + MOTION_BLUR_EXPAND_PX;
+    if (src_h > 0 && b.y + b.h > static_cast<float>(src_h))
+      b.h = static_cast<float>(src_h) - b.y;
+    if (b.h < 0.0f)
+      b.h = 0.0f;
   }
 }
 
@@ -1161,6 +1210,7 @@ std::vector<VtOcrBox> VisualTrackerManager::active_boxes() const {
            ghostHidden);
     }
   }
+  expand_boxes_if_motion(result, 0, 0);
   return result;
 }
 
@@ -1277,6 +1327,7 @@ VisualTrackerManager::snapshot_for_push(uint32_t src_w, uint32_t src_h) const {
            ghostHidden);
     }
   }
+  expand_boxes_if_motion(result, src_w, src_h);
   return result;
 }
 
@@ -1414,5 +1465,6 @@ std::vector<VtOcrBox> VisualTrackerManager::boxes_for_output_snapshot(
            ghostHidden);
     }
   }
+  expand_boxes_if_motion(result, src_w, src_h);
   return result;
 }

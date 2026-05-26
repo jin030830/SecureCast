@@ -202,6 +202,26 @@ private:
   // 3-A: register_or_update / register_or_update_gray 진입 시 갱신 (ms 단위).
   std::atomic<uint64_t> lastOcrUpdateTsMs_{0};
 
+  // 스크롤 모션 hysteresis: 글로벌 mouse/keyboard hook이 시각 기록
+  // (scroll_motion_hook 모듈). 박스 반환 함수가 다음 조건 만족 시 박스 h 확장:
+  //   1) 모션 후 MIN_HOLD_MS 이내 (즉시 종료 방지)
+  //   2) OR 활성 트래커 중 NCC unstable(lastScore<SCORE_OK 또는 framesSinceMatch>0)
+  //      → "완벽 추적 전까지 확장 유지"
+  //   3) MAX_HOLD_MS 초과 시 강제 종료 (safety cap)
+  // hook은 paint 이전 인과 신호라 첫 모션부터 즉시 활성.
+  static constexpr int64_t MOTION_MIN_HOLD_MS = 300;
+  static constexpr int64_t MOTION_MAX_HOLD_MS = 5000;
+  static constexpr float MOTION_BLUR_EXPAND_PX = 60.0f; // 위/아래 각각
+
+  // update_all_gray가 매 사이클 갱신. 모든 활성 트래커가 lastScore>=SCORE_OK +
+  // framesSinceMatch==0이면 true. helper가 종료 조건으로 사용.
+  mutable std::atomic<bool> allTrackersStable_{true};
+
+  // 모션 hysteresis 활성 시 박스 h를 위아래로 확장. src_h>0이면 하단 clamp.
+  // src_w 인자는 미사용 (수직 확장만) — 인터페이스 일관성을 위해 받음.
+  void expand_boxes_if_motion(std::vector<VtOcrBox> &boxes, uint32_t src_w,
+                              uint32_t src_h) const;
+
   // NCC score: template top-left at (sx, sy) in gray frame (scalar fallback)
   float ncc_at(const uint8_t *gray, int gstride, int gw, int gh,
                const std::vector<uint8_t> &tmpl, int tw, int th, int sx,
