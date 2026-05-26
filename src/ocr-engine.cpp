@@ -312,6 +312,18 @@ SecureCastOcrEngine::analyze_bgra_frame(const uint8_t *pixels, int width,
       multipass_small_text(lines, pixels, width, height, stride);
   auto boxes = detect_pii(updatedLines);
 
+  // 좌표 sanity check: frame 경계를 벗어나거나 비현실적으로 작은 박스 제거.
+  // multipass Phase 2 좌표 환산 실패나 메타 캡처로 들어온 이상 박스 차단.
+  // 사용자 로그에서 bbox=(2138, ...) > frame width 868 같은 OOB가 관찰됨.
+  boxes.erase(std::remove_if(boxes.begin(), boxes.end(),
+                             [width, height](const SecureCastOcrBox &b) {
+                               return b.x < 0.0f || b.y < 0.0f ||
+                                      b.x + b.w > static_cast<float>(width) ||
+                                      b.y + b.h > static_cast<float>(height) ||
+                                      b.w < 2.0f || b.h < 2.0f;
+                             }),
+              boxes.end());
+
   // L1 캐시 갱신 (VisualTracker가 좌표 추적 담당, OCR은 탐지/확인만 수행)
   lastRoiDhash_ = compute_roi_dhash(pixels, stride, width, height);
   hasLastRoiDhash_ = true;
