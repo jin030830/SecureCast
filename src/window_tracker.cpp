@@ -642,7 +642,13 @@ extern "C" uint64_t sc_get_minimize_end_ns(HWND hwnd)
 namespace {
 
 // EnumWindows callback for sc_find_all_alive_blacklist_windows.
-// 가시성/크기/visibility 필터 모두 생략 — 살아있는 블랙리스트 exe HWND라면 추가.
+// 살아있는 BL exe의 HWND 중 사용자에게 노출 가능한 창만 통과시킨다:
+//   - IsWindowVisible=false → 일반적으로 Electron/Chromium 앱의 hidden helper
+//     hwnd (Discord/Slack 등에서 다수 존재). 사용자에게 안 보이므로 lingering
+//     등록 시 실제 가시 창보다 큰 박스가 생기는 원인. 거른다.
+//   - non-iconic 창 중 100x100 미만 → 마찬가지로 helper hwnd 의심. 거른다.
+//   - iconic(minimized) 창 → peek 시 잠시 화면에 뜨므로 통과. bounds는 아래에서
+//     rcNormalPosition으로 산출한다(GetWindowRect는 화면 밖 좌표라 무의미).
 BOOL CALLBACK enum_all_blacklist_proc(HWND hwnd, LPARAM lparam)
 {
 	auto *out = reinterpret_cast<TrackedWindowList *>(lparam);
@@ -651,6 +657,10 @@ BOOL CALLBACK enum_all_blacklist_proc(HWND hwnd, LPARAM lparam)
 
 	// 닫힌 창은 패스 (EnumWindows는 보통 살아있는 것만 주지만 방어적).
 	if (!IsWindow(hwnd))
+		return TRUE;
+
+	// hidden helper 거르기 — minimized는 visible=true 유지하므로 통과한다.
+	if (!IsWindowVisible(hwnd))
 		return TRUE;
 
 	// 프로세스 → exe 매칭.
@@ -674,13 +684,26 @@ BOOL CALLBACK enum_all_blacklist_proc(HWND hwnd, LPARAM lparam)
 	if (!is_blacklisted(exe_name))
 		return TRUE;
 
+	// non-iconic 가시 창 중 100x100 미만은 helper hwnd로 보고 거른다.
+	// iconic이면 GetWindowRect가 화면 밖 좌표라 의미 없으므로 size check를 건너뛴다.
+	const bool iconic = IsIconic(hwnd) != 0;
+	if (!iconic) {
+		RECT wr{};
+		if (GetWindowRect(hwnd, &wr)) {
+			const LONG w = wr.right - wr.left;
+			const LONG h = wr.bottom - wr.top;
+			if (w < MIN_WINDOW_DIMENSION || h < MIN_WINDOW_DIMENSION)
+				return TRUE;
+		}
+	}
+
 	// Bounds 산출:
 	//   iconic이면 GetWindowPlacement.rcNormalPosition (workspace 좌표)을 모니터
 	//   origin 보정해서 화면 좌표로 변환.
 	//   non-iconic이면 DWM EXTENDED_FRAME_BOUNDS 우선, 실패하면 GetWindowRect.
 	RECT bounds{};
 	bool gotBounds = false;
-	if (IsIconic(hwnd)) {
+	if (iconic) {
 		WINDOWPLACEMENT wp{};
 		wp.length = sizeof(wp);
 		if (GetWindowPlacement(hwnd, &wp)) {
@@ -916,11 +939,15 @@ bool wcsistr_contains(const wchar_t *hay, const wchar_t *needle)
 }
 
 // 살아있는 BL 앱 목록(`alive` — TrackedWindowList의 exe_name들)에 매핑된 displayName
-// 중 하나라도 Name에 포함되면 true.
+// 중 하나라도 Name에 포함되면 true. 매칭된 exe(`kBlacklistApps[].exe`)는 out_exe로
+// 반환되어 호출자가 lingering 등록 대상을 좁히는 데 사용한다.
 // alive가 비어있으면 항상 false (B안: 살아있어야만 가드 대상).
 bool name_matches_alive_blacklist(const wchar_t *name,
-                                  const TrackedWindowList *alive)
+                                  const TrackedWindowList *alive,
+                                  wchar_t *out_exe, size_t out_cap)
 {
+	if (out_exe && out_cap > 0)
+		out_exe[0] = 0;
 	if (!name || !*name || !alive || alive->count == 0)
 		return false;
 	for (int i = 0; i < alive->count; ++i) {
@@ -931,8 +958,17 @@ bool name_matches_alive_blacklist(const wchar_t *name,
 			for (const wchar_t *display : app.displayNames) {
 				if (!display)
 					break;
-				if (wcsistr_contains(name, display))
+				if (wcsistr_contains(name, display)) {
+					if (out_exe && out_cap > 0) {
+						size_t i2 = 0;
+						while (app.exe[i2] && i2 + 1 < out_cap) {
+							out_exe[i2] = app.exe[i2];
+							++i2;
+						}
+						out_exe[i2] = 0;
+					}
 					return true;
+				}
 			}
 		}
 	}
@@ -968,7 +1004,8 @@ IUIAutomation *get_or_create_uia()
 	return g_uiaPtr;
 }
 
-// 한 버튼 element가 블랙리스트 앱인지 다단계로 판정.
+// 한 버튼 element가 블랙리스트 앱인지 다단계로 판정. 매칭된 BL exe는 out_exe로
+// 반환되어 호출자가 lingering 등록 대상을 좁히는 데 사용된다.
 // 1) NativeWindowHandle → 그 hwnd의 PID → exe
 // 2) 안 되면 element ProcessId 직접
 // 3) 둘 다 fail이면 alive BL exe set에 매핑된 displayName으로 Name 매칭
@@ -976,8 +1013,11 @@ IUIAutomation *get_or_create_uia()
 // Win11 작업표시줄은 모든 버튼이 explorer.exe라 사실상 3) Name 매칭이 주된 경로.
 // alive list가 비어있으면 3)도 항상 false → BL 결정 불가능 = false 반환.
 bool element_is_blacklist_btn(IUIAutomationElement *btn,
-                              const TrackedWindowList *alive)
+                              const TrackedWindowList *alive,
+                              wchar_t *out_exe, size_t out_cap)
 {
+	if (out_exe && out_cap > 0)
+		out_exe[0] = 0;
 	if (!btn)
 		return false;
 
@@ -998,9 +1038,17 @@ bool element_is_blacklist_btn(IUIAutomationElement *btn,
 		                    sizeof(exe_name) / sizeof(exe_name[0]))) {
 			if (iequals(exe_name, L"explorer.exe"))
 				; // pass — Name으로 보조 매칭 한 번 더 시도
-			else if (is_blacklisted(exe_name))
+			else if (is_blacklisted(exe_name)) {
+				if (out_exe && out_cap > 0) {
+					size_t i = 0;
+					while (exe_name[i] && i + 1 < out_cap) {
+						out_exe[i] = exe_name[i];
+						++i;
+					}
+					out_exe[i] = 0;
+				}
 				return true;
-			else
+			} else
 				return false; // 다른 앱 확정
 		}
 	}
@@ -1009,14 +1057,23 @@ bool element_is_blacklist_btn(IUIAutomationElement *btn,
 	BSTR bstrName = nullptr;
 	bool nameHit = false;
 	if (SUCCEEDED(btn->get_CurrentName(&bstrName)) && bstrName) {
-		nameHit = name_matches_alive_blacklist(bstrName, alive);
+		nameHit = name_matches_alive_blacklist(bstrName, alive, out_exe,
+		                                        out_cap);
 		SysFreeString(bstrName);
 	}
 	return nameHit;
 }
 
+// 캐시된 버튼 하나. rect는 화면 좌표, exe는 어떤 BL 앱에 매핑됐는지(`KakaoTalk.exe`
+// 등). hover hit 시 이 exe를 ScHoverInfo로 반환해 호출자가 lingering 등록을 그 exe로
+// 좁힐 수 있게 한다.
+struct CachedBtn {
+	RECT rect;
+	wchar_t exe[64];
+};
+
 struct BtnCache {
-	std::vector<RECT> rects;        // 블랙리스트 버튼들의 화면 좌표
+	std::vector<CachedBtn> btns;
 	uint64_t lastUpdateMs = 0;      // 마지막 rebuild 시각
 	bool everSucceeded = false;     // 한 번이라도 UIA가 작업표시줄 element를 잡았는지
 	std::mutex mtx;
@@ -1031,7 +1088,7 @@ constexpr uint64_t kBtnCacheTtlMs = 5000;
 // 호출자는 alive->count > 0 일 때만 이 함수를 호출해야 한다.
 void rebuild_btn_cache_locked(const TrackedWindowList *alive)
 {
-	g_btnCache.rects.clear();
+	g_btnCache.btns.clear();
 
 	IUIAutomation *uia = get_or_create_uia();
 	if (!uia) {
@@ -1082,12 +1139,15 @@ void rebuild_btn_cache_locked(const TrackedWindowList *alive)
 				if (FAILED(buttons->GetElement(i, &btn)) || !btn)
 					continue;
 
-				if (element_is_blacklist_btn(btn, alive)) {
-					RECT r{};
+				CachedBtn cb{};
+				if (element_is_blacklist_btn(
+				        btn, alive, cb.exe,
+				        sizeof(cb.exe) / sizeof(cb.exe[0]))) {
 					if (SUCCEEDED(btn->get_CurrentBoundingRectangle(
-					        &r)) &&
-					    r.right > r.left && r.bottom > r.top) {
-						g_btnCache.rects.push_back(r);
+					        &cb.rect)) &&
+					    cb.rect.right > cb.rect.left &&
+					    cb.rect.bottom > cb.rect.top) {
+						g_btnCache.btns.push_back(cb);
 					}
 				}
 				btn->Release();
@@ -1105,13 +1165,16 @@ void rebuild_btn_cache_locked(const TrackedWindowList *alive)
 
 } // namespace
 
-extern "C" ScTaskbarHoverResult sc_taskbar_hover_blacklist_btn()
+extern "C" ScHoverInfo sc_taskbar_hover_blacklist_btn()
 {
+	ScHoverInfo info{};
+	info.result = SC_TB_HOVER_UNKNOWN;
+
 	POINT pt{};
 	if (!GetCursorPos(&pt))
-		return SC_TB_HOVER_UNKNOWN;
+		return info;
 	if (!point_over_any_taskbar(pt))
-		return SC_TB_HOVER_UNKNOWN;
+		return info;
 
 	// [B안] 살아있는 BL 앱이 0개면 hover 어디든 BL일 수 없음 → OTHER 확정.
 	// EnumWindows ~수 ms 비용이지만 매 tick 호출자가 이미 같은 함수를 호출하므로
@@ -1120,9 +1183,10 @@ extern "C" ScTaskbarHoverResult sc_taskbar_hover_blacklist_btn()
 	sc_find_all_alive_blacklist_windows(&alive);
 	if (alive.count == 0) {
 		std::lock_guard<std::mutex> lock(g_btnCache.mtx);
-		g_btnCache.rects.clear();
+		g_btnCache.btns.clear();
 		g_btnCache.lastUpdateMs = GetTickCount64();
-		return SC_TB_HOVER_OTHER;
+		info.result = SC_TB_HOVER_OTHER;
+		return info;
 	}
 
 	std::lock_guard<std::mutex> lock(g_btnCache.mtx);
@@ -1135,11 +1199,21 @@ extern "C" ScTaskbarHoverResult sc_taskbar_hover_blacklist_btn()
 	// UIA가 작업표시줄 element를 한 번도 못 잡았으면 식별 자체 불가 → UNKNOWN
 	// (호출자는 본래 동작으로 fallback).
 	if (!g_btnCache.everSucceeded)
-		return SC_TB_HOVER_UNKNOWN;
+		return info;
 
-	for (const RECT &r : g_btnCache.rects) {
-		if (PtInRect(&r, pt))
-			return SC_TB_HOVER_BLACKLIST;
+	for (const CachedBtn &cb : g_btnCache.btns) {
+		if (PtInRect(&cb.rect, pt)) {
+			info.result = SC_TB_HOVER_BLACKLIST;
+			size_t i = 0;
+			const size_t cap = sizeof(info.exe) / sizeof(info.exe[0]);
+			while (cb.exe[i] && i + 1 < cap) {
+				info.exe[i] = cb.exe[i];
+				++i;
+			}
+			info.exe[i] = 0;
+			return info;
+		}
 	}
-	return SC_TB_HOVER_OTHER;
+	info.result = SC_TB_HOVER_OTHER;
+	return info;
 }

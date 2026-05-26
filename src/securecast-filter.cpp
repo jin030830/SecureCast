@@ -1996,14 +1996,27 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
     // 미리보기 영역으로 옮겨가면 hoverResult가 UNKNOWN으로 떨어지지만, hysteresis
     // 안에 OTHER 신호가 살아있으면 OFF 유지(메모장 peek 동안 카톡 블러 박스가
     // 끌려오는 회귀 차단).
-    ScTaskbarHoverResult hoverResult = SC_TB_HOVER_UNKNOWN;
+    ScHoverInfo hoverInfo{};
+    hoverInfo.result = SC_TB_HOVER_UNKNOWN;
     if (mouseOverTaskbar)
-      hoverResult = sc_taskbar_hover_blacklist_btn();
-    if (hoverResult == SC_TB_HOVER_BLACKLIST)
+      hoverInfo = sc_taskbar_hover_blacklist_btn();
+    const ScTaskbarHoverResult hoverResult = hoverInfo.result;
+    if (hoverResult == SC_TB_HOVER_BLACKLIST) {
       filter->lastHoverBlacklistTick = nowTick;
-    else if (hoverResult == SC_TB_HOVER_OTHER)
+      // 매칭 exe 갱신 — lingering 등록 시 alive BL 중 이 exe만 통과.
+      size_t i = 0;
+      const size_t cap = sizeof(filter->lastHoverExe) /
+                          sizeof(filter->lastHoverExe[0]);
+      while (hoverInfo.exe[i] && i + 1 < cap) {
+        filter->lastHoverExe[i] = hoverInfo.exe[i];
+        ++i;
+      }
+      filter->lastHoverExe[i] = 0;
+    } else if (hoverResult == SC_TB_HOVER_OTHER) {
       filter->lastHoverNotBlacklistTick = nowTick;
-    // UNKNOWN은 두 tick 다 손대지 않음 (fail-safe).
+    }
+    // UNKNOWN은 두 tick 다 손대지 않음 (fail-safe). lastHoverExe도 보존하여
+    // 미리보기 영역으로 이동한 직후의 회귀를 막는다.
 
     // 미리보기 영역에 머무는 동안(mouseOverTaskbar=false but previewActive=true)
     // hover_blacklist_btn이 호출되지 않아 직전 신호가 점차 만료되고 결국 fail-safe
@@ -2054,11 +2067,17 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
       sc_find_all_alive_blacklist_windows(&aliveBl);
       if (aliveBl.count > 0) {
         filter->previewActiveNs = os_gettime_ns();
-        // 살아있는 블랙리스트 앱의 화면상 bounds(iconic이면 restored 위치)에
-        // lingering 등록. peek 끝나면 previewActiveNs 컷오프로 자연 소멸.
-        for (int i = 0; i < aliveBl.count; ++i)
+        // exe 필터링: blRecent 동안에는 hover된 그 BL exe만 lingering 등록해
+        // "카톡 hover 시 Discord까지 가려짐" 회귀를 차단. fail-safe(blRecent 만료)
+        // 시에는 stale exe 사용을 피하기 위해 전체 등록 — UIA 실패 환경 등 안전 우선.
+        const bool filterByExe = blRecent && filter->lastHoverExe[0] != 0;
+        for (int i = 0; i < aliveBl.count; ++i) {
+          if (filterByExe &&
+              _wcsicmp(aliveBl.items[i].exe_name, filter->lastHoverExe) != 0)
+            continue;
           register_lingering_window(filter, aliveBl.items[i],
                                     /*fromPreview=*/true);
+        }
       }
     }
   }

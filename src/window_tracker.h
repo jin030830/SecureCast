@@ -127,10 +127,10 @@ bool sc_mouse_over_taskbar();
 // 자동 보정.
 bool sc_mouse_over_thumbnail_zone();
 
-// 살아있는 모든 블랙리스트 프로세스의 top-level HWND를 즉시 enum해서 out에 채움.
-// sc_scan_blacklisted_windows와 달리 가시성/크기/visibleRects 필터 없음 —
-// 최소화 상태(iconic) 또는 cloaked 상태인 창도 포함. peek가 그런 창을 잠시
-// 화면에 띄울 때 lingering 등록 대상으로 쓰기 위함.
+// 살아있는 모든 블랙리스트 프로세스의 사용자 노출 가능 top-level HWND를 즉시 enum해서
+// out에 채움. minimized(iconic) 창은 통과(peek 시 잠시 화면에 뜨므로), Electron류 앱이
+// 다수 만드는 hidden helper hwnd(IsWindowVisible=false 또는 non-iconic & <100x100)는
+// 거른다 — 그렇지 않으면 hover 가드가 실제 가시 창보다 큰 블러 박스를 그린다.
 // 각 항목의 bounds: iconic이면 GetWindowPlacement.rcNormalPosition을 화면 좌표로
 // 변환한 값(=복원 시 표시될 위치), 아니면 DWM EXTENDED_FRAME_BOUNDS.
 // 반환값: out->count에 채워진 개수.
@@ -144,6 +144,14 @@ typedef enum ScTaskbarHoverResult {
   SC_TB_HOVER_OTHER,      // 마우스 아래 버튼이 다른 앱
   SC_TB_HOVER_UNKNOWN     // 식별 불가(작업표시줄 밖, 빈 영역, UIA 실패 등)
 } ScTaskbarHoverResult;
+
+// hover 식별의 매칭 정보. BLACKLIST 결과일 때만 `exe`가 채워진다(예: "KakaoTalk.exe").
+// 호출자는 이 exe로 lingering 등록 대상을 좁혀, 한 BL 앱을 hover했을 때 다른
+// 살아있는 BL 앱들까지 함께 가려지는 회귀를 막는다.
+typedef struct ScHoverInfo {
+  ScTaskbarHoverResult result;
+  wchar_t exe[64];
+} ScHoverInfo;
 
 // 살아있는 블랙리스트 앱의 작업표시줄 버튼 위치를 사전 매핑(UIA 1회 enum, ~5초 TTL
 // 캐시)한 뒤, 현재 마우스 좌표가 그 버튼 사각형 중 하나에 들어있는지 확인.
@@ -163,9 +171,9 @@ typedef enum ScTaskbarHoverResult {
 // 캐시는 약 5초 TTL — 작업표시줄 재배치/앱 추가-제거 대응. UIA FindAll은 30~80ms
 // 비용이라 매 video_tick 호출은 부담이므로 캐시 갱신은 hit 시 자동(만료된 경우만).
 //
-// 반환값: 블랙리스트 버튼 위면 BLACKLIST, 작업표시줄 다른 위치면 OTHER, 작업표시줄
-//        밖이거나 UIA가 한 번도 작업표시줄 element를 못 잡았으면 UNKNOWN.
-ScTaskbarHoverResult sc_taskbar_hover_blacklist_btn();
+// 반환값: ScHoverInfo. result는 BLACKLIST/OTHER/UNKNOWN. result==BLACKLIST일 때
+//        exe에 매칭된 BL exe(예: "KakaoTalk.exe")가 채워진다. 그 외엔 exe[0]=0.
+ScHoverInfo sc_taskbar_hover_blacklist_btn();
 
 // `target` 창의 bounds를 z-order 위의 다른 top-level 창들로 잘라서 실제
 // 화면에 노출된 disjoint 사각형들을 out에 채워 반환한다.

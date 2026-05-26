@@ -266,6 +266,10 @@ struct SecureCastFilter {
   // 의도가 만료되지 않는다(=메모장 peek 동안 카톡 블러가 끌려오는 회귀 차단).
   uint64_t lastHoverBlacklistTick = 0;
   uint64_t lastHoverNotBlacklistTick = 0;
+  // 마지막으로 BL hover가 인식된 시점의 매칭 exe(예: "KakaoTalk.exe"). lingering
+  // 등록 시 alive BL 중 이 exe와 일치하는 인스턴스만 통과시켜, 카톡 hover로 Discord
+  // 까지 가려지는 회귀를 막는다. blRecent가 만료되면 stale 방지를 위해 무시한다.
+  wchar_t lastHoverExe[64] = {0};
 
   // ----- [Game Mode] CPU 사용률 기반 자동 전환 -----
   float cpuSampleAccumulator = 0.0f; // 1초 샘플링 누산기
