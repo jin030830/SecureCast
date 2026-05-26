@@ -1985,7 +1985,71 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
         (nowTick - filter->lastInThumbnailZoneTick) < kPreviewHystMs;
     const bool previewActive = peekTrigger || zoneHystActive;
 
-    if (previewActive) {
+    // [hover 식별 — 역방향 매핑 + 양방향 hysteresis + fail-safe]
+    // 살아있는 블랙리스트 앱의 작업표시줄 버튼 BoundingRectangle을 UIA로 사전 매핑한
+    // 캐시(5초 TTL)와 마우스 위치를 비교 — exe 이름 기반이라 환경/언어 무관.
+    //   BLACKLIST → lastHoverBlacklistTick 갱신
+    //   OTHER     → lastHoverNotBlacklistTick 갱신
+    //   UNKNOWN   → 둘 다 손대지 않음 (직전 신호 hysteresis 살림)
+    //
+    // 가드 결정은 마지막으로 본 신호(BL vs OTHER) 기준 — 마우스가 작업표시줄에서
+    // 미리보기 영역으로 옮겨가면 hoverResult가 UNKNOWN으로 떨어지지만, hysteresis
+    // 안에 OTHER 신호가 살아있으면 OFF 유지(메모장 peek 동안 카톡 블러 박스가
+    // 끌려오는 회귀 차단).
+    ScTaskbarHoverResult hoverResult = SC_TB_HOVER_UNKNOWN;
+    if (mouseOverTaskbar)
+      hoverResult = sc_taskbar_hover_blacklist_btn();
+    if (hoverResult == SC_TB_HOVER_BLACKLIST)
+      filter->lastHoverBlacklistTick = nowTick;
+    else if (hoverResult == SC_TB_HOVER_OTHER)
+      filter->lastHoverNotBlacklistTick = nowTick;
+    // UNKNOWN은 두 tick 다 손대지 않음 (fail-safe).
+
+    // 미리보기 영역에 머무는 동안(mouseOverTaskbar=false but previewActive=true)
+    // hover_blacklist_btn이 호출되지 않아 직전 신호가 점차 만료되고 결국 fail-safe
+    // (gate=1)로 떨어진다 — 사용자가 메모장 미리보기를 1.5초 이상 보면 카톡 블러가
+    // 발동하는 회귀의 원인. peek 미리보기는 "마지막으로 hover한 아이콘" 기준이므로
+    // 그 신호를 미리보기 동안 매 frame refresh해 hysteresis가 끊기지 않게 한다.
+    // previewActive가 false로 떨어지면 refresh 멈춰 자연 만료(1.5초 후).
+    if (previewActive && !mouseOverTaskbar) {
+      if (filter->lastHoverBlacklistTick > 0 &&
+          filter->lastHoverBlacklistTick >= filter->lastHoverNotBlacklistTick) {
+        filter->lastHoverBlacklistTick = nowTick;
+      } else if (filter->lastHoverNotBlacklistTick > 0) {
+        filter->lastHoverNotBlacklistTick = nowTick;
+      }
+    }
+
+    constexpr uint64_t kHoverBlHystMs = 1500;
+    const bool blRecent =
+        filter->lastHoverBlacklistTick != 0 &&
+        (nowTick - filter->lastHoverBlacklistTick) < kHoverBlHystMs;
+    const bool otherRecent =
+        filter->lastHoverNotBlacklistTick != 0 &&
+        (nowTick - filter->lastHoverNotBlacklistTick) < kHoverBlHystMs;
+    // 가장 최근 신호 = 두 tick 중 큰 쪽 (둘 다 0이면 신호 없음)
+    const bool blIsMoreRecent =
+        filter->lastHoverBlacklistTick > filter->lastHoverNotBlacklistTick;
+
+    // 가드 발동 조건:
+    //   - 현재 BLACKLIST hover 확정      → ON (즉시)
+    //   - BL이 hysteresis 안 + 최근 신호  → ON (strip 이동 갭 보전)
+    //   - OTHER가 hysteresis 안 + 최근 신호 → OFF (메모장 peek 등)
+    //   - 둘 다 hysteresis 밖             → UNKNOWN fail-safe (안전 우선 ON)
+    bool hoverGateOpen;
+    if (hoverResult == SC_TB_HOVER_BLACKLIST) {
+      hoverGateOpen = true;
+    } else if (blRecent && blIsMoreRecent) {
+      hoverGateOpen = true;
+    } else if (otherRecent) {
+      hoverGateOpen = false;
+    } else {
+      // 작업표시줄/미리보기 진입 직후 등 신호가 아직 없는 상태 — UIA가 한 번도
+      // 작업표시줄을 못 잡는 환경 포함. 안전을 위해 ON.
+      hoverGateOpen = true;
+    }
+
+    if (previewActive && hoverGateOpen) {
       TrackedWindowList aliveBl{};
       sc_find_all_alive_blacklist_windows(&aliveBl);
       if (aliveBl.count > 0) {

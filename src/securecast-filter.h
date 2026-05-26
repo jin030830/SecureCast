@@ -260,6 +260,12 @@ struct SecureCastFilter {
   // 썸네일이 실제로 떠 있다는 것은 직전에 마우스가 작업표시줄에 있었다는 뜻.
   // 이 없이 zone만으로 판정하면 단순히 화면 하단을 지나가도 발동돼버림.
   uint64_t lastOverTaskbarTick = 0;
+  // 마지막으로 마우스가 블랙리스트/비-블랙리스트 작업표시줄 버튼 위에 있었던 시각.
+  // 두 tick 중 큰(=최근) 쪽이 현재 hover 의도로 간주되며, hysteresis(1.5s) 안의
+  // 신호만 유효. previewActive 동안에는 매 frame refresh되어 미리보기를 보는 동안
+  // 의도가 만료되지 않는다(=메모장 peek 동안 카톡 블러가 끌려오는 회귀 차단).
+  uint64_t lastHoverBlacklistTick = 0;
+  uint64_t lastHoverNotBlacklistTick = 0;
 
   // ----- [Game Mode] CPU 사용률 기반 자동 전환 -----
   float cpuSampleAccumulator = 0.0f; // 1초 샘플링 누산기

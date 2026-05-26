@@ -182,15 +182,20 @@ endif()
 # Windows 전용 시스템 라이브러리.
 #   d3d11/dxgi : Role C의 N-Frame Delay Queue가 GPU 텍스처를 staging buffer로
 #                옮길 때 필요할 수 있다.
-#   dwmapi     : Role A의 window_tracker가 DwmGetWindowAttribute로 정확한
-#                창 좌표를 얻기 위해 필요하다.
-#   windowsapp : C++/WinRT / Windows Runtime API 사용 시 필요할 수 있다.
+#   dwmapi            : Role A의 window_tracker가 DwmGetWindowAttribute로 정확한
+#                       창 좌표를 얻기 위해 필요하다.
+#   windowsapp        : C++/WinRT / Windows Runtime API 사용 시 필요할 수 있다.
+#   uiautomationcore  : 작업표시줄 hover 가드가 IUIAutomation으로 블랙리스트 앱의
+#                       작업표시줄 버튼 위치를 매핑하기 위해 필요.
+#   ole32             : CoCreateInstance / CoInitializeEx (UIA COM 초기화).
 if(WIN32)
   target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE
     d3d11
     dxgi
     dwmapi
     windowsapp
+    uiautomationcore
+    ole32
   )
 endif()
 

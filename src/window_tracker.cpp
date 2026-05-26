@@ -28,10 +28,13 @@
 #include <dwmapi.h>     // DwmGetWindowAttribute
 #include <psapi.h>      // QueryFullProcessImageNameW (psapi 또는 kernel32 양쪽 노출)
 #include <wctype.h>     // towlower
+#include <objbase.h>    // CoInitializeEx / CoCreateInstance
+#include <uiautomation.h> // IUIAutomation, ElementFromHandle, FindAll
 
 #include <atomic>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
 
 namespace {
 
@@ -832,4 +835,311 @@ extern "C" bool sc_mouse_over_thumbnail_zone()
 			return true;
 	}
 	return false;
+}
+
+// ────────────────────────────────────────────────────────────
+// UI Automation 기반 작업표시줄 블랙리스트 버튼 위치 매핑
+//
+// 접근: 마우스 아래 element를 식별하는 대신, 살아있는 블랙리스트 앱의 작업표시줄
+// 버튼 BoundingRectangle을 사전에 enum해서 캐시. 마우스 위치 검사 시 캐시 hit만
+// 확인 — 사용자 환경의 UIA Name 표기에 무관하게 exe 이름 기반으로 매칭.
+// ────────────────────────────────────────────────────────────
+namespace {
+
+bool point_over_any_taskbar(POINT pt)
+{
+	HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
+	if (tray) {
+		RECT r{};
+		if (GetWindowRect(tray, &r) && PtInRect(&r, pt))
+			return true;
+	}
+	HWND tray2 = nullptr;
+	while ((tray2 = FindWindowExW(nullptr, tray2, L"Shell_SecondaryTrayWnd",
+	                               nullptr)) != nullptr) {
+		RECT r{};
+		if (GetWindowRect(tray2, &r) && PtInRect(&r, pt))
+			return true;
+	}
+	return false;
+}
+
+bool pid_to_exe_name(DWORD pid, wchar_t *exe_name, size_t cap)
+{
+	if (pid == 0 || cap == 0)
+		return false;
+	HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+	if (!proc)
+		return false;
+	wchar_t exe_path[MAX_PATH] = {};
+	DWORD path_size = MAX_PATH;
+	bool ok = QueryFullProcessImageNameW(proc, 0, exe_path, &path_size) != 0;
+	CloseHandle(proc);
+	if (!ok)
+		return false;
+	path_basename(exe_path, exe_name, cap);
+	return true;
+}
+
+// Name 속성 보조 매칭 사전 — UIA가 작업표시줄 버튼에 대해 PID를 노출하지 않을 때
+// fallback. Win11의 새 작업표시줄은 모든 버튼이 explorer.exe로 보고되므로 사실상
+// 이 Name 매칭이 주된 식별 경로.
+// exe별로 displayName 후보를 묶어, "살아있는 BL 앱의 exe"에 매핑된 표기만 매칭
+// 활성화한다. 카톡이 핀만 되어 있고 종료 상태면 'KakaoTalk' Name도 매칭에서 제외
+// → '카카오톡 고정됨' false positive 차단.
+struct BlacklistAppNames {
+	const wchar_t *exe;            // basename (예: L"KakaoTalk.exe"), iequals 비교
+	const wchar_t *displayNames[4]; // null-terminated, 다국어 표기
+};
+
+const BlacklistAppNames kBlacklistApps[] = {
+	{L"KakaoTalk.exe", {L"KakaoTalk", L"카카오톡", nullptr, nullptr}},
+	{L"Discord.exe",   {L"Discord", nullptr, nullptr, nullptr}},
+	{L"Slack.exe",     {L"Slack", nullptr, nullptr, nullptr}},
+};
+
+bool wcsistr_contains(const wchar_t *hay, const wchar_t *needle)
+{
+	if (!hay || !needle || !*needle)
+		return false;
+	for (const wchar_t *h = hay; *h; ++h) {
+		const wchar_t *a = h;
+		const wchar_t *b = needle;
+		while (*a && *b && towlower(*a) == towlower(*b)) {
+			++a;
+			++b;
+		}
+		if (!*b)
+			return true;
+	}
+	return false;
+}
+
+// 살아있는 BL 앱 목록(`alive` — TrackedWindowList의 exe_name들)에 매핑된 displayName
+// 중 하나라도 Name에 포함되면 true.
+// alive가 비어있으면 항상 false (B안: 살아있어야만 가드 대상).
+bool name_matches_alive_blacklist(const wchar_t *name,
+                                  const TrackedWindowList *alive)
+{
+	if (!name || !*name || !alive || alive->count == 0)
+		return false;
+	for (int i = 0; i < alive->count; ++i) {
+		const wchar_t *aliveExe = alive->items[i].exe_name;
+		for (const auto &app : kBlacklistApps) {
+			if (!iequals(app.exe, aliveExe))
+				continue;
+			for (const wchar_t *display : app.displayNames) {
+				if (!display)
+					break;
+				if (wcsistr_contains(name, display))
+					return true;
+			}
+		}
+	}
+	return false;
+}
+
+// UIA COM 상태 (호출 스레드 기준 lazy init).
+std::atomic<bool> g_uiaInitTried{false};
+std::atomic<bool> g_uiaCoInitOk{false};
+IUIAutomation *g_uiaPtr = nullptr;
+std::mutex g_uiaInitMtx;
+
+IUIAutomation *get_or_create_uia()
+{
+	if (g_uiaPtr)
+		return g_uiaPtr;
+	std::lock_guard<std::mutex> lock(g_uiaInitMtx);
+	if (g_uiaPtr)
+		return g_uiaPtr;
+	if (!g_uiaInitTried.exchange(true)) {
+		HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+		g_uiaCoInitOk.store(SUCCEEDED(hr) || hr == RPC_E_CHANGED_MODE);
+	}
+	if (!g_uiaCoInitOk.load())
+		return nullptr;
+	IUIAutomation *uia = nullptr;
+	HRESULT hr = CoCreateInstance(__uuidof(CUIAutomation), nullptr,
+	                              CLSCTX_INPROC_SERVER, __uuidof(IUIAutomation),
+	                              reinterpret_cast<void **>(&uia));
+	if (FAILED(hr) || !uia)
+		return nullptr;
+	g_uiaPtr = uia;
+	return g_uiaPtr;
+}
+
+// 한 버튼 element가 블랙리스트 앱인지 다단계로 판정.
+// 1) NativeWindowHandle → 그 hwnd의 PID → exe
+// 2) 안 되면 element ProcessId 직접
+// 3) 둘 다 fail이면 alive BL exe set에 매핑된 displayName으로 Name 매칭
+// explorer.exe인 경우는 작업표시줄 자체 element라 1)/2)에서는 false로 떨어지지만
+// Win11 작업표시줄은 모든 버튼이 explorer.exe라 사실상 3) Name 매칭이 주된 경로.
+// alive list가 비어있으면 3)도 항상 false → BL 결정 불가능 = false 반환.
+bool element_is_blacklist_btn(IUIAutomationElement *btn,
+                              const TrackedWindowList *alive)
+{
+	if (!btn)
+		return false;
+
+	DWORD pid = 0;
+	UIA_HWND uhwnd = nullptr;
+	if (SUCCEEDED(btn->get_CurrentNativeWindowHandle(&uhwnd)) && uhwnd) {
+		GetWindowThreadProcessId(reinterpret_cast<HWND>(uhwnd), &pid);
+	}
+	if (pid == 0) {
+		int ipid = 0;
+		if (SUCCEEDED(btn->get_CurrentProcessId(&ipid)) && ipid > 0)
+			pid = static_cast<DWORD>(ipid);
+	}
+
+	if (pid != 0) {
+		wchar_t exe_name[64] = {};
+		if (pid_to_exe_name(pid, exe_name,
+		                    sizeof(exe_name) / sizeof(exe_name[0]))) {
+			if (iequals(exe_name, L"explorer.exe"))
+				; // pass — Name으로 보조 매칭 한 번 더 시도
+			else if (is_blacklisted(exe_name))
+				return true;
+			else
+				return false; // 다른 앱 확정
+		}
+	}
+
+	// Name 속성 보조 매칭 (alive BL exe set과 교차매칭)
+	BSTR bstrName = nullptr;
+	bool nameHit = false;
+	if (SUCCEEDED(btn->get_CurrentName(&bstrName)) && bstrName) {
+		nameHit = name_matches_alive_blacklist(bstrName, alive);
+		SysFreeString(bstrName);
+	}
+	return nameHit;
+}
+
+struct BtnCache {
+	std::vector<RECT> rects;        // 블랙리스트 버튼들의 화면 좌표
+	uint64_t lastUpdateMs = 0;      // 마지막 rebuild 시각
+	bool everSucceeded = false;     // 한 번이라도 UIA가 작업표시줄 element를 잡았는지
+	std::mutex mtx;
+};
+BtnCache g_btnCache;
+
+constexpr uint64_t kBtnCacheTtlMs = 5000;
+
+// 캐시 rebuild. caller가 g_btnCache.mtx를 lock한 상태로 호출.
+// `alive`는 현재 살아있는 BL 앱 목록 — Name 매칭 시 그 exe에 매핑된 displayName만
+// 통과시켜 '카카오톡 고정됨' 같은 핀-only false positive를 차단한다.
+// 호출자는 alive->count > 0 일 때만 이 함수를 호출해야 한다.
+void rebuild_btn_cache_locked(const TrackedWindowList *alive)
+{
+	g_btnCache.rects.clear();
+
+	IUIAutomation *uia = get_or_create_uia();
+	if (!uia) {
+		g_btnCache.lastUpdateMs = GetTickCount64();
+		return;
+	}
+
+	// 주/보조 작업표시줄 hwnd 수집
+	HWND trays[8] = {};
+	int trayCount = 0;
+	HWND tray0 = FindWindowW(L"Shell_TrayWnd", nullptr);
+	if (tray0)
+		trays[trayCount++] = tray0;
+	HWND t2 = nullptr;
+	while ((t2 = FindWindowExW(nullptr, t2, L"Shell_SecondaryTrayWnd",
+	                            nullptr)) != nullptr &&
+	       trayCount < 8) {
+		trays[trayCount++] = t2;
+	}
+
+	// ControlType=Button 조건
+	VARIANT v{};
+	v.vt = VT_I4;
+	v.lVal = UIA_ButtonControlTypeId;
+	IUIAutomationCondition *cond = nullptr;
+	uia->CreatePropertyCondition(UIA_ControlTypePropertyId, v, &cond);
+	if (!cond) {
+		g_btnCache.lastUpdateMs = GetTickCount64();
+		return;
+	}
+
+	bool anyTrayElementOk = false;
+
+	for (int t = 0; t < trayCount; ++t) {
+		IUIAutomationElement *trayEl = nullptr;
+		if (FAILED(uia->ElementFromHandle(trays[t], &trayEl)) || !trayEl)
+			continue;
+		anyTrayElementOk = true;
+
+		IUIAutomationElementArray *buttons = nullptr;
+		if (SUCCEEDED(trayEl->FindAll(TreeScope_Descendants, cond,
+		                              &buttons)) &&
+		    buttons) {
+			int count = 0;
+			buttons->get_Length(&count);
+			for (int i = 0; i < count; ++i) {
+				IUIAutomationElement *btn = nullptr;
+				if (FAILED(buttons->GetElement(i, &btn)) || !btn)
+					continue;
+
+				if (element_is_blacklist_btn(btn, alive)) {
+					RECT r{};
+					if (SUCCEEDED(btn->get_CurrentBoundingRectangle(
+					        &r)) &&
+					    r.right > r.left && r.bottom > r.top) {
+						g_btnCache.rects.push_back(r);
+					}
+				}
+				btn->Release();
+			}
+			buttons->Release();
+		}
+		trayEl->Release();
+	}
+
+	cond->Release();
+	if (anyTrayElementOk)
+		g_btnCache.everSucceeded = true;
+	g_btnCache.lastUpdateMs = GetTickCount64();
+}
+
+} // namespace
+
+extern "C" ScTaskbarHoverResult sc_taskbar_hover_blacklist_btn()
+{
+	POINT pt{};
+	if (!GetCursorPos(&pt))
+		return SC_TB_HOVER_UNKNOWN;
+	if (!point_over_any_taskbar(pt))
+		return SC_TB_HOVER_UNKNOWN;
+
+	// [B안] 살아있는 BL 앱이 0개면 hover 어디든 BL일 수 없음 → OTHER 확정.
+	// EnumWindows ~수 ms 비용이지만 매 tick 호출자가 이미 같은 함수를 호출하므로
+	// 캐시 효과(프로세스 핸들 등)로 추가 부담은 미미.
+	TrackedWindowList alive{};
+	sc_find_all_alive_blacklist_windows(&alive);
+	if (alive.count == 0) {
+		std::lock_guard<std::mutex> lock(g_btnCache.mtx);
+		g_btnCache.rects.clear();
+		g_btnCache.lastUpdateMs = GetTickCount64();
+		return SC_TB_HOVER_OTHER;
+	}
+
+	std::lock_guard<std::mutex> lock(g_btnCache.mtx);
+	const uint64_t nowMs = GetTickCount64();
+	if (g_btnCache.lastUpdateMs == 0 ||
+	    (nowMs - g_btnCache.lastUpdateMs) > kBtnCacheTtlMs) {
+		rebuild_btn_cache_locked(&alive);
+	}
+
+	// UIA가 작업표시줄 element를 한 번도 못 잡았으면 식별 자체 불가 → UNKNOWN
+	// (호출자는 본래 동작으로 fallback).
+	if (!g_btnCache.everSucceeded)
+		return SC_TB_HOVER_UNKNOWN;
+
+	for (const RECT &r : g_btnCache.rects) {
+		if (PtInRect(&r, pt))
+			return SC_TB_HOVER_BLACKLIST;
+	}
+	return SC_TB_HOVER_OTHER;
 }

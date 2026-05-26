@@ -136,6 +136,37 @@ bool sc_mouse_over_thumbnail_zone();
 // 반환값: out->count에 채워진 개수.
 void sc_find_all_alive_blacklist_windows(TrackedWindowList *out);
 
+// 작업표시줄 hover 식별 결과 (3-state).
+// 호출자는 BL/OTHER 둘 다 hysteresis로 추적해 가장 최근 신호로 가드를 결정하고,
+// UNKNOWN은 직전 신호를 보존(둘 다 hysteresis 밖이면 fail-safe로 가드 ON).
+typedef enum ScTaskbarHoverResult {
+  SC_TB_HOVER_BLACKLIST,  // 마우스 아래 버튼이 블랙리스트 앱
+  SC_TB_HOVER_OTHER,      // 마우스 아래 버튼이 다른 앱
+  SC_TB_HOVER_UNKNOWN     // 식별 불가(작업표시줄 밖, 빈 영역, UIA 실패 등)
+} ScTaskbarHoverResult;
+
+// 살아있는 블랙리스트 앱의 작업표시줄 버튼 위치를 사전 매핑(UIA 1회 enum, ~5초 TTL
+// 캐시)한 뒤, 현재 마우스 좌표가 그 버튼 사각형 중 하나에 들어있는지 확인.
+//
+// 식별 전략:
+//   1. 살아있는 BL 앱 목록을 먼저 수집 — 0개면 hover 어디든 BL일 수 없으므로
+//      UIA enum을 생략하고 OTHER 즉시 반환.
+//   2. 주/보조 작업표시줄(Shell_TrayWnd / Shell_SecondaryTrayWnd)에 대해
+//      ElementFromHandle로 UIA root element 획득
+//   3. TreeScope_Descendants + ControlType=Button 조건으로 FindAll
+//   4. 각 버튼의 PID→exe로 직접 매칭 시도; Win11 작업표시줄은 모든 버튼이
+//      explorer.exe로 보고되므로 사실상 살아있는 BL exe에 매핑된 다국어
+//      displayName으로 Name 매칭이 주된 경로 — 핀-only(예: '카카오톡 고정됨')
+//      false positive는 alive set 교차매칭으로 차단된다.
+//   5. 매칭된 버튼의 BoundingRectangle을 캐시에 저장
+//
+// 캐시는 약 5초 TTL — 작업표시줄 재배치/앱 추가-제거 대응. UIA FindAll은 30~80ms
+// 비용이라 매 video_tick 호출은 부담이므로 캐시 갱신은 hit 시 자동(만료된 경우만).
+//
+// 반환값: 블랙리스트 버튼 위면 BLACKLIST, 작업표시줄 다른 위치면 OTHER, 작업표시줄
+//        밖이거나 UIA가 한 번도 작업표시줄 element를 못 잡았으면 UNKNOWN.
+ScTaskbarHoverResult sc_taskbar_hover_blacklist_btn();
+
 // `target` 창의 bounds를 z-order 위의 다른 top-level 창들로 잘라서 실제
 // 화면에 노출된 disjoint 사각형들을 out에 채워 반환한다.
 // 반환값: out에 채워진 사각형 개수 (0 = 완전히 가려짐).
