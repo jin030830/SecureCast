@@ -1131,9 +1131,22 @@ static void ocr_worker_loop(SecureCastFilter *filter) {
       }
     } else if (adaptScale > 1.0f) {
       // 업스케일
-      const int upW = static_cast<int>(width * adaptScale + 0.5f);
-      const int upH = static_cast<int>(height * adaptScale + 0.5f);
-      if (upW <= 4096 && upH <= 4096) {
+      int upW = static_cast<int>(width * adaptScale + 0.5f);
+      int upH = static_cast<int>(height * adaptScale + 0.5f);
+      // 4096 캡 초과 시 adaptScale을 가능한 한계까지 줄여 재계산.
+      // 이전엔 캡 초과면 업스케일을 통째로 스킵해 ocrPx가 원본 그대로 OCR로
+      // 넘어가 kScaleMax=2.5의 의미가 사라지는 버그가 있었다.
+      if (upW > 4096 || upH > 4096) {
+        const float cappedScale =
+            std::min(4096.0f / static_cast<float>(width),
+                     4096.0f / static_cast<float>(height));
+        if (cappedScale > 1.0f) {
+          adaptScale = cappedScale;
+          upW = static_cast<int>(width * adaptScale + 0.5f);
+          upH = static_cast<int>(height * adaptScale + 0.5f);
+        }
+      }
+      if (upW <= 4096 && upH <= 4096 && adaptScale > 1.0f) {
         scaledBuf.resize((size_t)upW * upH * 4);
         if (adaptScale == 2.0f) {
           upsample2x_bgra_simd(pixels.data(), width, height, stride,
