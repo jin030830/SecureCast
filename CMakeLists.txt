@@ -223,6 +223,8 @@ if(WIN32)
       src/window_tracker.h
       src/win_event_listener.cpp  # Role A: SetWinEventHook push 감지
       src/win_event_listener.h
+      src/scroll_motion_hook.cpp  # 글로벌 휠/키 hook (스크롤 모션 인과 신호)
+      src/scroll_motion_hook.h
       src/overlay-window.cpp      # Role D: 스트리머 전용 보안 상태 HUD (캡처 제외)
       src/overlay-window.h
       src/selection-overlay.cpp   # Role D: 드래그 블러 선택 오버레이
