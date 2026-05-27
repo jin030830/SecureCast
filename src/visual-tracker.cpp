@@ -1281,7 +1281,9 @@ VisualTrackerManager::snapshot_for_push(uint32_t src_w, uint32_t src_h) const {
 #ifdef _WIN32
     if (tr.ownerWin && src_w > 0 && src_h > 0) {
       HWND target = reinterpret_cast<HWND>(tr.ownerWin);
-      if (IsWindow(target)) {
+      // [Minimize skip] owner가 minimized면 화면에 안 보이므로 블러 emit 불필요.
+      // sc_minimize_tracker가 별도로 lingering 블러를 관리한다.
+      if (IsWindow(target) && !IsIconic(target)) {
         RECT cur{};
         if (SUCCEEDED(DwmGetWindowAttribute(target,
                                             DWMWA_EXTENDED_FRAME_BOUNDS, &cur,
@@ -1331,12 +1333,28 @@ VisualTrackerManager::snapshot_for_push(uint32_t src_w, uint32_t src_h) const {
               if (deltaW > 1 || deltaH > 1 || deltaL > 1 || deltaT > 1) {
                 lastResizeDetectedMs_.store(nowMs, std::memory_order_release);
               }
+
+              // [Option 1+2 신호 통합]
+              // (1) showCmd 폴링 → maximize 버튼/단축키 트랜지션 감지
+              // (2) MOVESIZESTART/END WinEvent → 사용자 드래그 리사이즈 감지
+              // 둘 중 하나라도 active면 sticky 즉시 강제 활성. delta 기반보다
+              // 정확한 신호 (cur가 아직 안 변해도 트랜지션 시작 감지).
+              sc_notify_showcmd_change(target);
+              if (sc_is_window_resizing(target, 1500)) {
+                lastResizeDetectedMs_.store(nowMs, std::memory_order_release);
+              }
+
               const int64_t lastResize =
                   lastResizeDetectedMs_.load(std::memory_order_acquire);
               const bool stickyActive =
                   (lastResize > 0) && (nowMs - lastResize < 1500);
 
-              if (stickyActive) {
+              // [Move vs Resize 구분]
+              // 드래그 이동(크기 변화 없음)은 top-left translation 공식으로 정확
+              // 처리됨. predictive expansion(monitor 기준)을 적용하면 화면 전체
+              // 블러 부작용. 크기 변화(deltaW/H > 30)가 있을 때만 expansion 활성.
+              const bool sizeChanged = (deltaW > 30 || deltaH > 30);
+              if (stickyActive && sizeChanged) {
                 // monitor 전체 영역 (taskbar 포함) 기준 predictive expansion.
                 // cur도 union해서 양 방향 커버.
                 const RECT &pred = mi.rcMonitor;

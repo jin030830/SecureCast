@@ -1515,6 +1515,8 @@ static void *securecast_create(obs_data_t *settings, obs_source_t *context) {
                  &filter->prevUserTime);
   // 최소화 애니메이션 가드 — pre-minimize bounds 캡처용 시스템 훅 등록.
   sc_minimize_tracker_init();
+  // Resize 가드 — MOVESIZESTART/END WinEvent + showCmd 폴링.
+  sc_resize_tracker_init();
 #endif
 
   // Panic 핫키 등록 (Ctrl+Shift+F12 기본 바인딩)
@@ -1663,6 +1665,7 @@ static void securecast_destroy(void *data) {
   filter->winListener.stop();
   // 최소화 가드 훅 refcount 감소 (마지막 filter면 실제 unhook).
   sc_minimize_tracker_shutdown();
+  sc_resize_tracker_shutdown();
 #endif
 
   // OCR/Tracker 워커 먼저 중지 (trackerMgr·ring buffer 해제 전 race 방지)

@@ -683,6 +683,129 @@ extern "C" uint64_t sc_get_minimize_end_ns(HWND hwnd)
 	return it->second.endNs;
 }
 
+// =============================================================================
+// [Resize 가드] WinEvent MOVESIZESTART/END + showCmd 폴링 신호
+//
+// minimize tracker와 같은 패턴 — refcount 기반 init/shutdown.
+// 두 신호 소스(WinEvent 드래그 리사이즈, showCmd 변화 maximize/restore)는
+// 모두 g_resizeMap의 endTick을 갱신해 동일 grace 윈도우로 통합.
+// =============================================================================
+namespace {
+
+struct ResizeState {
+	uint64_t startTick; // GetTickCount64 ms — 트랜지션 시작 또는 마지막 갱신
+	uint64_t endTick;   // GetTickCount64 ms — MOVESIZEEND/showCmd 안정화 시점
+};
+
+std::mutex g_resizeMutex;
+std::unordered_map<HWND, ResizeState> g_resizingWindows;
+HWINEVENTHOOK g_resizeHook = nullptr;
+std::atomic<int> g_resizeRefCount{0};
+
+// showCmd 폴링 캐시 (사용자 드래그 외 maximize 버튼/단축키 트랜지션 감지용).
+std::unordered_map<HWND, UINT> g_lastShowCmd;
+
+void CALLBACK ResizeEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd,
+                              LONG idObject, LONG idChild, DWORD, DWORD)
+{
+	if (idObject != OBJID_WINDOW || idChild != CHILDID_SELF || !hwnd)
+		return;
+	const uint64_t nowTick = GetTickCount64();
+	std::lock_guard<std::mutex> lock(g_resizeMutex);
+	if (event == EVENT_SYSTEM_MOVESIZESTART) {
+		g_resizingWindows[hwnd] = {nowTick, 0};
+	} else if (event == EVENT_SYSTEM_MOVESIZEEND) {
+		auto it = g_resizingWindows.find(hwnd);
+		if (it != g_resizingWindows.end())
+			it->second.endTick = nowTick;
+		else
+			g_resizingWindows[hwnd] = {nowTick, nowTick};
+	}
+}
+
+} // namespace
+
+extern "C" void sc_resize_tracker_init()
+{
+	if (g_resizeRefCount.fetch_add(1, std::memory_order_acq_rel) != 0)
+		return;
+	g_resizeHook = SetWinEventHook(
+		EVENT_SYSTEM_MOVESIZESTART, EVENT_SYSTEM_MOVESIZEEND, nullptr,
+		ResizeEventProc, 0, 0,
+		WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+}
+
+extern "C" void sc_resize_tracker_shutdown()
+{
+	if (g_resizeRefCount.fetch_sub(1, std::memory_order_acq_rel) != 1)
+		return;
+	if (g_resizeHook) {
+		UnhookWinEvent(g_resizeHook);
+		g_resizeHook = nullptr;
+	}
+	std::lock_guard<std::mutex> lock(g_resizeMutex);
+	g_resizingWindows.clear();
+	g_lastShowCmd.clear();
+}
+
+extern "C" void sc_notify_showcmd_change(HWND hwnd)
+{
+	if (!hwnd)
+		return;
+	WINDOWPLACEMENT wp{};
+	wp.length = sizeof(wp);
+	if (!GetWindowPlacement(hwnd, &wp))
+		return;
+	const UINT cur = wp.showCmd;
+	const uint64_t nowTick = GetTickCount64();
+	std::lock_guard<std::mutex> lock(g_resizeMutex);
+	auto it = g_lastShowCmd.find(hwnd);
+	if (it == g_lastShowCmd.end()) {
+		g_lastShowCmd[hwnd] = cur;
+		return;
+	}
+	if (it->second != cur) {
+		const UINT prev = it->second;
+		it->second = cur;
+		// minimize 관련 트랜지션(SW_SHOWMINIMIZED/MINIMIZE/SHOWMINNOACTIVE)은
+		// 신호 발생 안 함 — minimize는 owner가 숨겨지는 거라 expansion이 필요
+		// 없고, 신호 발생 시 sticky가 켜져 전체 화면 블러 부작용 발생.
+		// NORMAL ↔ MAXIMIZED 같은 visible-state 간 트랜지션만 신호.
+		auto isMinimizedState = [](UINT s) {
+			return s == SW_SHOWMINIMIZED || s == SW_MINIMIZE ||
+			       s == SW_SHOWMINNOACTIVE;
+		};
+		if (isMinimizedState(prev) || isMinimizedState(cur))
+			return;
+		// 진짜 트랜지션 (maximize/restore) — endTick 갱신해 grace 카운트 시작.
+		auto rit = g_resizingWindows.find(hwnd);
+		if (rit != g_resizingWindows.end())
+			rit->second.endTick = nowTick;
+		else
+			g_resizingWindows[hwnd] = {nowTick, nowTick};
+	}
+}
+
+extern "C" bool sc_is_window_resizing(HWND hwnd, uint64_t graceMs)
+{
+	if (!hwnd)
+		return false;
+	const uint64_t nowTick = GetTickCount64();
+	std::lock_guard<std::mutex> lock(g_resizeMutex);
+	auto it = g_resizingWindows.find(hwnd);
+	if (it == g_resizingWindows.end())
+		return false;
+	const auto &st = it->second;
+	if (st.endTick == 0)
+		return true; // MOVESIZESTART 후 END 미수신 — 진행 중
+	// END 수신 후 graceMs 동안 true 유지 (송출 N프레임 지연 흡수).
+	if (nowTick - st.endTick > graceMs) {
+		g_resizingWindows.erase(it); // grace 만료 → evict
+		return false;
+	}
+	return true;
+}
+
 namespace {
 
 // EnumWindows callback for sc_find_all_alive_blacklist_windows.

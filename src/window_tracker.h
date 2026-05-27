@@ -114,6 +114,28 @@ int sc_poll_minimizing_windows(ScMinimizingEntry *out, int maxOut,
 // 루프에서 slot.timestamp와 비교해 ghost blur를 잘라내는 데 사용.
 uint64_t sc_get_minimize_end_ns(HWND hwnd);
 
+// ============================================================
+// [Resize 가드] maximize/restore/사용자 드래그 리사이즈 시 owner 창
+// 트랜지션을 감지해 sticky expansion 신호로 활용.
+//
+// 신호 소스 (둘 다 같은 g_resizeMap 갱신):
+//   1. WinEvent EVENT_SYSTEM_MOVESIZESTART/END  — 사용자 드래그 리사이즈
+//   2. GetWindowPlacement.showCmd 폴링 변화      — 버튼/단축키 maximize
+//
+// minimize tracker와 동일한 refcount 패턴.
+// ============================================================
+void sc_resize_tracker_init();
+void sc_resize_tracker_shutdown();
+
+// 주어진 HWND가 현재 리사이즈/maximize 트랜지션 중인지 검사. visual-tracker가
+// snapshot_for_push에서 호출해 sticky expansion을 켜는 신호로 사용.
+// graceMs 동안 트랜지션 종료 후에도 true 반환 (송출 지연 보호).
+bool sc_is_window_resizing(HWND hwnd, uint64_t graceMs);
+
+// 폴링 진입점: 호출자(visual-tracker)가 owner HWND 별로 showCmd 변화를 감지해
+// 위 맵에 트랜지션을 기록한다. graceMs 동안 sc_is_window_resizing이 true.
+void sc_notify_showcmd_change(HWND hwnd);
+
 // 현재 마우스 커서가 작업표시줄 영역 (주 + 보조 모니터) 위에 있는지 검사.
 // Aero Peek은 TaskListThumbnailWnd가 안 보일 수도 있고 DWM 썸네일로 직접 렌더
 // 되어 HWND 추적이 안 되는 경우도 있어, 마우스 위치를 peek 상태의 보조 신호로
