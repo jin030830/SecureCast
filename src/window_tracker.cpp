@@ -276,36 +276,6 @@ BOOL CALLBACK enum_proc(HWND hwnd, LPARAM lparam)
 	if (width < MIN_WINDOW_DIMENSION || height < MIN_WINDOW_DIMENSION)
 		return TRUE;
 
-	// [Alt+Tab / Task View 가드]
-	// Task Switcher / Multitasking View 창은 라이브 썸네일을 렌더한다 — 블랙리스트
-	// 앱이 최소화·뒷창인 상태에서도 그 썸네일을 통해 노출될 수 있다. 스위처 창
-	// 자체를 마스크에 추가해 썸네일 영역을 통째로 가린다.
-	// (다른 곳의 z-order 차감 로직은 스위처를 "가린 것으로 보지 않음" — 그건
-	// "스위처 뒤의 블랙리스트 마스크 유지" 용도. 여기는 스위처 자신을 마스킹.)
-	if (is_task_switcher_window(hwnd)) {
-		RECT visRects[SC_MAX_VISIBLE_SUBRECTS];
-		int visCount = sc_compute_visible_subrects(hwnd, rect, visRects,
-		                                            SC_MAX_VISIBLE_SUBRECTS);
-		if (visCount == 0)
-			return TRUE; // 스위처가 다른 무엇인가에 완전 가려짐
-		auto &slot = out->items[out->count++];
-		slot.hwnd = hwnd;
-		slot.bounds = rect;
-		slot.visibleCount = visCount;
-		for (int v = 0; v < visCount; ++v)
-			slot.visibleRects[v] = visRects[v];
-		// 디버그 마커 (블랙리스트 exe와 구분).
-		const wchar_t kMarker[] = L"__altTab";
-		for (size_t i = 0; i < sizeof(slot.exe_name) / sizeof(slot.exe_name[0]); ++i) {
-			slot.exe_name[i] = (i < sizeof(kMarker) / sizeof(kMarker[0]))
-			                       ? kMarker[i]
-			                       : L'\0';
-			if (!slot.exe_name[i])
-				break;
-		}
-		return TRUE;
-	}
-
 	// 윈도우의 소유 프로세스 ID 획득. 0이면 system 윈도우 (실패).
 	DWORD pid = 0;
 	GetWindowThreadProcessId(hwnd, &pid);
@@ -410,11 +380,15 @@ extern "C" void sc_scan_blacklisted_windows(TrackedWindowList *out)
 	out->count = 0;
 	EnumWindows(enum_proc, reinterpret_cast<LPARAM>(out));
 
-	// [Win11 Task View 폴백] Win+Tab Task View 창은 EnumWindows에 노출되지
-	// 않는 경우가 있다(별도 isolation context 또는 capture exclusion). 하지만
-	// GetForegroundWindow는 그 hwnd를 정상 반환한다(PowerShell 진단으로 확인).
-	// foreground가 task switcher 클래스이고 list에 아직 없으면 추가한다.
-	// foreground는 정의상 top → 전체 bounds 마스킹.
+	// [Alt+Tab / Win+Tab Task View 가드]
+	// Task Switcher / Multitasking View 창은 라이브 썸네일을 렌더하므로 블랙리스트
+	// 앱이 최소화·뒷창인 상태에서도 노출될 수 있다. foreground가 스위처 클래스면
+	// 마스크에 추가해 썸네일 영역을 통째로 가린다.
+	//
+	// foreground 기준을 쓰는 이유: 스위처는 키 입력을 받아야 하므로 정의상
+	// foreground다(Alt+Tab은 Alt 잡혀있는 동안, Win+Tab은 사용자가 닫기 전까지).
+	// 같은 XamlExplorerHostIslandWindow 클래스를 쓰는 Snap Layouts/Assist 오버레이는
+	// 드래그 중인 사용자 창이 foreground라 자동 제외 — 평상시 false positive 방지.
 	HWND fg = GetForegroundWindow();
 	if (fg && is_task_switcher_window(fg) && out->count < SC_MAX_TRACKED_WINDOWS) {
 		bool alreadyIn = false;
@@ -436,7 +410,7 @@ extern "C" void sc_scan_blacklisted_windows(TrackedWindowList *out)
 					slot.bounds = fgRect;
 					slot.visibleCount = 1;
 					slot.visibleRects[0] = fgRect;
-					const wchar_t kMarker[] = L"__winTab";
+					const wchar_t kMarker[] = L"__taskSw";
 					for (size_t i = 0;
 					     i < sizeof(slot.exe_name) / sizeof(slot.exe_name[0]); ++i) {
 						slot.exe_name[i] = (i < sizeof(kMarker) / sizeof(kMarker[0]))
