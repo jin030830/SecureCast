@@ -35,6 +35,11 @@ struct VtBoxOwner {
   void *hwnd = nullptr;
   int32_t windowL = 0;
   int32_t windowT = 0;
+  // [Anim guard] OCR 시점 owner 창의 right/bottom (모니터 절대좌표). 렌더 시
+  // 현재 크기와 비교해 maximize/restore 진행 중인지 감지하고 그동안 박스에
+  // 추가 padding을 입혀 OBS pipeline lag으로 인한 위·아래 노출 방지.
+  int32_t windowR = 0;
+  int32_t windowB = 0;
 };
 
 class VisualTrackerManager {
@@ -158,6 +163,10 @@ private:
     // 렌더 시 송출 슬롯의 windowSnapshot에서 같은 hwnd의 bounds와 비교해 delta 산출.
     int32_t refWindowL = 0;
     int32_t refWindowT = 0;
+    // [Anim guard] OCR 시점 right/bottom. snapshot_for_push에서 현재 크기와
+    // 비교해 maximize/restore 애니메이션 진행을 감지한다.
+    int32_t refWindowR = 0;
+    int32_t refWindowB = 0;
 
     // [Fix #2] OCR worker가 register_or_update를 호출할 때마다 증가.
     // Phase C에서 ocrRevision이 lt와 it에서 다르면
@@ -203,6 +212,11 @@ private:
   // update_all_gray가 매 사이클 갱신. 모든 활성 트래커가 lastScore>=SCORE_OK +
   // framesSinceMatch==0이면 true. helper가 종료 조건으로 사용.
   mutable std::atomic<bool> allTrackersStable_{true};
+
+  // [Anim guard sticky] snapshot_for_push에서 owner 창 크기 변화를 감지한
+  // 가장 최근 시각(ms, steady_clock). 한 번 감지되면 일정 시간 동안 maximize/
+  // restore 애니메이션 진행 중으로 간주해 padding boost를 유지한다.
+  mutable std::atomic<int64_t> lastResizeDetectedMs_{0};
 
   // 모션 hysteresis 활성 시 박스 h를 위아래로 확장. src_h>0이면 하단 clamp.
   // src_w 인자는 미사용 (수직 확장만) — 인터페이스 일관성을 위해 받음.

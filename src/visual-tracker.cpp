@@ -979,11 +979,12 @@ void VisualTrackerManager::register_or_update_gray(
     float x, y;
     bool isAnchored;
     int32_t curWinL, curWinT;
+    int32_t curWinR, curWinB;
   };
   std::vector<TrEffPos> effPos(M);
   for (int m = 0; m < M; ++m) {
     const auto &tr = trackers_[m];
-    effPos[m] = {tr.x, tr.y, false, 0, 0};
+    effPos[m] = {tr.x, tr.y, false, 0, 0, 0, 0};
 #ifdef _WIN32
     if (tr.ownerWin) {
       HWND h = reinterpret_cast<HWND>(tr.ownerWin);
@@ -1004,6 +1005,8 @@ void VisualTrackerManager::register_or_update_gray(
               effPos[m].y = tr.refY + (cur.top - tr.refWindowT) * sy;
               effPos[m].curWinL = cur.left;
               effPos[m].curWinT = cur.top;
+              effPos[m].curWinR = cur.right;
+              effPos[m].curWinB = cur.bottom;
               effPos[m].isAnchored = true;
             }
           }
@@ -1117,11 +1120,15 @@ void VisualTrackerManager::register_or_update_gray(
         // 기존 owner 살아있음 — bounds 갱신만, ownerWin은 그대로.
         tr.refWindowL = effPos[bestM].curWinL;
         tr.refWindowT = effPos[bestM].curWinT;
+        tr.refWindowR = effPos[bestM].curWinR;
+        tr.refWindowB = effPos[bestM].curWinB;
       } else if (useOwners && tr.ownerWin == nullptr && owners[n].hwnd) {
         // 기존 owner 없었음 → OCR 측에서 잡은 owner로 신규 binding.
         tr.ownerWin = owners[n].hwnd;
         tr.refWindowL = owners[n].windowL;
         tr.refWindowT = owners[n].windowT;
+        tr.refWindowR = owners[n].windowR;
+        tr.refWindowB = owners[n].windowB;
       }
       // 그 외(owner 있었는데 죽음, 또는 새 owner도 없음): refX/refY만 갱신,
       // 다음 사이클에 owner 재바인딩 시도.
@@ -1174,6 +1181,8 @@ void VisualTrackerManager::register_or_update_gray(
       tr.ownerWin = owners[n].hwnd;
       tr.refWindowL = owners[n].windowL;
       tr.refWindowT = owners[n].windowT;
+      tr.refWindowR = owners[n].windowR;
+      tr.refWindowB = owners[n].windowB;
     }
     precompute_tmpl_stats(tr);
     trackers_.push_back(std::move(tr));
@@ -1301,11 +1310,87 @@ VisualTrackerManager::snapshot_for_push(uint32_t src_w, uint32_t src_h) const {
                 outY = static_cast<float>(src_h) - tr.bh;
               ownerAnchored = true;
 
-              // [z-order 차감] outX/outY/tr.bw/tr.bh를 monitor 좌표로 환산해
-              // owner 위에 덮인 다른 창들을 sc_compute_visible_subrects가 빼고
-              // 실제 노출된 disjoint 사각형들을 돌려준다. 각 서브렉트마다 별도
-              // VtOcrBox로 푸시. 사용자가 ghost-kill 우회 정책상 anchor 트래커는
-              // 항상 출력했지만, 그 출력이 잘못된 창 위에 뜨던 결함을 보정.
+              // [Anim guard sticky] maximize/restore 시 cur가 mid-state로
+              // 점진적으로 변하는 동안 픽셀은 최종 위치로 점프하면 박스 위치
+              // 미스매치 → 노출. 변화 감지 시 sticky 활성, monitor 기준으로
+              // 미리 큰 expansion 적용.
+              const int refWinW = tr.refWindowR - tr.refWindowL;
+              const int refWinH = tr.refWindowB - tr.refWindowT;
+              const int curWinW = cur.right - cur.left;
+              const int curWinH = cur.bottom - cur.top;
+              const int deltaW =
+                  (refWinW > 0) ? std::abs(curWinW - refWinW) : 0;
+              const int deltaH =
+                  (refWinH > 0) ? std::abs(curWinH - refWinH) : 0;
+              const int deltaL = std::abs(cur.left - tr.refWindowL);
+              const int deltaT = std::abs(cur.top - tr.refWindowT);
+              const int64_t nowMs =
+                  std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now().time_since_epoch())
+                      .count();
+              if (deltaW > 1 || deltaH > 1 || deltaL > 1 || deltaT > 1) {
+                lastResizeDetectedMs_.store(nowMs, std::memory_order_release);
+              }
+              const int64_t lastResize =
+                  lastResizeDetectedMs_.load(std::memory_order_acquire);
+              const bool stickyActive =
+                  (lastResize > 0) && (nowMs - lastResize < 1500);
+
+              if (stickyActive) {
+                // monitor 전체 영역 (taskbar 포함) 기준 predictive expansion.
+                // cur도 union해서 양 방향 커버.
+                const RECT &pred = mi.rcMonitor;
+                const bool hasRB = (tr.refWindowR > tr.refWindowL) &&
+                                   (tr.refWindowB > tr.refWindowT);
+                const int32_t effRefR =
+                    hasRB ? tr.refWindowR : tr.refWindowL;
+                const int32_t effRefB =
+                    hasRB ? tr.refWindowB : tr.refWindowT;
+
+                const float dL_pred = (pred.left - tr.refWindowL) * sx;
+                const float dT_pred = (pred.top - tr.refWindowT) * sy;
+                const float dR_pred = (pred.right - effRefR) * sx;
+                const float dB_pred = (pred.bottom - effRefB) * sy;
+                const float dL_cur = (cur.left - tr.refWindowL) * sx;
+                const float dT_cur = (cur.top - tr.refWindowT) * sy;
+                const float dR_cur = (cur.right - effRefR) * sx;
+                const float dB_cur = (cur.bottom - effRefB) * sy;
+
+                const float dL = std::min(dL_pred, dL_cur);
+                const float dR = std::max(dR_pred, dR_cur);
+                const float dT = std::min(dT_pred, dT_cur);
+                const float dB = std::max(dB_pred, dB_cur);
+
+                const float moveLoX = std::min(dL, dR);
+                const float moveHiX = std::max(dL, dR);
+                const float moveLoY = std::min(dT, dB);
+                const float moveHiY = std::max(dT, dB);
+
+                // 비대칭 pad: 아래쪽 특히 크게 (사용자 요청 — 아래 노출 차단).
+                const float padPxH = 20.0f * sx;
+                const float padPxUp = 50.0f * sy;
+                const float padPxDown = 200.0f * sy;
+                float ux = tr.refX + moveLoX - padPxH;
+                float uy = tr.refY + moveLoY - padPxUp;
+                float urx = tr.refX + tr.bw + moveHiX + padPxH;
+                float ury = tr.refY + tr.bh + moveHiY + padPxDown;
+                if (ux < 0.0f)
+                  ux = 0.0f;
+                if (uy < 0.0f)
+                  uy = 0.0f;
+                if (urx > static_cast<float>(src_w))
+                  urx = static_cast<float>(src_w);
+                if (ury > static_cast<float>(src_h))
+                  ury = static_cast<float>(src_h);
+                float uw = urx - ux;
+                float uh = ury - uy;
+                if (uw > 0.0f && uh > 0.0f)
+                  result.push_back({tr.type, ux, uy, uw, uh});
+                continue; // sticky expansion 처리 완료
+              }
+
+              // [z-order 차감] 비-sticky 경로. owner 위 다른 창들 빼고 노출된
+              // disjoint 사각형들만 마스킹.
               RECT boxScreen;
               boxScreen.left = mi.rcMonitor.left +
                                static_cast<LONG>(outX / sx);

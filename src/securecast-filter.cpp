@@ -1229,7 +1229,7 @@ static void ocr_worker_loop(SecureCastFilter *filter) {
         struct SrcRect {
           int x0, y0, x1, y1;
           HWND hwnd;
-          int32_t monL, monT;
+          int32_t monL, monT, monR, monB;
         };
         std::vector<SrcRect> srcRects;
         srcRects.reserve(static_cast<size_t>(windowSnapshot.count) *
@@ -1249,7 +1249,9 @@ static void ocr_worker_loop(SecureCastFilter *filter) {
             srcRects.push_back(
                 {br.x, br.y, br.x + br.width, br.y + br.height, tw.hwnd,
                  static_cast<int32_t>(tw.bounds.left),
-                 static_cast<int32_t>(tw.bounds.top)});
+                 static_cast<int32_t>(tw.bounds.top),
+                 static_cast<int32_t>(tw.bounds.right),
+                 static_cast<int32_t>(tw.bounds.bottom)});
           }
         }
         for (size_t b = 0; b < vtBoxes.size(); ++b) {
@@ -1263,6 +1265,8 @@ static void ocr_worker_loop(SecureCastFilter *filter) {
               owners[b].hwnd = reinterpret_cast<void *>(sr.hwnd);
               owners[b].windowL = sr.monL;
               owners[b].windowT = sr.monT;
+              owners[b].windowR = sr.monR;
+              owners[b].windowB = sr.monB;
               break;
             }
           }
@@ -1307,6 +1311,8 @@ static void ocr_worker_loop(SecureCastFilter *filter) {
                       reinterpret_cast<void *>(allWindows.items[i].hwnd);
                   owners[b].windowL = r.left;
                   owners[b].windowT = r.top;
+                  owners[b].windowR = r.right;
+                  owners[b].windowB = r.bottom;
                   break;
                 }
               }
@@ -2309,11 +2315,12 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
   //           sub-rect 계수를 곱한다.
   // MAX_TRACKERS는 VisualTrackerManager 클래스 static 상수이므로
   // securecast-filter.cpp에서는 직접 사용 불가. 실제 값(8)을 리터럴로 대체.
+  // x2: 슬롯의 N프레임 전 snap + 현재 snap 둘 다 사용 (anim 지연 보정).
   static constexpr int kMaxTrackerSlots = 8;
   BlurRect all_rects[SC_MAX_BLUR_RECTS * 2 +
                      SC_MAX_TRACKED_WINDOWS * SC_MAX_VISIBLE_SUBRECTS * 2 +
                      SC_MAX_LINGERING * SC_MAX_VISIBLE_SUBRECTS +
-                     kMaxTrackerSlots + 8];
+                     kMaxTrackerSlots * 2 + 8];
   const int kAllRectsCap =
       static_cast<int>(sizeof(all_rects) / sizeof(all_rects[0]));
   int all_count = 0;
@@ -2373,16 +2380,17 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
   // OCR 박스 — Visual Tracker가 제공하는 NCC 추적 위치
   // [좌표계 동기화] use1GPath 모드에서는 트래커가 half-res 공간에서 추적하므로
   // trackerCoordScale_(=2.0f)를 곱해 원본 해상도로 좌표를 복원한다.
-  // [Window anchor v4] 블러 박스를 ring buffer 슬롯에 함께 저장해서 송출 프레임과
-  // 정확히 같이 지연시킨다. 실시간 창 위치는 일절 사용하지 않음 — 송출되는
-  // 프레임은 캡처 시점의 픽셀이고, 그 시점의 트래커 박스를 그대로 사용해야
-  // 텍스트와 블러가 동일 시간축에서 움직인다.
+  //
+  // [Anim 지연 보정] N프레임 전 슬롯의 박스(T-N) + 현재 시점에서 다시 계산한
+  // 박스(T) 둘 다 사용. OBS의 N프레임 지연 송출 특성 활용:
+  //   - 슬롯 박스는 캡처 시점에 작을 수 있음 (sticky 미활성)
+  //   - 현재 시점 박스는 sticky 확장된 큰 박스
+  //   - 두 시점 모두 마스킹 → 송출되는 과거 픽셀이 미래의 큰 박스로 보호됨
   {
     const float tScale = filter->trackerCoordScale_;
-    const auto &trackerBoxes = outputSlot->trackerSnapshot;
-    for (const auto &tb : trackerBoxes) {
+    auto push_tracker_box = [&](const VtOcrBox &tb) {
       if (all_count >= (int)(sizeof(all_rects) / sizeof(all_rects[0])))
-        break;
+        return;
       BlurRect r{};
       r.x = static_cast<int>(tb.x * tScale);
       r.y = static_cast<int>(tb.y * tScale);
@@ -2391,7 +2399,25 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
       r.type = 0; // Blur
       if (r.width > 0 && r.height > 0)
         all_rects[all_count++] = r;
-    }
+    };
+
+    // 1) 슬롯 저장 박스 (캡처 시점 매칭)
+    for (const auto &tb : outputSlot->trackerSnapshot)
+      push_tracker_box(tb);
+
+    // 2) 현재 시점 박스 (sticky 확장 적용된 큰 박스 — lookahead)
+    const uint32_t srcWNow =
+        (tScale > 0.0f)
+            ? static_cast<uint32_t>(static_cast<float>(w) / tScale)
+            : w;
+    const uint32_t srcHNow =
+        (tScale > 0.0f)
+            ? static_cast<uint32_t>(static_cast<float>(h) / tScale)
+            : h;
+    const auto currentSnap = filter->trackerMgr.snapshot_for_push(srcWNow,
+                                                                  srcHNow);
+    for (const auto &tb : currentSnap)
+      push_tracker_box(tb);
   }
 #ifdef _WIN32
   // [Role D] 알림 영역 자동 블러 — 지연 슬롯의 notifRect 주입 (송출 동기화).
