@@ -34,6 +34,7 @@
 #include <atomic>
 #include <mutex>
 #include <unordered_map>
+#include <string>
 #include <vector>
 
 namespace {
@@ -44,12 +45,36 @@ constexpr int MIN_WINDOW_DIMENSION = 100;
 // 게임 모드에서는 호출자(securecast-filter.cpp)가 SCAN_INTERVAL_GAME(0.5초)을 전달한다.
 constexpr float SCAN_INTERVAL_SEC = 0.15f;
 
-// 보호 대상 앱 목록. 향후 OBS Properties UI에서 사용자가 편집할 수 있게 확장 예정.
+// 보호 대상 앱 기본 목록 (일반 모드).
 const wchar_t *const kBlacklist[] = {
 	L"KakaoTalk.exe",
 	L"Discord.exe",
 	L"Slack.exe",
 };
+
+// 게임 모드 추가 기본 목록. 일반 모드에 안 들어가 있어도 게임 모드에선 자동
+// 블러 (브라우저/메모장 등 게임 중 노출되기 쉬운 민감 가능 앱).
+const wchar_t *const kGameModeExtraBlacklist[] = {
+	L"chrome.exe",
+	L"firefox.exe",
+	L"msedge.exe",
+	L"whale.exe",  // Naver Whale
+	L"notepad.exe",
+	L"WINWORD.EXE",
+	L"EXCEL.EXE",
+	L"POWERPNT.EXE",
+};
+
+// 사용자가 OBS settings에서 추가한 동적 블랙리스트 (일반/게임 모드 별도).
+// mutex 보호 — settings update와 scan thread 사이 race 방지.
+std::mutex g_userBlacklistMutex;
+std::vector<std::wstring> g_userBlacklistNormal;
+std::vector<std::wstring> g_userBlacklistGameMode;
+
+// 게임 모드 글로벌 플래그 — 어느 필터든 게임 모드면 true. is_blacklisted가
+// 자동으로 game-mode-extra 리스트도 검사하도록 함. enum_proc 등 모든 scan
+// 경로가 자동으로 게임 모드 블랙리스트 적용.
+std::atomic<bool> g_anyFilterInGameMode{false};
 
 // UWP (Microsoft Store) 앱은 모두 ApplicationFrameHost.exe라는 단일 호스트
 // 프로세스로 보고된다. 실제 앱 식별은 자식 윈도우의 PID를 다시 봐야 가능하므로
@@ -88,8 +113,68 @@ void path_basename(const wchar_t *full_path, wchar_t *out, size_t out_cap)
 
 bool is_blacklisted(const wchar_t *exe_name)
 {
+	// 1. 하드코딩 기본 (일반 모드)
 	for (const wchar_t *entry : kBlacklist) {
 		if (iequals(entry, exe_name))
+			return true;
+	}
+	// 2. 사용자 추가 (일반 모드)
+	{
+		std::lock_guard<std::mutex> lock(g_userBlacklistMutex);
+		for (const auto &entry : g_userBlacklistNormal) {
+			if (iequals(entry.c_str(), exe_name))
+				return true;
+		}
+	}
+	// 3. 어느 필터든 게임 모드면 game-mode-extra도 자동 적용
+	if (g_anyFilterInGameMode.load(std::memory_order_acquire)) {
+		for (const wchar_t *entry : kGameModeExtraBlacklist) {
+			if (iequals(entry, exe_name))
+				return true;
+		}
+		std::lock_guard<std::mutex> lock(g_userBlacklistMutex);
+		for (const auto &entry : g_userBlacklistGameMode) {
+			if (iequals(entry.c_str(), exe_name))
+				return true;
+		}
+	}
+	return false;
+}
+
+// 일반 모드 블랙리스트에만 있는지 검사 (game-mode-extra 제외).
+// dialog 토글 분기에서 "일반 블랙리스트는 항상 자동, 게임 블랙리스트만 토글" 처리에 사용.
+bool is_blacklisted_normal_only(const wchar_t *exe_name)
+{
+	for (const wchar_t *entry : kBlacklist) {
+		if (iequals(entry, exe_name))
+			return true;
+	}
+	std::lock_guard<std::mutex> lock(g_userBlacklistMutex);
+	for (const auto &entry : g_userBlacklistNormal) {
+		if (iequals(entry.c_str(), exe_name))
+			return true;
+	}
+	return false;
+}
+
+// 명시적 game-mode 체크 — 게임 모드 flag와 무관하게 game-mode-extra까지 검사.
+bool is_blacklisted_game_mode(const wchar_t *exe_name)
+{
+	for (const wchar_t *entry : kBlacklist) {
+		if (iequals(entry, exe_name))
+			return true;
+	}
+	for (const wchar_t *entry : kGameModeExtraBlacklist) {
+		if (iequals(entry, exe_name))
+			return true;
+	}
+	std::lock_guard<std::mutex> lock(g_userBlacklistMutex);
+	for (const auto &entry : g_userBlacklistNormal) {
+		if (iequals(entry.c_str(), exe_name))
+			return true;
+	}
+	for (const auto &entry : g_userBlacklistGameMode) {
+		if (iequals(entry.c_str(), exe_name))
 			return true;
 	}
 	return false;
@@ -784,6 +869,74 @@ extern "C" void sc_notify_showcmd_change(HWND hwnd)
 		else
 			g_resizingWindows[hwnd] = {nowTick, nowTick};
 	}
+}
+
+extern "C" bool sc_is_blacklisted_exe(const wchar_t *exe_name)
+{
+	return is_blacklisted(exe_name);
+}
+
+extern "C" bool sc_is_blacklisted_exe_game_mode(const wchar_t *exe_name)
+{
+	return is_blacklisted_game_mode(exe_name);
+}
+
+extern "C" bool sc_is_blacklisted_exe_normal_only(const wchar_t *exe_name)
+{
+	return is_blacklisted_normal_only(exe_name);
+}
+
+// 사용자 설정 → 동적 블랙리스트 갱신. 줄바꿈으로 구분된 텍스트 파싱.
+// settings update 호출 시 1회 호출.
+extern "C" void sc_set_user_blacklist_normal(const wchar_t *const *exes,
+                                              int count)
+{
+	std::lock_guard<std::mutex> lock(g_userBlacklistMutex);
+	g_userBlacklistNormal.clear();
+	for (int i = 0; i < count; ++i) {
+		if (exes[i] && exes[i][0])
+			g_userBlacklistNormal.emplace_back(exes[i]);
+	}
+}
+
+extern "C" void sc_set_user_blacklist_game_mode(const wchar_t *const *exes,
+                                                 int count)
+{
+	std::lock_guard<std::mutex> lock(g_userBlacklistMutex);
+	g_userBlacklistGameMode.clear();
+	for (int i = 0; i < count; ++i) {
+		if (exes[i] && exes[i][0])
+			g_userBlacklistGameMode.emplace_back(exes[i]);
+	}
+}
+
+// 어느 필터든 게임 모드면 true로 설정 — is_blacklisted가 자동으로
+// game-mode-extra 적용. enum_proc 등 모든 scan 경로 무수정 적용.
+extern "C" void sc_set_global_game_mode(bool active)
+{
+	g_anyFilterInGameMode.store(active, std::memory_order_release);
+}
+
+extern "C" bool sc_get_hwnd_exe_name(HWND hwnd, wchar_t *out, size_t out_cap)
+{
+	if (!hwnd || !out || out_cap == 0)
+		return false;
+	out[0] = 0;
+	DWORD pid = 0;
+	GetWindowThreadProcessId(hwnd, &pid);
+	if (pid == 0)
+		return false;
+	HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+	if (!proc)
+		return false;
+	wchar_t exe_path[MAX_PATH] = {};
+	DWORD path_size = MAX_PATH;
+	bool ok = QueryFullProcessImageNameW(proc, 0, exe_path, &path_size) != 0;
+	CloseHandle(proc);
+	if (!ok)
+		return false;
+	path_basename(exe_path, out, out_cap);
+	return out[0] != 0;
 }
 
 extern "C" bool sc_is_window_resizing(HWND hwnd, uint64_t graceMs)

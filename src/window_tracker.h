@@ -132,6 +132,28 @@ void sc_resize_tracker_shutdown();
 // graceMs 동안 트랜지션 종료 후에도 true 반환 (송출 지연 보호).
 bool sc_is_window_resizing(HWND hwnd, uint64_t graceMs);
 
+// 주어진 exe 이름이 사용자 블랙리스트에 있는지 검사 (game mode dialog 제외 판단용).
+bool sc_is_blacklisted_exe(const wchar_t *exe_name);
+
+// 게임 모드 추가 블랙리스트 검사 (일반 + game-mode-extra 모두 통과 시 true).
+bool sc_is_blacklisted_exe_game_mode(const wchar_t *exe_name);
+
+// 일반 모드 블랙리스트에만 있는지 (game-mode-extra 제외). dialog 분기에서 사용.
+bool sc_is_blacklisted_exe_normal_only(const wchar_t *exe_name);
+
+// 사용자 설정 → 동적 블랙리스트 갱신. exes는 wchar_t* 배열 (count개).
+// settings update 콜백에서 1회 호출.
+void sc_set_user_blacklist_normal(const wchar_t *const *exes, int count);
+void sc_set_user_blacklist_game_mode(const wchar_t *const *exes, int count);
+
+// 어느 필터든 게임 모드면 true → sc_is_blacklisted_exe가 자동으로
+// game-mode-extra까지 검사. 필터의 game mode enter/exit에서 호출.
+void sc_set_global_game_mode(bool active);
+
+// 주어진 HWND의 owner process exe 이름을 base name으로 추출.
+// 성공 시 true 반환. out 버퍼는 wchar 단위 크기.
+bool sc_get_hwnd_exe_name(HWND hwnd, wchar_t *out, size_t out_cap);
+
 // 폴링 진입점: 호출자(visual-tracker)가 owner HWND 별로 showCmd 변화를 감지해
 // 위 맵에 트랜지션을 기록한다. graceMs 동안 sc_is_window_resizing이 true.
 void sc_notify_showcmd_change(HWND hwnd);
