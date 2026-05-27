@@ -19,10 +19,6 @@
 // 스레드 안전: 내부 뮤텍스로 보호. 렌더/OCR 양쪽에서 안전하게 호출 가능.
 // ============================================================
 
-// 전방 선언: window_tracker.h의 TrackedWindowList (HWND-bounds 배열).
-// .cpp에서 windows.h/window_tracker.h를 포함해 실 멤버 접근.
-struct TrackedWindowList;
-
 // OCR 결과를 Tracker에 전달하는 경량 구조체.
 // ocr-engine.h의 SecureCastOcrBox와 동일 레이아웃이지만
 // 순환 include를 피하기 위해 별도 선언.
@@ -110,15 +106,6 @@ public:
   // 최소화 가드에서 비-블랙리스트 owner 창도 lingering 등록 대상에 포함시키기
   // 위해 사용. 트래커가 없거나 모두 owner=nullptr면 빈 벡터 반환.
   std::vector<void *> active_owner_windows() const;
-
-  // [Window anchor] 송출 프레임 동기화 버전. 트래커의 ownerWin이 output_snapshot
-  // 안에 있으면, OCR 등록 시점 창 위치(refWindow)와 현재 송출 슬롯 창 위치의
-  // delta를 모니터→소스 좌표로 환산해 refX/refY에 더해 반환. owner 없는 트래커는
-  // 기존 active_boxes()와 동일하게 tr.x/tr.y 사용. 결과는 active_boxes()의
-  // ghost-kill 게이트와 동일한 조건을 거친 후 송출용 좌표.
-  std::vector<VtOcrBox>
-  boxes_for_output_snapshot(const TrackedWindowList *output_snapshot,
-                            uint32_t src_w, uint32_t src_h) const;
 
   // [Window anchor v4] pushFrame 직전에 호출. owner 창 바인딩된 트래커는
   // refWindow(OCR 시점)와 현재 DWM bounds의 delta를 즉시 계산해 박스 좌표를

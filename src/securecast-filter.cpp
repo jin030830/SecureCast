@@ -2713,9 +2713,9 @@ static void securecast_video_tick(void *data, float seconds) {
                                  : SCAN_INTERVAL_NORMAL;
   sc_tracker_tick(seconds, &filter->trackerAccumulator, &filter->windowList,
                   scanInterval);
-  // [Window anchor] 실시간 트래커 좌표 보정은 제거. 송출 프레임 동기화는
-  // video_render에서 outputSlot->windowSnapshot 기반으로 수행한다
-  // (boxes_for_output_snapshot).
+  // [Window anchor] 실시간 트래커 좌표 보정은 여기서 하지 않는다. pushFrame
+  // 직전에 trackerMgr.snapshot_for_push()가 owner 창의 현재 DWM bounds로 박스
+  // 좌표를 다시 계산해 슬롯에 저장한다.
 
   // [Role D] windowList 스캔 결과를 blacklistMask에 반영 (video_render에서
   // 최우선 차단에 사용). 각 창의 visibleRects(앞 창에 가려진 부분 제외)만
