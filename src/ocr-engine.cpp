@@ -313,8 +313,9 @@ SecureCastOcrEngine::analyze_bgra_frame(const uint8_t *pixels, int width,
   auto boxes = detect_pii(updatedLines);
 
   // 좌표 sanity check: frame 경계를 벗어나거나 비현실적으로 작은 박스 제거.
-  // multipass Phase 2 좌표 환산 실패나 메타 캡처로 들어온 이상 박스 차단.
-  // 사용자 로그에서 bbox=(2138, ...) > frame width 868 같은 OOB가 관찰됨.
+  // multipass batch/split의 IoU 좌표 역투영 실패나 메타 캡처로 들어온 이상
+  // 박스 차단. 사용자 로그에서 bbox=(2138, ...) > frame width 868 같은 OOB가
+  // 관찰됨.
   boxes.erase(std::remove_if(boxes.begin(), boxes.end(),
                              [width, height](const SecureCastOcrBox &b) {
                                return b.x < 0.0f || b.y < 0.0f ||

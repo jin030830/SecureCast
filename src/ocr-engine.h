@@ -152,8 +152,10 @@ private:
   detect_pii(const std::vector<SecureCastOcrLine> &lines);
 
   // P3: 소형 글씨 다중 패스 OCR
-  // lines에서 높이 < 20px인 라인을 최대 MAX_PASSES개까지 2× 업스케일 재OCR.
-  // detect_pii에 넘기기 전에 호출한다. L2 캐시 갱신에는 원본 lines를 사용한다.
+  // 높이 < SMALL_H px 인 라인 전체를 Union BBox 한 영역으로 묶어 2×
+  // nearest-neighbor 업스케일 후 단일 batch recognize_text 호출. 8MP 초과나
+  // sparse 레이아웃이면 split_batch_multipass로 폴백. 결과는 IoU 매칭으로
+  // 원본 라인에 다시 투영. detect_pii에 넘기기 전 호출 (L2 캐시는 원본 lines).
   std::vector<SecureCastOcrLine>
   multipass_small_text(const std::vector<SecureCastOcrLine> &lines,
                        const uint8_t *pixels, int width, int height,
