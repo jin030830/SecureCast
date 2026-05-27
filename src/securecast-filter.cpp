@@ -106,6 +106,32 @@ static constexpr float GM_ENTER_TIME = 3.0f; // 진입까지 ≥40% 유지 시�
 static constexpr float GM_EXIT_TIME = 5.0f;  // 해제까지 ≤30%  유지 시간 (초)
 static constexpr float GM_SAMPLE_INTERVAL = 1.0f; // CPU 샘플링 주기 (초)
 
+#ifdef _WIN32
+// [Game mode 전역 상태] 여러 필터 인스턴스(여러 OBS 소스에 같은 필터 부착)
+// 사이에서 dialog가 중복으로 뜨지 않도록 공유. game mode session 동안 한 exe
+// 당 한 번만 dialog. whitelist도 공유 — 사용자가 한 번 허용한 exe는 모든
+// 필터에서 블러 해제.
+static std::mutex g_gmGlobalMutex;
+static std::unordered_set<std::wstring> g_gmDialogPromptedExes;
+static std::unordered_set<std::wstring> g_gmWhitelist;
+static std::atomic<bool> g_gmAnyActive{false}; // 어느 필터든 게임 모드면 true
+
+// SecureCast/OBS 자기 자신 등 절대 블러/dialog 대상 아닌 exe 목록.
+// OBS는 스트리밍 도구라 화면에 보여도 안전. dialog 자체도 OBS 프로세스에서
+// MessageBoxW로 떠 foreground 잠시 잡으므로 self-fg loop 방지에도 필요.
+static bool is_gm_excluded_exe(const std::wstring &exe) {
+  static const wchar_t *const kExcluded[] = {
+      L"obs64.exe", L"obs32.exe", L"obs.exe",
+      L"obs-studio.exe", L"explorer.exe", // explorer = 작업표시줄/바탕화면
+  };
+  for (const wchar_t *e : kExcluded) {
+    if (_wcsicmp(exe.c_str(), e) == 0)
+      return true;
+  }
+  return false;
+}
+#endif
+
 // ================================================================
 // [Game Mode] GetSystemTimes 기반 시스템 전체 CPU 사용률 샘플링 (WIN32)
 //
@@ -2737,8 +2763,40 @@ static void securecast_video_tick(void *data, float seconds) {
           filter->isGameMode.store(true, std::memory_order_release);
           filter->gameModeEntryTimer = 0.0f;
           filter->gameModeExitTimer = 0.0f;
-          blog(LOG_INFO, "[SecureCast] Game mode ON  (CPU: %.0f%%)",
-               filter->cpuUsage);
+          // 어느 필터든 게임 모드면 글로벌 flag set → is_blacklisted가
+          // game-mode-extra (Chrome/Notepad 등)도 자동 적용.
+          sc_set_global_game_mode(true);
+          // [Game mode 진입] 현재 foreground = "the game"으로 캡처.
+          // 이 exe는 게임 모드 동안 블러 안 함 (게임 자체). Chrome 등이
+          // 떠 있는 상태에서 게임모드가 켜지면 그게 게임으로 잘못 잡힐 수 있어
+          // 캡처된 exe를 로그로 명시.
+          wchar_t gameExe[64] = {};
+          HWND fg = GetForegroundWindow();
+          if (fg && sc_get_hwnd_exe_name(fg, gameExe, 64)) {
+            // 제외 리스트 exe (OBS 등)가 fg면 게임 캡처하지 말기 — 게임 모드는
+            // 켜지지만 "the game" 없음 → 모든 다른 fg에 dialog 떠야 함.
+            if (is_gm_excluded_exe(std::wstring(gameExe))) {
+              std::lock_guard<std::mutex> lock(filter->gameModeMutex);
+              filter->gameModeGameExe.clear();
+              blog(LOG_INFO,
+                   "[SecureCast] Game mode ON (CPU: %.0f%%) — fg '%ls' is "
+                   "excluded, no game captured",
+                   filter->cpuUsage, gameExe);
+            } else {
+              std::lock_guard<std::mutex> lock(filter->gameModeMutex);
+              filter->gameModeGameExe = gameExe;
+              blog(LOG_INFO,
+                   "[SecureCast] Game mode ON (CPU: %.0f%%) — game exe='%ls'",
+                   filter->cpuUsage, gameExe);
+            }
+          } else {
+            std::lock_guard<std::mutex> lock(filter->gameModeMutex);
+            filter->gameModeGameExe.clear();
+            blog(LOG_INFO,
+                 "[SecureCast] Game mode ON (CPU: %.0f%%) — no fg captured",
+                 filter->cpuUsage);
+          }
+          filter->gameModeLastFg.store(fg, std::memory_order_release);
         }
       } else {
         filter->gameModeEntryTimer = 0.0f;
@@ -2749,6 +2807,17 @@ static void securecast_video_tick(void *data, float seconds) {
         if (filter->gameModeExitTimer >= GM_EXIT_TIME) {
           filter->isGameMode.store(false, std::memory_order_release);
           filter->gameModeExitTimer = 0.0f;
+          // 글로벌 flag clear → game-mode-extra 적용 중지.
+          // (TODO: 여러 필터 인스턴스면 모두 false일 때만 clear해야 정확.
+          //  현재는 마지막 게임 모드 탈출 필터가 clear 무방.)
+          sc_set_global_game_mode(false);
+          // [Game mode 탈출] 게임 exe 초기화. whitelist/prompted는 글로벌이므로
+          // 다음 게임 모드 세션까지 유지 — OBS 실행 동안 같은 앱 재질문 안 함.
+          {
+            std::lock_guard<std::mutex> lock(filter->gameModeMutex);
+            filter->gameModeGameExe.clear();
+          }
+          filter->gameModeLastFg.store(nullptr, std::memory_order_release);
           blog(LOG_INFO,
                "[SecureCast] Game mode OFF (CPU: %.0f%%, 5s cooldown)",
                filter->cpuUsage);
@@ -2758,6 +2827,112 @@ static void securecast_video_tick(void *data, float seconds) {
       }
     }
   }
+
+#ifdef _WIN32
+  // [Game mode foreground 변화 감지]
+  // 게임 모드 동안 사용자가 다른 앱을 켜면 (foreground 변화) → 그 앱이
+  // 게임/화이트리스트 외라면 dialog로 허용 여부 확인. 응답 받기 전까지
+  // 자동 블러는 mask building 단계에서 처리.
+  if (filter->isGameMode.load(std::memory_order_acquire)) {
+    HWND curFg = GetForegroundWindow();
+    HWND prevFg = static_cast<HWND>(
+        filter->gameModeLastFg.load(std::memory_order_acquire));
+    if (curFg && curFg != prevFg) {
+      filter->gameModeLastFg.store(curFg, std::memory_order_release);
+      wchar_t fgExe[64] = {};
+      if (sc_get_hwnd_exe_name(curFg, fgExe, 64)) {
+        std::wstring fgExeStr(fgExe);
+        // 디버그: 모든 fg 변화 로그 (어떤 exe가 잡히고 어떤 게 안 잡히는지 확인).
+        blog(LOG_INFO, "[SecureCast][GM-fg] fg changed to '%ls'", fgExe);
+
+        // SecureCast/OBS 자기 자신 같은 제외 리스트 → 절대 dialog/블러 X.
+        if (is_gm_excluded_exe(fgExeStr)) {
+          blog(LOG_INFO, "[SecureCast][GM] '%ls' is excluded — skipping",
+               fgExe);
+        } else {
+          // 게임 자체나 이미 처리된 exe는 skip. whitelist/prompted는 GLOBAL
+          // 사용 — 여러 필터 인스턴스 사이 중복 dialog 방지.
+          bool isGame = false, alreadyPrompted = false, inWhitelist = false;
+          {
+            std::lock_guard<std::mutex> lock(filter->gameModeMutex);
+            isGame = (fgExeStr == filter->gameModeGameExe);
+          }
+          {
+            std::lock_guard<std::mutex> glock(g_gmGlobalMutex);
+            inWhitelist = g_gmWhitelist.count(fgExeStr) > 0;
+            alreadyPrompted = g_gmDialogPromptedExes.count(fgExeStr) > 0;
+          }
+          if (!isGame && !inWhitelist && !alreadyPrompted) {
+          // 분기:
+          //  - 일반 블랙리스트 exe → 항상 silent blur (토글 무관, 사용자가
+          //    '일반 모드에서도 차단'이라 명시한 거)
+          //  - 게임 블랙리스트 exe → 토글 OFF면 silent, ON이면 dialog
+          //  - 둘 다 아닌 exe → 항상 dialog
+          const bool isOnNormalBl = sc_is_blacklisted_exe_normal_only(fgExe);
+          const bool isOnAnyBl = sc_is_blacklisted_exe_game_mode(fgExe);
+          const bool isOnGameOnlyBl = isOnAnyBl && !isOnNormalBl;
+          const bool askForBl =
+              filter->gameModeAskForBlacklist.load(std::memory_order_acquire);
+          if (isOnNormalBl) {
+            blog(LOG_INFO,
+                 "[SecureCast][GM] normal blacklist exe '%ls' — silent blur",
+                 fgExe);
+          } else if (isOnGameOnlyBl && !askForBl) {
+            blog(LOG_INFO,
+                 "[SecureCast][GM] game blacklist exe '%ls' — silent blur "
+                 "(toggle off)",
+                 fgExe);
+          } else {
+            // dialog 띄움. 중복 방지로 prompted set에 미리 추가 (한 앱 한 번만).
+            // GLOBAL set 사용 — 다른 필터 인스턴스에서도 같은 exe는 skip.
+            {
+              std::lock_guard<std::mutex> glock(g_gmGlobalMutex);
+              g_gmDialogPromptedExes.insert(fgExeStr);
+            }
+            wchar_t fgTitle[256] = {};
+            GetWindowTextW(curFg, fgTitle, 256);
+            std::wstring titleStr = fgTitle[0] ? fgTitle : L"(제목 없음)";
+            blog(LOG_INFO,
+                 "[SecureCast][GM] new fg '%ls' (%ls) — spawning consent dialog",
+                 fgExe, titleStr.c_str());
+            std::thread([fgExeStr, titleStr]() {
+              // 경고 스타일 메시지. 창 제목 + exe + 강조 텍스트.
+              std::wstring msg =
+                  L"⚠️ 보안 경고\n\n"
+                  L"앱: " +
+                  titleStr +
+                  L"\n"
+                  L"실행 파일: " +
+                  fgExeStr +
+                  L"\n\n"
+                  L"이 앱에 민감 정보가 포함되어 있을 수 있어 자동으로 블러"
+                  L" 처리됐습니다.\n"
+                  L"방송 송출 화면에 그대로 노출(블러 해제)하시겠습니까?\n\n"
+                  L"[예] = 이번 게임 세션 동안 블러 해제\n"
+                  L"[아니오] = 계속 블러 유지 (권장)";
+              int result = MessageBoxW(
+                  nullptr, msg.c_str(), L"⚠️ SecureCast 보안 경고",
+                  MB_YESNO | MB_TOPMOST | MB_ICONWARNING | MB_DEFBUTTON2 |
+                      MB_SETFOREGROUND);
+              if (result == IDYES) {
+                std::lock_guard<std::mutex> glock(g_gmGlobalMutex);
+                g_gmWhitelist.insert(fgExeStr);
+                blog(LOG_INFO,
+                     "[SecureCast][GM] user allowed '%ls' for this session",
+                     fgExeStr.c_str());
+              } else {
+                blog(LOG_INFO,
+                     "[SecureCast][GM] user kept '%ls' blurred",
+                     fgExeStr.c_str());
+              }
+            }).detach();
+          }
+          } // end of !isGame && !inWhitelist && !alreadyPrompted
+        } // end of !is_gm_excluded_exe
+      }
+    }
+  }
+#endif
 
   // ── WinEvent: 포그라운드 전환 감지 → Quick Restore ─
   // 게임 모드는 CPU 임계값(≤30%, 5s)으로만 해제한다.
@@ -2830,6 +3005,49 @@ static void securecast_video_tick(void *data, float seconds) {
             (int)(r.bottom - r.top), 0};
       }
     }
+
+#ifdef _WIN32
+    // [Game mode 자동 블러] 게임 모드 동안 foreground가 게임/화이트리스트가
+    // 아니면 그 창 전체를 blacklistMask에 추가. dialog 응답 받기 전까지는
+    // 블러 유지. 사용자가 [예] 응답하면 화이트리스트에 들어가 다음 프레임부터
+    // 이 블록이 skip. OBS/explorer 같은 제외 리스트 exe도 skip.
+    if (filter->isGameMode.load(std::memory_order_acquire) &&
+        outCount < SC_MAX_BLUR_RECTS) {
+      HWND fg = GetForegroundWindow();
+      if (fg) {
+        wchar_t fgExe[64] = {};
+        if (sc_get_hwnd_exe_name(fg, fgExe, 64)) {
+          std::wstring fgExeStr(fgExe);
+          bool block = false;
+          if (!is_gm_excluded_exe(fgExeStr)) {
+            bool isGame = false;
+            {
+              std::lock_guard<std::mutex> lock(filter->gameModeMutex);
+              isGame = (fgExeStr == filter->gameModeGameExe);
+            }
+            bool inWhitelist = false;
+            {
+              std::lock_guard<std::mutex> glock(g_gmGlobalMutex);
+              inWhitelist = g_gmWhitelist.count(fgExeStr) > 0;
+            }
+            block = !isGame && !inWhitelist;
+          }
+          if (block) {
+            RECT fgRect{};
+            if (SUCCEEDED(DwmGetWindowAttribute(
+                    fg, DWMWA_EXTENDED_FRAME_BOUNDS, &fgRect,
+                    sizeof(fgRect)))) {
+              filter->blacklistMask.rects[outCount++] = {
+                  (int)fgRect.left, (int)fgRect.top,
+                  (int)(fgRect.right - fgRect.left),
+                  (int)(fgRect.bottom - fgRect.top), 0};
+            }
+          }
+        }
+      }
+    }
+#endif
+
     filter->blacklistMask.rectCount = outCount;
     if (filter->windowList.count > 0 && filter->logScanThrottle++ % 10 == 0)
       blog(LOG_INFO,

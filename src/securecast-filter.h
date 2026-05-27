@@ -18,6 +18,8 @@
 // C++ Standard Library Headers (MUST be included before OBS headers)
 // ----------------------------------------------------
 #include <array>
+#include <string>
+#include <unordered_set>
 #include <atomic>
 #include <condition_variable>
 #include <functional>
@@ -210,6 +212,22 @@ struct SecureCastFilter {
   bool isActive = true; // 필터 활성화 여부
   std::atomic<bool> isGameMode{
       false}; // CPU 임계값 기반 자동 전환 (render/tick 크로스 스레드)
+
+  // ----- [Game Mode 세션 화이트리스트] -----
+  // 게임 모드 ON 동안: OCR 중단 + foreground 변화 시 게임 외 모든 앱 자동 블러
+  // + dialog로 사용자 허용 받음. 사용자 OK → 세션 화이트리스트 추가 → 그 앱은
+  // 이 세션 동안 블러 안 함. 게임 모드 OFF 시 화이트리스트 폐기.
+  std::mutex gameModeMutex;
+  // 게임 모드 진입 시 캡처한 게임 프로세스 exe (이 exe는 블러 안 함)
+  std::wstring gameModeGameExe;
+  // 사용자 허용 받은 exe 목록 (lower-case)
+  std::unordered_set<std::wstring> gameModeWhitelist;
+  // dialog 중복 방지: dialog 중이거나 응답받은 exe (lower-case)
+  std::unordered_set<std::wstring> gameModeDialogPromptedExes;
+  // 직전 폴링 시 foreground HWND (변화 감지용)
+  std::atomic<void *> gameModeLastFg{nullptr};
+  // 설정: 블랙리스트 exe도 dialog로 물어볼지 여부 (기본 false = 항상 블러, 안 물음)
+  std::atomic<bool> gameModeAskForBlacklist{false};
   SecurityState currentState =
       SecurityState::SAFE; // 현재 보안 등급 (SAFE/PARTIAL/RISK)
 
