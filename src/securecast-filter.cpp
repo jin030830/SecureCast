@@ -1111,21 +1111,23 @@ static void ocr_worker_loop(SecureCastFilter *filter) {
     }
 
     // 2-C: 적응형 스케일 — 직전 사이클 평균 라인 높이를 14~20px 대역으로 맞춤.
-    // 첫 사이클(avgH=0): fallback 정책(1440p+ 0.5×, 1080p- 2×).
+    // ★ 다운스케일 비활성화: 표 케이스에서 큰 헤더 + 작은 데이터가 섞이면
+    //   avgLineH가 중간값(28px)이라 0.57× 다운스케일 적용 → 작은 데이터 행이
+    //   더 작아져 OCR 미인식 → 다음 사이클도 같은 avg 유지 → 영원히 누락.
+    //   downscale 차단(min 1.0×)으로 progression 차단.
+    // 첫 사이클(avgH=0): 무조건 2× 업스케일 (1440p+ fallback 0.5×도 제거).
     constexpr float kOcrTargetH = 16.0f; // Windows.Media.Ocr 최적 구간 중간값
-    constexpr float kScaleMin = 0.5f;
+    constexpr float kScaleMin = 1.0f;    // 0.5 → 1.0 (다운스케일 차단)
     constexpr float kScaleMax = 2.5f;
     const float avgLineH =
         filter->ocrEngine ? filter->ocrEngine->averageLineHeight() : 0.0f;
 
-    // fallback: 1440p+ → 0.5×, 1080p- → 2×
-    const bool is1440p = (width >= 2560 && height >= 1440);
     float adaptScale;
     if (avgLineH > 0.0f) {
       adaptScale =
           std::max(kScaleMin, std::min(kOcrTargetH / avgLineH, kScaleMax));
     } else {
-      adaptScale = is1440p ? 0.5f : 2.0f;
+      adaptScale = 2.0f; // 첫 사이클 fallback: 항상 2× 업
     }
 
     // 스케일 적용 (0.5× 다운 or 2× 업만 SIMD; 그 외 스칼라 bilinear)

@@ -212,7 +212,11 @@ SecureCastOcrEngine::analyze_bgra_frame(const uint8_t *pixels, int width,
   // ── L1: ROI dHash ─────────────────────────────────────────────
   // PII 박스 영역만 해시 → 시계·커서 등 ROI 외부 변화는 완전히 무시.
   // hamming_distance ≤ 2 → 안티앨리어싱·압축 노이즈 허용 → OCR 생략.
-  if (sameRes && hasLastRoiDhash_) {
+  //
+  // ★ lastBoxes_가 비어있으면 L1 hit 안 함. 정적 화면에서 OCR이 한 번
+  //   실패해 0박스 캐싱되면 그 화면 내내 영원히 0박스가 반환되는 영구화
+  //   문제 차단. 빈 결과면 다음 사이클에서 full OCR 강제로 재시도 기회 보장.
+  if (sameRes && hasLastRoiDhash_ && !lastBoxes_.empty()) {
     const uint64_t roiHash = compute_roi_dhash(pixels, stride, width, height);
     if (hamming_distance(roiHash, lastRoiDhash_) <= 2) {
       if (++consecutiveSkips_ < kMaxConsecutiveSkips)
@@ -305,7 +309,13 @@ SecureCastOcrEngine::analyze_bgra_frame(const uint8_t *pixels, int width,
     float sumH = 0.0f;
     for (const auto &l : lines)
       sumH += l.h;
-    avgLineHeight_ = sumH / static_cast<float>(lines.size());
+    const float current = sumH / static_cast<float>(lines.size());
+    // EMA smoothing: 갑작스러운 평균 변동을 완화. 큰 헤더만 잡힌 사이클에서
+    // avg가 폭증해 다음 사이클이 과도하게 downscale되어 작은 글자 누락이
+    // 영구화되는 진동 차단. 0.7×prev + 0.3×current로 부드럽게.
+    avgLineHeight_ = (avgLineHeight_ > 0.0f)
+                         ? avgLineHeight_ * 0.7f + current * 0.3f
+                         : current;
   }
 
   auto updatedLines =
@@ -1137,8 +1147,11 @@ SecureCastOcrEngine::detect_pii(const std::vector<SecureCastOcrLine> &lines) {
 
   // 2) 전화번호: 국내(010/011/016~019, 02~06x) + 국제(+1-xxx, +44-xx...)
   // 국제번호는 \b 없이 +로 시작하므로 별도 alt 추가.
+  // OCR이 들쭉날쭉한 공백/구분자를 출력하는 케이스 흡수: [-\s]? → [-\s]{0,3}
+  // (단일 → 0~3개 허용). "010 - 0002 - 0014" 같은 긴 공백 패턴도 매칭.
+  // 마지막 \b → (?:\b|$): 라인 끝(boundary 없음)도 허용.
   static const re2::RE2 PATTERN_PHONE(
-      R"((?:\+82[-\s]?1[016-9]|\b01[016-9])[-\s]?\d{3,4}[-\s]?\d{4}\b|\b0(?:2[-\s]?\d{3,4}|[3-9]\d[-\s]?\d{3,4}|[3-9]\d{2}[-\s]?\d{3,4})[-\s]?\d{4}\b|\+[1-9]\d{0,2}[-\s]?(?:\d[-\s]?){6,13}\d)");
+      R"((?:\+82[-\s]{0,3}1[016-9]|\b01[016-9])[-\s]{0,3}\d{3,4}[-\s]{0,3}\d{4}(?:\b|$)|\b0(?:2[-\s]{0,3}\d{3,4}|[3-9]\d[-\s]{0,3}\d{3,4}|[3-9]\d{2}[-\s]{0,3}\d{3,4})[-\s]{0,3}\d{4}(?:\b|$)|\+[1-9]\d{0,2}[-\s]{0,3}(?:\d[-\s]{0,3}){6,13}\d)");
 
   // 3) 이메일: 전체를 그룹 1로 캡처 (valid_email 검증에 사용)
   static const re2::RE2 PATTERN_EMAIL(
@@ -1542,9 +1555,15 @@ static UnionBBox compute_union_bbox(const std::vector<SecureCastOcrLine> &lines,
   return b;
 }
 
-// 2× 업스케일된 batch 좌표(batchLines)를 (ux0, uy0) 원본 좌표계로 역투영하여
-// indices에 대응하는 가장 잘 맞는 라인을 IoU 매칭으로 result[idx]에 반영.
-// IoU가 임계치 미만이면 result[idx]는 유지된다(원본 라인 보존).
+// multipass 업스케일 배율. 2 → 3으로 늘려 매우 작은 글씨(특히 한글) 검출 강화.
+// 비용: batch 픽셀 수 4× → 9× (2.25배). SC_MAX_OCR_BATCH_PX 가드에 더 자주
+// 걸려 split fallback 발동 빈도 증가. 정확도 우선 trade-off.
+constexpr int kMpUpscale = 3;
+constexpr float kMpUpscaleInv = 1.0f / static_cast<float>(kMpUpscale);
+
+// kMpUpscale× 업스케일된 batch 좌표(batchLines)를 (ux0, uy0) 원본 좌표계로
+// 역투영하여 indices에 대응하는 가장 잘 맞는 라인을 IoU 매칭으로 result[idx]에
+// 반영. IoU가 임계치 미만이면 result[idx]는 유지된다(원본 라인 보존).
 static void apply_iou_match(std::vector<SecureCastOcrLine> &result,
                             const std::vector<int> &indices,
                             const std::vector<SecureCastOcrLine> &batchLines,
@@ -1555,9 +1574,9 @@ static void apply_iou_match(std::vector<SecureCastOcrLine> &result,
     int bestJ = -1;
     for (int j = 0; j < static_cast<int>(batchLines.size()); ++j) {
       const auto &bl = batchLines[j];
-      const float bx = ux0 + bl.x * 0.5f;
-      const float by = uy0 + bl.y * 0.5f;
-      const float bw = bl.w * 0.5f, bh = bl.h * 0.5f;
+      const float bx = ux0 + bl.x * kMpUpscaleInv;
+      const float by = uy0 + bl.y * kMpUpscaleInv;
+      const float bw = bl.w * kMpUpscaleInv, bh = bl.h * kMpUpscaleInv;
       const float ix = std::max(orig.x, bx);
       const float iy = std::max(orig.y, by);
       const float ix2 = std::min(orig.x + orig.w, bx + bw);
@@ -1576,10 +1595,10 @@ static void apply_iou_match(std::vector<SecureCastOcrLine> &result,
       const auto &bl = batchLines[bestJ];
       SecureCastOcrLine mapped;
       mapped.text = bl.text;
-      mapped.x = ux0 + bl.x * 0.5f;
-      mapped.y = uy0 + bl.y * 0.5f;
-      mapped.w = bl.w * 0.5f;
-      mapped.h = bl.h * 0.5f;
+      mapped.x = ux0 + bl.x * kMpUpscaleInv;
+      mapped.y = uy0 + bl.y * kMpUpscaleInv;
+      mapped.w = bl.w * kMpUpscaleInv;
+      mapped.h = bl.h * kMpUpscaleInv;
       result[idx] = mapped;
     }
   }
@@ -1605,7 +1624,12 @@ std::vector<SecureCastOcrLine> SecureCastOcrEngine::multipass_small_text(
   PhaseTimer t_mp(&profile_.acc.multipass);
   static constexpr int PAD = 4;
 
-  const float SMALL_H = avgLineHeight_ > 0.0f ? avgLineHeight_ * 0.7f : 20.0f;
+  // 표 케이스: 큰 헤더 + 작은 데이터 행이 섞이면 avgLineHeight가 중간값이라
+  // 0.7배 임계로는 데이터 행이 multipass 대상에서 빠짐. 0.9배 + 22px floor로
+  // 작은 데이터 셀까지 업스케일 OCR 대상에 포함.
+  const float SMALL_H = avgLineHeight_ > 0.0f
+                            ? std::max(avgLineHeight_ * 0.9f, 22.0f)
+                            : 24.0f;
 
   auto result = lines;
   std::vector<int> small;
@@ -1624,7 +1648,8 @@ std::vector<SecureCastOcrLine> SecureCastOcrEngine::multipass_small_text(
   if (ucw <= 0 || uch <= 0)
     return result;
 
-  const size_t batchPx = static_cast<size_t>(ucw * 2) * (uch * 2);
+  const size_t batchPx =
+      static_cast<size_t>(ucw * kMpUpscale) * (uch * kMpUpscale);
   const float unionArea = static_cast<float>(ucw * uch);
   const bool isSparse =
       (unionArea > 0.0f) && (ub.sumArea / unionArea < SC_SPARSE_THRESHOLD);
@@ -1635,13 +1660,14 @@ std::vector<SecureCastOcrLine> SecureCastOcrEngine::multipass_small_text(
     return split_batch_multipass(result, small, pixels, width, height, stride);
   }
 
-  // 3단계: 기본 밀집/안전 단일 Batch OCR
-  const int bW = ucw * 2, bH = uch * 2;
+  // 3단계: 기본 밀집/안전 단일 Batch OCR (kMpUpscale× nearest-neighbor)
+  const int bW = ucw * kMpUpscale, bH = uch * kMpUpscale;
   std::vector<uint8_t> batch(static_cast<size_t>(bW) * bH * 4);
   for (int by = 0; by < bH; ++by) {
     for (int bx = 0; bx < bW; ++bx) {
-      const uint8_t *s =
-          pixels + (ptrdiff_t)(ub.y0 + by / 2) * stride + (ub.x0 + bx / 2) * 4;
+      const uint8_t *s = pixels +
+                         (ptrdiff_t)(ub.y0 + by / kMpUpscale) * stride +
+                         (ub.x0 + bx / kMpUpscale) * 4;
       uint8_t *d = batch.data() + (ptrdiff_t)by * bW * 4 + bx * 4;
       d[0] = s[0];
       d[1] = s[1];
@@ -1713,12 +1739,13 @@ std::vector<SecureCastOcrLine> SecureCastOcrEngine::split_batch_multipass(
         if (cw <= 0 || ch <= 0)
           continue;
 
-        const int upW = cw * 2, upH = ch * 2;
+        const int upW = cw * kMpUpscale, upH = ch * kMpUpscale;
         std::vector<uint8_t> up(static_cast<size_t>(upW) * upH * 4);
         for (int uy = 0; uy < upH; ++uy) {
           for (int ux = 0; ux < upW; ++ux) {
-            const uint8_t *src =
-                pixels + (ptrdiff_t)(cy + uy / 2) * stride + (cx + ux / 2) * 4;
+            const uint8_t *src = pixels +
+                                 (ptrdiff_t)(cy + uy / kMpUpscale) * stride +
+                                 (cx + ux / kMpUpscale) * 4;
             uint8_t *d = up.data() + (ptrdiff_t)uy * upW * 4 + ux * 4;
             d[0] = src[0];
             d[1] = src[1];
@@ -1732,24 +1759,26 @@ std::vector<SecureCastOcrLine> SecureCastOcrEngine::split_batch_multipass(
           continue;
 
         for (auto &rl : reLines) {
-          rl.x = cx + rl.x * 0.5f;
-          rl.y = cy + rl.y * 0.5f;
-          rl.w *= 0.5f;
-          rl.h *= 0.5f;
+          rl.x = cx + rl.x * kMpUpscaleInv;
+          rl.y = cy + rl.y * kMpUpscaleInv;
+          rl.w *= kMpUpscaleInv;
+          rl.h *= kMpUpscaleInv;
         }
         result[idx] = reLines[0];
       }
     } else {
       // 배치 픽셀 임계치 초과 시 최종 안전 장치(이 서브셋 OCR 포기).
-      if (static_cast<size_t>(ucw * 2) * (uch * 2) > SC_MAX_OCR_BATCH_PX)
+      if (static_cast<size_t>(ucw * kMpUpscale) * (uch * kMpUpscale) >
+          SC_MAX_OCR_BATCH_PX)
         continue;
 
-      const int bW = ucw * 2, bH = uch * 2;
+      const int bW = ucw * kMpUpscale, bH = uch * kMpUpscale;
       std::vector<uint8_t> batch(static_cast<size_t>(bW) * bH * 4);
       for (int by = 0; by < bH; ++by) {
         for (int bx = 0; bx < bW; ++bx) {
-          const uint8_t *s = pixels + (ptrdiff_t)(ub.y0 + by / 2) * stride +
-                             (ub.x0 + bx / 2) * 4;
+          const uint8_t *s = pixels +
+                             (ptrdiff_t)(ub.y0 + by / kMpUpscale) * stride +
+                             (ub.x0 + bx / kMpUpscale) * 4;
           uint8_t *d = batch.data() + (ptrdiff_t)by * bW * 4 + bx * 4;
           d[0] = s[0];
           d[1] = s[1];
