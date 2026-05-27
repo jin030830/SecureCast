@@ -196,6 +196,8 @@ if(WIN32)
     windowsapp
     uiautomationcore
     ole32
+    shell32   # IShellLink (Start Menu .lnk 해석)
+    version   # GetFileVersionInfo (앱 친화명 fallback)
   )
 endif()
 

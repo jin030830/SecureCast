@@ -2928,9 +2928,11 @@ static void securecast_video_tick(void *data, float seconds) {
 // ================================================================
 
 #define SC_SETTING_BLACKLIST "sc_blacklist"
+#define SC_SETTING_BLACKLIST_GM "sc_blacklist_gm"
 // #define SC_SETTING_GAME_MODE   "sc_game_mode"  // [v2] 게임 모드 — 현재
 // 스코프 외
 #define SC_SETTING_MANUAL_RECTS "sc_manual_rects"
+#define SC_SETTING_GM_ASK_BL "sc_gm_ask_blacklist"
 
 // manualBlurMask → obs_data_array 직렬화 후 source settings에 write-back.
 // settingsMutex 밖에서 호출해야 함 — obs_source_get_settings가 OBS 내부 락을
@@ -2955,21 +2957,367 @@ static void save_manual_rects(SecureCastFilter *filter,
   obs_data_array_release(arr);
 }
 
-static void securecast_get_defaults(obs_data_t *settings) {
-  obs_data_set_default_string(settings, SC_SETTING_BLACKLIST, "");
+// ============================================================
+// 앱 picker — 시스템 설치 앱 + 실행 중 앱을 콤보박스에 채움.
+//  Source A: HKLM/HKCU Uninstall 레지스트리 (Win32 + MSIX)
+//  Source B: %LOCALAPPDATA%\Microsoft\WindowsApps\*.exe (메모장, 계산기 등)
+//  Source C: EnumWindows 실행 중 프로세스 (보완)
+//  표시 형식: "친화명  (exe.exe)"  — 저장값은 exe.exe (basename)
+// ============================================================
+#ifdef _WIN32
 
-  obs_data_array_t *emptyArr = obs_data_array_create();
-  obs_data_set_default_array(settings, SC_SETTING_MANUAL_RECTS, emptyArr);
-  obs_data_array_release(emptyArr);
+struct PickerApp {
+  std::string name;  // UTF-8 친화명
+  std::string exe;   // UTF-8 basename (저장값)
+};
+
+static void pa_to_utf8(const wchar_t *src, std::string &dst) {
+  int len = WideCharToMultiByte(CP_UTF8, 0, src, -1, nullptr, 0, nullptr,
+                                nullptr);
+  if (len > 1) {
+    dst.assign(len - 1, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, src, -1, dst.data(), len, nullptr, nullptr);
+  } else {
+    dst.clear();
+  }
+}
+
+static bool pa_already(const std::vector<PickerApp> &v, const std::string &exe) {
+  for (const auto &a : v)
+    if (_stricmp(a.exe.c_str(), exe.c_str()) == 0)
+      return true;
+  return false;
+}
+
+// 버전 리소스에서 FileDescription/ProductName 추출.
+static bool pa_friendly_name_from_exe(const wchar_t *path, std::string &out) {
+  DWORD dummy;
+  DWORD sz = GetFileVersionInfoSizeW(path, &dummy);
+  if (!sz)
+    return false;
+  std::vector<BYTE> buf(sz);
+  if (!GetFileVersionInfoW(path, 0, sz, buf.data()))
+    return false;
+  struct LCP {
+    WORD lang;
+    WORD cp;
+  } *trans;
+  UINT tsz = 0;
+  if (!VerQueryValueW(buf.data(), L"\\VarFileInfo\\Translation",
+                      reinterpret_cast<LPVOID *>(&trans), &tsz) ||
+      tsz < sizeof(LCP))
+    return false;
+  for (auto *fieldName : {L"FileDescription", L"ProductName"}) {
+    wchar_t subPath[80];
+    swprintf_s(subPath, L"\\StringFileInfo\\%04x%04x\\%s", trans[0].lang,
+               trans[0].cp, fieldName);
+    wchar_t *val = nullptr;
+    UINT vlen = 0;
+    if (VerQueryValueW(buf.data(), subPath, reinterpret_cast<LPVOID *>(&val),
+                       &vlen) &&
+        val && val[0]) {
+      pa_to_utf8(val, out);
+      return true;
+    }
+  }
+  return false;
+}
+
+// Source A: Uninstall 레지스트리 키 순회.
+static void pa_enum_registry(std::vector<PickerApp> &out) {
+  struct Hive {
+    HKEY root;
+    const wchar_t *path;
+  };
+  Hive hives[] = {
+      {HKEY_LOCAL_MACHINE,
+       L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall"},
+      {HKEY_LOCAL_MACHINE,
+       L"SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall"},
+      {HKEY_CURRENT_USER,
+       L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall"},
+  };
+  for (const auto &h : hives) {
+    HKEY hRoot;
+    if (RegOpenKeyExW(h.root, h.path, 0, KEY_READ, &hRoot) != ERROR_SUCCESS)
+      continue;
+    wchar_t subKey[256];
+    DWORD subLen = 256;
+    DWORD i = 0;
+    while (RegEnumKeyExW(hRoot, i++, subKey, &subLen, nullptr, nullptr, nullptr,
+                         nullptr) == ERROR_SUCCESS) {
+      subLen = 256;
+      HKEY hSub;
+      if (RegOpenKeyExW(hRoot, subKey, 0, KEY_READ, &hSub) != ERROR_SUCCESS)
+        continue;
+      DWORD sysComp = 0, dwSz = sizeof(DWORD);
+      RegQueryValueExW(hSub, L"SystemComponent", nullptr, nullptr,
+                       reinterpret_cast<LPBYTE>(&sysComp), &dwSz);
+      if (sysComp) {
+        RegCloseKey(hSub);
+        continue;
+      }
+      auto readSz = [&](const wchar_t *valName, wchar_t *buf, DWORD chars) {
+        DWORD type = 0;
+        DWORD bytes = chars * sizeof(wchar_t);
+        return RegQueryValueExW(hSub, valName, nullptr, &type,
+                                reinterpret_cast<LPBYTE>(buf), &bytes) ==
+                   ERROR_SUCCESS &&
+               type == REG_SZ && buf[0];
+      };
+      wchar_t displayName[256] = {};
+      wchar_t icon[MAX_PATH] = {};
+      if (readSz(L"DisplayName", displayName, 256) &&
+          readSz(L"DisplayIcon", icon, MAX_PATH)) {
+        // "C:\app\x.exe,0" → "C:\app\x.exe"
+        wchar_t *comma = wcschr(icon, L',');
+        if (comma)
+          *comma = L'\0';
+        wchar_t *p = icon;
+        if (*p == L'"') {
+          ++p;
+          wchar_t *q = wcschr(p, L'"');
+          if (q)
+            *q = L'\0';
+        }
+        const wchar_t *dot = wcsrchr(p, L'.');
+        if (dot && _wcsicmp(dot, L".exe") == 0) {
+          const wchar_t *base = p;
+          for (const wchar_t *r = p; *r; ++r)
+            if (*r == L'\\' || *r == L'/')
+              base = r + 1;
+          std::string exeStr;
+          pa_to_utf8(base, exeStr);
+          if (!exeStr.empty() && !pa_already(out, exeStr)) {
+            PickerApp app;
+            pa_to_utf8(displayName, app.name);
+            app.exe = std::move(exeStr);
+            out.push_back(std::move(app));
+          }
+        }
+      }
+      RegCloseKey(hSub);
+    }
+    RegCloseKey(hRoot);
+  }
+}
+
+// Source B: %LOCALAPPDATA%\Microsoft\WindowsApps\*.exe.
+static void pa_enum_windows_apps(std::vector<PickerApp> &out) {
+  wchar_t local[MAX_PATH] = {};
+  if (!GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH))
+    return;
+  wchar_t pattern[MAX_PATH];
+  swprintf_s(pattern, L"%s\\Microsoft\\WindowsApps\\*.exe", local);
+  WIN32_FIND_DATAW fd{};
+  HANDLE h = FindFirstFileW(pattern, &fd);
+  if (h == INVALID_HANDLE_VALUE)
+    return;
+  do {
+    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+      continue;
+    std::string exeStr;
+    pa_to_utf8(fd.cFileName, exeStr);
+    if (exeStr.empty() || pa_already(out, exeStr))
+      continue;
+    PickerApp app;
+    app.exe = exeStr;
+    wchar_t fullPath[MAX_PATH];
+    swprintf_s(fullPath, L"%s\\Microsoft\\WindowsApps\\%s", local,
+               fd.cFileName);
+    if (!pa_friendly_name_from_exe(fullPath, app.name)) {
+      // fallback: .exe 제거한 파일명
+      auto dot = exeStr.find_last_of('.');
+      app.name = (dot != std::string::npos) ? exeStr.substr(0, dot) : exeStr;
+    }
+    if (!app.name.empty())
+      out.push_back(std::move(app));
+  } while (FindNextFileW(h, &fd));
+  FindClose(h);
+}
+
+// Source C: 실행 중 가시 창 (앞 소스에 없는 앱 보완).
+static BOOL CALLBACK pa_enum_running_proc(HWND hwnd, LPARAM lparam) {
+  auto *out = reinterpret_cast<std::vector<PickerApp> *>(lparam);
+  if (!IsWindowVisible(hwnd) || IsIconic(hwnd))
+    return TRUE;
+  DWORD pid = 0;
+  GetWindowThreadProcessId(hwnd, &pid);
+  if (!pid)
+    return TRUE;
+  HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+  if (!proc)
+    return TRUE;
+  wchar_t path[MAX_PATH] = {};
+  DWORD sz = MAX_PATH;
+  bool ok = QueryFullProcessImageNameW(proc, 0, path, &sz) != 0;
+  CloseHandle(proc);
+  if (!ok)
+    return TRUE;
+  const wchar_t *base = path;
+  for (const wchar_t *q = path; *q; ++q)
+    if (*q == L'\\' || *q == L'/')
+      base = q + 1;
+  if (_wcsicmp(base, L"explorer.exe") == 0 ||
+      _wcsicmp(base, L"obs64.exe") == 0)
+    return TRUE; // OBS 자체와 explorer 제외
+  std::string exeStr;
+  pa_to_utf8(base, exeStr);
+  if (exeStr.empty() || pa_already(*out, exeStr))
+    return TRUE;
+  PickerApp app;
+  app.exe = exeStr;
+  wchar_t title[128] = {};
+  GetWindowTextW(hwnd, title, 128);
+  if (title[0])
+    pa_to_utf8(title, app.name);
+  else if (!pa_friendly_name_from_exe(path, app.name)) {
+    auto dot = exeStr.find_last_of('.');
+    app.name = (dot != std::string::npos) ? exeStr.substr(0, dot) : exeStr;
+  }
+  if (!app.name.empty())
+    out->push_back(std::move(app));
+  return TRUE;
+}
+
+static void populate_app_picker(obs_property_t *combo) {
+  std::vector<PickerApp> apps;
+  pa_enum_registry(apps);
+  pa_enum_windows_apps(apps);
+  EnumWindows(pa_enum_running_proc, reinterpret_cast<LPARAM>(&apps));
+  std::sort(apps.begin(), apps.end(), [](const PickerApp &a, const PickerApp &b) {
+    return _stricmp(a.name.c_str(), b.name.c_str()) < 0;
+  });
+  for (const auto &a : apps) {
+    std::string label = a.name + "  (" + a.exe + ")";
+    obs_property_list_add_string(combo, label.c_str(), a.exe.c_str());
+  }
+}
+
+// 콤보박스 선택값 → editable_list 추가 (중복 체크).
+static bool add_picker_to_list(void *data, const char *listKey) {
+  auto *filter = static_cast<SecureCastFilter *>(data);
+  if (!filter || !filter->context)
+    return false;
+  obs_data_t *settings = obs_source_get_settings(filter->context);
+  if (!settings)
+    return false;
+  const char *sel = obs_data_get_string(settings, "sc_app_picker");
+  if (!sel || !*sel) {
+    obs_data_release(settings);
+    return false;
+  }
+  obs_data_array_t *arr = obs_data_get_array(settings, listKey);
+  if (!arr)
+    arr = obs_data_array_create();
+  bool exists = false;
+  size_t n = obs_data_array_count(arr);
+  for (size_t i = 0; i < n; ++i) {
+    obs_data_t *item = obs_data_array_item(arr, i);
+    const char *val = obs_data_get_string(item, "value");
+    if (val && _stricmp(val, sel) == 0)
+      exists = true;
+    obs_data_release(item);
+    if (exists)
+      break;
+  }
+  if (!exists) {
+    obs_data_t *newItem = obs_data_create();
+    obs_data_set_string(newItem, "value", sel);
+    obs_data_array_push_back(arr, newItem);
+    obs_data_release(newItem);
+    obs_data_set_array(settings, listKey, arr);
+    obs_source_update(filter->context, settings);
+  }
+  obs_data_array_release(arr);
+  obs_data_release(settings);
+  return true;
+}
+
+static bool sc_add_to_normal_cb(obs_properties_t *, obs_property_t *,
+                                void *data) {
+  return add_picker_to_list(data, SC_SETTING_BLACKLIST);
+}
+static bool sc_add_to_game_cb(obs_properties_t *, obs_property_t *,
+                              void *data) {
+  return add_picker_to_list(data, SC_SETTING_BLACKLIST_GM);
+}
+
+#endif // _WIN32
+
+// 기본값으로 KakaoTalk/Discord/Slack 자동 추가 (사용자 설정 비어있을 때만).
+static obs_data_array_t *make_default_blacklist_array() {
+  obs_data_array_t *arr = obs_data_array_create();
+  static const char *const kDefaults[] = {"KakaoTalk.exe", "Discord.exe",
+                                          "Slack.exe"};
+  for (const char *exe : kDefaults) {
+    obs_data_t *item = obs_data_create();
+    obs_data_set_string(item, "value", exe);
+    obs_data_array_push_back(arr, item);
+    obs_data_release(item);
+  }
+  return arr;
+}
+
+static void securecast_get_defaults(obs_data_t *settings) {
+  obs_data_array_t *defNormal = make_default_blacklist_array();
+  obs_data_set_default_array(settings, SC_SETTING_BLACKLIST, defNormal);
+  obs_data_array_release(defNormal);
+  obs_data_array_t *defGame = make_default_blacklist_array();
+  obs_data_set_default_array(settings, SC_SETTING_BLACKLIST_GM, defGame);
+  obs_data_array_release(defGame);
+  obs_data_set_default_bool(settings, SC_SETTING_GM_ASK_BL, false);
+
+  obs_data_array_t *emptyRectArr = obs_data_array_create();
+  obs_data_set_default_array(settings, SC_SETTING_MANUAL_RECTS, emptyRectArr);
+  obs_data_array_release(emptyRectArr);
 }
 
 static obs_properties_t *securecast_get_properties(void *data) {
   obs_properties_t *props = obs_properties_create();
-  obs_properties_add_text(props, SC_SETTING_BLACKLIST,
-                          "Blacklist Apps (one per line)", OBS_TEXT_MULTILINE);
 
 #ifdef _WIN32
-  // [Role D] 수동 드래그 블러 초기화 버튼
+  // 1) 공유 앱 picker — 시스템 설치 앱 + 실행 중 앱 (친화명 + exe).
+  obs_property_t *picker = obs_properties_add_list(
+      props, "sc_app_picker", "앱 선택", OBS_COMBO_TYPE_LIST,
+      OBS_COMBO_FORMAT_STRING);
+  populate_app_picker(picker);
+
+  // 2) 일반 모드 그룹 (Add 버튼 + editable_list)
+  obs_properties_t *normalGrp = obs_properties_create();
+  obs_properties_set_param(normalGrp, data, nullptr);
+  obs_properties_add_button(normalGrp, "sc_add_normal_btn",
+                            "선택한 앱 추가", sc_add_to_normal_cb);
+  obs_properties_add_editable_list(normalGrp, SC_SETTING_BLACKLIST,
+                                   "일반 모드 블랙리스트 (게임모드 OFF에서만)",
+                                   OBS_EDITABLE_LIST_TYPE_STRINGS, nullptr,
+                                   nullptr);
+  obs_properties_add_group(props, "sc_normal_section", "일반 모드 차단 앱",
+                           OBS_GROUP_NORMAL, normalGrp);
+
+  // 3) 게임 모드 그룹 (Add 버튼 + editable_list)
+  obs_properties_t *gameGrp = obs_properties_create();
+  obs_properties_set_param(gameGrp, data, nullptr);
+  obs_properties_add_button(gameGrp, "sc_add_game_btn",
+                            "선택한 앱 추가", sc_add_to_game_cb);
+  obs_properties_add_editable_list(
+      gameGrp, SC_SETTING_BLACKLIST_GM,
+      "게임 모드 블랙리스트 (게임모드 ON에서 추가 적용)",
+      OBS_EDITABLE_LIST_TYPE_STRINGS, nullptr, nullptr);
+  obs_properties_add_group(props, "sc_game_section", "게임 모드 차단 앱",
+                           OBS_GROUP_NORMAL, gameGrp);
+
+  // 4) 게임 모드 dialog 옵션
+  obs_property_t *askProp = obs_properties_add_bool(
+      props, SC_SETTING_GM_ASK_BL,
+      "게임 블랙리스트 앱도 노출 전 확인 창 띄우기");
+  obs_property_set_long_description(
+      askProp,
+      "게임 모드 중에 '게임 모드 블랙리스트'에 등록한 앱이 화면에 뜨면, "
+      "송출할지 매번 확인 창으로 물어봅니다. 꺼두면 자동으로 가립니다.\n"
+      "(일반 모드 블랙리스트 앱은 토글과 무관하게 항상 자동으로 가립니다.)");
+
+  // 5) 수동 드래그 블러 초기화 버튼
   obs_properties_add_button(
       props, "sc_clear_manual", "Clear Manual Blurs",
       [](obs_properties_t *, obs_property_t *, void *btn_data) -> bool {
@@ -2986,7 +3334,6 @@ static obs_properties_t *securecast_get_properties(void *data) {
              "[SecureCast][D] Manual blur rects cleared (Properties button).");
         return true;
       });
-  (void)data;
 #else
   (void)data;
 #endif
@@ -2996,10 +3343,103 @@ static obs_properties_t *securecast_get_properties(void *data) {
 
 // GUI 스레드에서 호출되므로 settingsMutex로 보호 (Render Thread와 data race
 // 방지)
+// editable_list FILES 항목의 path에서 basename(.exe)만 추출. OBS는 self-exclude.
+// 경로면 마지막 \ 뒤를, 이미 exe면 그대로.
+static std::wstring path_to_exe_basename(const std::wstring &path) {
+  size_t lastSep = path.find_last_of(L"\\/");
+  std::wstring base = (lastSep == std::wstring::npos) ? path
+                                                       : path.substr(lastSep + 1);
+  // trim leading/trailing whitespace
+  while (!base.empty() && (base.front() == L' ' || base.front() == L'\t'))
+    base.erase(base.begin());
+  while (!base.empty() && (base.back() == L' ' || base.back() == L'\t'))
+    base.pop_back();
+  return base;
+}
+
+// editable_list (obs_data_array_t) → wstring 배열. 각 item의 "value" 키에 path.
+// OBS 자체는 자동 제외 (사용자가 실수로 추가해도 적용 안 함).
+static std::vector<std::wstring>
+parse_blacklist_array(obs_data_array_t *arr) {
+  std::vector<std::wstring> result;
+  if (!arr)
+    return result;
+  static const wchar_t *const kObsExclude[] = {
+      L"obs64.exe", L"obs32.exe", L"obs.exe", L"obs-studio.exe",
+  };
+  size_t count = obs_data_array_count(arr);
+  for (size_t i = 0; i < count; ++i) {
+    obs_data_t *item = obs_data_array_item(arr, i);
+    if (!item)
+      continue;
+    const char *valUtf8 = obs_data_get_string(item, "value");
+    if (valUtf8 && valUtf8[0]) {
+      int wlen = MultiByteToWideChar(CP_UTF8, 0, valUtf8, -1, nullptr, 0);
+      if (wlen > 1) {
+        std::wstring wide(wlen - 1, L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, valUtf8, -1, wide.data(), wlen);
+        std::wstring base = path_to_exe_basename(wide);
+        if (!base.empty()) {
+          // OBS 자체 제외
+          bool isObs = false;
+          for (const wchar_t *e : kObsExclude) {
+            if (_wcsicmp(base.c_str(), e) == 0) {
+              isObs = true;
+              break;
+            }
+          }
+          if (!isObs)
+            result.push_back(std::move(base));
+        }
+      }
+    }
+    obs_data_release(item);
+  }
+  return result;
+}
+
+static void apply_user_blacklists(obs_data_array_t *normalArr,
+                                  obs_data_array_t *gmArr) {
+  auto normal = parse_blacklist_array(normalArr);
+  auto gm = parse_blacklist_array(gmArr);
+
+  std::vector<const wchar_t *> normalPtrs;
+  normalPtrs.reserve(normal.size());
+  for (const auto &s : normal)
+    normalPtrs.push_back(s.c_str());
+  std::vector<const wchar_t *> gmPtrs;
+  gmPtrs.reserve(gm.size());
+  for (const auto &s : gm)
+    gmPtrs.push_back(s.c_str());
+
+  sc_set_user_blacklist_normal(normalPtrs.empty() ? nullptr : normalPtrs.data(),
+                                (int)normalPtrs.size());
+  sc_set_user_blacklist_game_mode(gmPtrs.empty() ? nullptr : gmPtrs.data(),
+                                   (int)gmPtrs.size());
+  blog(LOG_INFO,
+       "[SecureCast] User blacklist updated: %zu normal + %zu game-mode "
+       "(OBS auto-excluded)",
+       normal.size(), gm.size());
+}
+
 static void securecast_update(void *data, obs_data_t *settings) {
   SecureCastFilter *filter = static_cast<SecureCastFilter *>(data);
   std::lock_guard<std::mutex> lock(filter->settingsMutex);
-  filter->blacklistApps = obs_data_get_string(settings, SC_SETTING_BLACKLIST);
+  filter->gameModeAskForBlacklist.store(
+      obs_data_get_bool(settings, SC_SETTING_GM_ASK_BL),
+      std::memory_order_release);
+
+  // 동적 블랙리스트(일반 + 게임 모드) 글로벌에 반영. editable_list는
+  // obs_data_array_t로 직렬화됨 — 각 item의 "value"에 파일 path.
+  obs_data_array_t *normalArr =
+      obs_data_get_array(settings, SC_SETTING_BLACKLIST);
+  obs_data_array_t *gmArr =
+      obs_data_get_array(settings, SC_SETTING_BLACKLIST_GM);
+  apply_user_blacklists(normalArr, gmArr);
+  if (normalArr)
+    obs_data_array_release(normalArr);
+  if (gmArr)
+    obs_data_array_release(gmArr);
   blog(LOG_INFO, "[SecureCast][D] Settings updated.");
 
   // 수동 블러 rect 역직렬화
