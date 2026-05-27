@@ -19,6 +19,7 @@
 #define NOMINMAX
 #include <windows.h>
 #include <dwmapi.h>
+#include "window_tracker.h" // sc_compute_visible_subrects (z-order 차감)
 #include "scroll_motion_hook.h" // 글로벌 휠/키 hook 시각 query
 #endif
 
@@ -1250,6 +1251,10 @@ std::vector<void *> VisualTrackerManager::active_owner_windows() const {
 //   ★ 이 경로로 좌표가 잡히면 NCC ghost-kill 게이트를 우회한다. 빠른 드래그 시
 //     NCC가 따라가지 못해 framesSinceMatch가 증가하더라도 owner 창의 위치가 곧
 //     진실이므로 블러를 절대 풀지 않는다 (사용자 보고: 이동 시 블러 해제 문제).
+//   ★ 추가로 sc_compute_visible_subrects로 z-order 차감 — owner 위를 덮은 창
+//     영역에는 블러를 표시하지 않는다. 메모장이 Chrome 위를 덮을 때 메모장 위에
+//     블러가 떠 PII가 그 창에 있다고 오해하던 문제 차단. 0개 가시 영역이면 트래커
+//     자체를 송출에서 제외 (완전히 가려진 상태).
 // owner 없거나 anchor 실패: NCC tr.x/tr.y + ghost-kill 게이트 (스크롤·텍스트 소멸 케이스).
 std::vector<VtOcrBox>
 VisualTrackerManager::snapshot_for_push(uint32_t src_w, uint32_t src_h) const {
@@ -1258,6 +1263,7 @@ VisualTrackerManager::snapshot_for_push(uint32_t src_w, uint32_t src_h) const {
   result.reserve(trackers_.size());
 
   int ghostHidden = 0;
+  int occludedHidden = 0;
   for (const auto &tr : trackers_) {
     float outX = tr.x;
     float outY = tr.y;
@@ -1294,6 +1300,40 @@ VisualTrackerManager::snapshot_for_push(uint32_t src_w, uint32_t src_h) const {
               if (outY + tr.bh > static_cast<float>(src_h))
                 outY = static_cast<float>(src_h) - tr.bh;
               ownerAnchored = true;
+
+              // [z-order 차감] outX/outY/tr.bw/tr.bh를 monitor 좌표로 환산해
+              // owner 위에 덮인 다른 창들을 sc_compute_visible_subrects가 빼고
+              // 실제 노출된 disjoint 사각형들을 돌려준다. 각 서브렉트마다 별도
+              // VtOcrBox로 푸시. 사용자가 ghost-kill 우회 정책상 anchor 트래커는
+              // 항상 출력했지만, 그 출력이 잘못된 창 위에 뜨던 결함을 보정.
+              RECT boxScreen;
+              boxScreen.left = mi.rcMonitor.left +
+                               static_cast<LONG>(outX / sx);
+              boxScreen.top = mi.rcMonitor.top +
+                              static_cast<LONG>(outY / sy);
+              boxScreen.right = mi.rcMonitor.left +
+                                static_cast<LONG>((outX + tr.bw) / sx);
+              boxScreen.bottom = mi.rcMonitor.top +
+                                 static_cast<LONG>((outY + tr.bh) / sy);
+
+              RECT visRects[SC_MAX_VISIBLE_SUBRECTS];
+              const int visCount = sc_compute_visible_subrects(
+                  target, boxScreen, visRects, SC_MAX_VISIBLE_SUBRECTS);
+
+              if (visCount == 0) {
+                ++occludedHidden;
+                continue; // 완전 occlusion — 송출 제외
+              }
+
+              for (int v = 0; v < visCount; ++v) {
+                const RECT &vr = visRects[v];
+                const float vx = (vr.left - mi.rcMonitor.left) * sx;
+                const float vy = (vr.top - mi.rcMonitor.top) * sy;
+                const float vw = (vr.right - vr.left) * sx;
+                const float vh = (vr.bottom - vr.top) * sy;
+                result.push_back({tr.type, vx, vy, vw, vh});
+              }
+              continue; // anchor + z-order 처리 완료, 아래 일반 push 우회
             }
           }
         }
@@ -1316,6 +1356,16 @@ VisualTrackerManager::snapshot_for_push(uint32_t src_w, uint32_t src_h) const {
     }
 
     result.push_back({tr.type, outX, outY, tr.bw, tr.bh});
+  }
+
+  if (occludedHidden > 0) {
+    static int s_occluded_throttle = 0;
+    if (++s_occluded_throttle >= 60) {
+      s_occluded_throttle = 0;
+      blog(LOG_DEBUG,
+           "[SecureCast][zorder-push] %d tracker(s) fully occluded — hidden",
+           occludedHidden);
+    }
   }
 
   if (ghostHidden > 0) {
