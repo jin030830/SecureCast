@@ -44,9 +44,13 @@ void WinEventListener::run()
 {
     m_threadId = GetCurrentThreadId();
 
-    // 그룹 1: 등장/사라짐/소멸 (드물게 발생, 모든 윈도우 대상)
+    // 그룹 1: 생성/소멸/표시/숨김/재정렬 (모든 윈도우 대상).
+    // 주의: SetWinEventHook은 [eventMin, eventMax] 폐구간이며 eventMin > eventMax 면
+    // 어떤 이벤트도 받지 못한다. 기존 (SHOW=0x8002, DESTROY=0x8001) 범위는
+    // min>max 라 그룹 1 훅이 사실상 무효였다. CREATE(0x8000)~REORDER(0x8004)로
+    // 정상화하면 SHOW/HIDE/DESTROY 전부 커버.
     m_hookGroup1 = SetWinEventHook(
-        EVENT_OBJECT_SHOW, EVENT_OBJECT_DESTROY,
+        EVENT_OBJECT_CREATE, EVENT_OBJECT_REORDER,
         nullptr, eventProc, 0, 0,
         WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
 
