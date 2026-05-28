@@ -22,6 +22,14 @@
 #include "plugin-support.h" // obs_log
 #ifdef _WIN32
 #include "window_tracker.h" // sc_tracker_tick (Role A: 블랙리스트 앱 좌표 수집)
+// [T08/T09] 자동 검색 enum source들. 같은 시그니처(vector<GameInfo>).
+#include "game_sources/steam.h"
+#include "game_sources/epic.h"
+#include "game_sources/battlenet.h"
+#include "game_sources/riot.h"
+#include "game_sources/uwp.h"
+#include "game_sources/gamebar.h"
+#include "game_sources/installed_programs.h"
 #include <dwmapi.h>           // DwmGetWindowAttribute (Role D: 알림 토스트 탐지)
 #include <obs-frontend-api.h> // obs_hotkey_register_frontend
 #endif
@@ -99,26 +107,22 @@ static constexpr float SCAN_INTERVAL_FORCE = 1.0f;
 static constexpr float SCAN_INTERVAL_NORMAL = 0.15f; // 일반 모드 스캔 주기
 static constexpr float SCAN_INTERVAL_GAME = 0.5f;    // 게임 모드 스캔 주기
 
-// Game mode thresholds
-static constexpr float GM_CPU_ENTER = 40.0f; // 진입 임계값 (%)
-static constexpr float GM_CPU_EXIT = 30.0f;  // 해제 임계값 (%)
-static constexpr float GM_ENTER_TIME = 3.0f; // 진입까지 ≥40% 유지 시간 (초)
-static constexpr float GM_EXIT_TIME = 5.0f;  // 해제까지 ≤30%  유지 시간 (초)
+// Game mode CPU sampling cadence — 사용자 노출 안 함 (UI 슬라이더 외).
+// 진입/해제 임계값/지속 시간은 SecureCastFilter::gameModeCpuThreshold/
+// gameModeEnterSeconds/gameModeExitSeconds로 옮겨감 (T07).
 static constexpr float GM_SAMPLE_INTERVAL = 1.0f; // CPU 샘플링 주기 (초)
 
 #ifdef _WIN32
-// [Game mode 전역 상태] 여러 필터 인스턴스(여러 OBS 소스에 같은 필터 부착)
-// 사이에서 dialog가 중복으로 뜨지 않도록 공유. game mode session 동안 한 exe
-// 당 한 번만 dialog. whitelist도 공유 — 사용자가 한 번 허용한 exe는 모든
-// 필터에서 블러 해제.
+// [Game mode v2 — T02] dialog 폐기 → 여러 필터 인스턴스 사이에서 공유해야 할
+// 상태는 화이트리스트뿐. (T15에서 OBS 설정 파일 기반 영구 저장으로 교체 예정.)
 static std::mutex g_gmGlobalMutex;
-static std::unordered_set<std::wstring> g_gmDialogPromptedExes;
 static std::unordered_set<std::wstring> g_gmWhitelist;
-static std::atomic<bool> g_gmAnyActive{false}; // 어느 필터든 게임 모드면 true
 
-// SecureCast/OBS 자기 자신 등 절대 블러/dialog 대상 아닌 exe 목록.
-// OBS는 스트리밍 도구라 화면에 보여도 안전. dialog 자체도 OBS 프로세스에서
-// MessageBoxW로 떠 foreground 잠시 잡으므로 self-fg loop 방지에도 필요.
+// [T08] 자동 검색 동시 실행 방지. 사용자가 버튼을 연타해도 한 번에 enum 1회.
+static std::atomic<bool> g_autodetect_running{false};
+
+// SecureCast/OBS 자기 자신 등 절대 블러 대상이 아닌 exe 목록.
+// OBS는 스트리밍 도구라 화면에 보여도 안전 — game mode 자동 블러에서 제외.
 static bool is_gm_excluded_exe(const std::wstring &exe) {
   static const wchar_t *const kExcluded[] = {
       L"obs64.exe", L"obs32.exe", L"obs.exe",
@@ -129,6 +133,37 @@ static bool is_gm_excluded_exe(const std::wstring &exe) {
       return true;
   }
   return false;
+}
+
+// [T13] 자동 블러된 fg를 ring buffer에 기록. 같은 exe가 다시 가려지면
+// 기존 entry 제거 후 새 entry를 front에 push (LRU). 크기 cap 초과 시 oldest pop.
+// 호출은 render 스레드 — recentBlurredMutex로 GUI 스레드 read와 직렬화.
+static void record_recent_blurred(SecureCastFilter *filter,
+                                  const std::wstring &exe, HWND fg) {
+  wchar_t title[256] = {};
+  if (fg)
+    GetWindowTextW(fg, title, 256);
+
+  SecureCastFilter::RecentBlurredApp app;
+  app.exe = exe;
+  app.window_title = title;
+  app.timestamp_ms = GetTickCount64();
+
+  std::lock_guard<std::mutex> lock(filter->recentBlurredMutex);
+  // dedup — 같은 exe entry 있으면 제거.
+  for (auto it = filter->recentBlurredApps.begin();
+       it != filter->recentBlurredApps.end();) {
+    if (_wcsicmp(it->exe.c_str(), exe.c_str()) == 0) {
+      it = filter->recentBlurredApps.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  filter->recentBlurredApps.push_front(std::move(app));
+  while (filter->recentBlurredApps.size() >
+         SecureCastFilter::kMaxRecentBlurred) {
+    filter->recentBlurredApps.pop_back();
+  }
 }
 #endif
 
@@ -1136,6 +1171,18 @@ static void ocr_worker_loop(SecureCastFilter *filter) {
       continue;
     }
 
+#ifdef _WIN32
+    // [Game mode v2 — T01] 어떤 필터든 게임 모드면 OCR 무거운 작업 전부 skip.
+    // CPU ~10% 절감 목표. ocrClearCachePending은 위에서 이미 처리되었고,
+    // ocrReady/empty-pixel 가드도 통과한 상태이므로 여기서 idle 복원 후 다음
+    // 프레임 대기. 게임 모드 중에도 submit은 render thread가 계속 들어올 수
+    // 있으나(이후 stage에서 차단 예정), 워커는 일관되게 인식 작업을 건너뛴다.
+    if (sc_any_filter_in_game_mode()) {
+      filter->ocrWorkerIdle.store(true, std::memory_order_release);
+      continue;
+    }
+#endif
+
     // 2-C: 적응형 스케일 — 직전 사이클 평균 라인 높이를 14~20px 대역으로 맞춤.
     // ★ 다운스케일 비활성화: 표 케이스에서 큰 헤더 + 작은 데이터가 섞이면
     //   avgLineH가 중간값(28px)이라 0.57× 다운스케일 적용 → 작은 데이터 행이
@@ -1629,6 +1676,36 @@ static void *securecast_create(obs_data_t *settings, obs_source_t *context) {
     obs_data_release(combo);
     blog(LOG_INFO, "[SecureCast] Select hotkey registered (Ctrl+Shift+B).");
   }
+
+  // [T12] 블랙리스트/화이트리스트 UI 핫키 (Ctrl+Shift+L 기본).
+  // 게임 모드 중 사용자가 빠르게 차단/허용 앱 편집할 수 있게 OBS 필터
+  // Properties 다이얼로그를 즉시 띄운다.
+  filter->blacklistUiHotkeyId = obs_hotkey_register_frontend(
+      "securecast_open_blacklist_ui",
+      "SecureCast — 블랙리스트/화이트리스트 UI 열기",
+      [](void *data, obs_hotkey_id, obs_hotkey_t *, bool pressed) {
+        if (!pressed)
+          return;
+        auto *f = static_cast<SecureCastFilter *>(data);
+        if (f->isDestroying.load(std::memory_order_acquire))
+          return;
+        obs_frontend_open_source_properties(f->context);
+      },
+      filter);
+  if (filter->blacklistUiHotkeyId != OBS_INVALID_HOTKEY_ID) {
+    obs_data_t *combo = obs_data_create();
+    obs_data_array_t *arr = obs_data_array_create();
+    obs_data_set_bool(combo, "control", true);
+    obs_data_set_bool(combo, "shift", true);
+    obs_data_set_bool(combo, "alt", false);
+    obs_data_set_string(combo, "key", "OBS_KEY_L");
+    obs_data_array_push_back(arr, combo);
+    obs_hotkey_load(filter->blacklistUiHotkeyId, arr);
+    obs_data_array_release(arr);
+    obs_data_release(combo);
+    blog(LOG_INFO,
+         "[SecureCast] Blacklist UI hotkey registered (Ctrl+Shift+L).");
+  }
 #endif
 
   // HLSL 셰이더 컴파일 (그래픽스 컨텍스트 필요)
@@ -1673,6 +1750,16 @@ static void securecast_destroy(void *data) {
   // 진행 중인 핫키 콜백이 filter 멤버에 접근하지 못하도록 즉시 플래그 설정
   filter->isDestroying.store(true, std::memory_order_release);
 
+#ifdef _WIN32
+  // [Game mode v2 — T01] 게임 모드 활성 상태인 채로 필터가 파괴되면 글로벌
+  // refcount가 정리되지 않아 다른 필터의 OCR이 영구히 skip 될 수 있다.
+  // exchange로 진입→탈출이 정확히 1:1이 되도록 보장(중복 호출 시 underflow
+  // 가드는 sc_set_global_game_mode 내부에서 처리).
+  if (filter->isGameMode.exchange(false, std::memory_order_acq_rel)) {
+    sc_set_global_game_mode(false);
+  }
+#endif
+
   // 핫키 먼저 해제 — 콜백이 해제된 filter에 접근하지 못하도록
   if (filter->panicHotkeyId != OBS_INVALID_HOTKEY_ID) {
     obs_hotkey_unregister(filter->panicHotkeyId);
@@ -1682,6 +1769,11 @@ static void securecast_destroy(void *data) {
   if (filter->selectHotkeyId != OBS_INVALID_HOTKEY_ID) {
     obs_hotkey_unregister(filter->selectHotkeyId);
     filter->selectHotkeyId = OBS_INVALID_HOTKEY_ID;
+  }
+  // [T12] 블랙리스트 UI 핫키 해제 — 콜백이 freed filter에 접근 못 하도록.
+  if (filter->blacklistUiHotkeyId != OBS_INVALID_HOTKEY_ID) {
+    obs_hotkey_unregister(filter->blacklistUiHotkeyId);
+    filter->blacklistUiHotkeyId = OBS_INVALID_HOTKEY_ID;
   }
   filter->selectionOverlay.cancel();
   filter->selectionOverlay.wait_and_join();
@@ -2193,8 +2285,9 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
   }
 #ifdef _WIN32
   // [Role D] 오버레이 HUD에 상태 동기화 (PostMessage → thread-safe,
-  // non-blocking)
-  filter->overlay.setState(newState);
+  // non-blocking). [T11] 게임 모드 활성 여부도 함께 전달 → 보라색 "GAME" 배지.
+  filter->overlay.setState(
+      newState, filter->isGameMode.load(std::memory_order_acquire));
 #endif
 
   // --- Step 4~5: N프레임 지연된 슬롯 꺼내기 ---
@@ -2749,7 +2842,39 @@ static void securecast_video_tick(void *data, float seconds) {
   }
 
 #ifdef _WIN32
-  // ── CPU 샘플링 & 게임 모드 상태머신 (1초 주기) ──────────────────────
+  // [T07] 사용자 설정값을 스냅샷으로 1회 읽음 — video_tick 안에서 securecast_update
+  // (GUI 스레드)가 동시에 쓰더라도 정렬된 int/bool은 단일 read 원자성. 슬라이더
+  // 값이 한 tick 내에서 일관되게 유지된다.
+  const bool gmAutoEnter = filter->gameModeAutoEnter;
+  const float gmCpuEnter = static_cast<float>(filter->gameModeCpuThreshold);
+  const float gmCpuExit = std::max(5.0f, gmCpuEnter - 10.0f);
+  const float gmEnterTime = static_cast<float>(filter->gameModeEnterSeconds);
+  const float gmExitTime = static_cast<float>(filter->gameModeExitSeconds);
+
+  // ── [T05] Primary trigger: 매 tick, fg가 known game이면 즉시 게임 모드 ON ─
+  // CPU 샘플링(1초 주기)을 기다리지 않는다 — 사용자가 게임을 띄우는 순간 바로
+  // OCR 정지 + 자동 블러 모드로 전환. 이미 게임 모드면 early-exit, 그래서
+  // 게임 진행 중에는 sc_get_hwnd_exe_name 비용을 추가로 지불하지 않는다.
+  // [T07] gameModeAutoEnter=false면 전체 자동 진입 비활성.
+  if (gmAutoEnter && !filter->isGameMode.load(std::memory_order_acquire)) {
+    HWND fg = GetForegroundWindow();
+    wchar_t fgExe[64] = {};
+    if (fg && sc_get_hwnd_exe_name(fg, fgExe, 64) &&
+        sc_is_known_game_or_user_game(fgExe)) {
+      filter->isGameMode.store(true, std::memory_order_release);
+      filter->gameModeEntryTimer = 0.0f;
+      filter->gameModeExitTimer = 0.0f;
+      {
+        std::lock_guard<std::mutex> lock(filter->gameModeMutex);
+        filter->gameModeGameExe = fgExe;
+      }
+      sc_set_global_game_mode(true);
+      blog(LOG_INFO,
+           "[SecureCast] Game mode ON (trigger=primary, game='%ls')", fgExe);
+    }
+  }
+
+  // ── CPU 샘플링 & Secondary trigger (1초 주기) ──────────────────────
   filter->cpuSampleAccumulator += seconds;
   if (filter->cpuSampleAccumulator >= GM_SAMPLE_INTERVAL) {
     filter->cpuSampleAccumulator = 0.0f;
@@ -2757,70 +2882,73 @@ static void securecast_video_tick(void *data, float seconds) {
         &filter->prevIdleTime, &filter->prevKernelTime, &filter->prevUserTime);
 
     if (!filter->isGameMode.load(std::memory_order_acquire)) {
-      if (filter->cpuUsage >= GM_CPU_ENTER) {
+      // [T07] 자동 진입 OFF면 Secondary도 비활성. 타이머만 reset.
+      if (!gmAutoEnter) {
+        filter->gameModeEntryTimer = 0.0f;
+      } else if (filter->cpuUsage >= gmCpuEnter) {
         filter->gameModeEntryTimer += GM_SAMPLE_INTERVAL;
-        if (filter->gameModeEntryTimer >= GM_ENTER_TIME) {
+        if (filter->gameModeEntryTimer >= gmEnterTime) {
+          // [T05] Secondary trigger: CPU ≥ 40% × 3초 지속 — 게임은 보통 첫
+          // 1초 만에 known list로 잡히지만 신작/마이너 게임은 그렇지 않다.
+          // 이 fallback이 OCR 정지/일반 블랙리스트 보호는 켜주되, fg 자동
+          // 가림은 known game 확인된 경우에만 활성한다 (회귀 방지).
           filter->isGameMode.store(true, std::memory_order_release);
           filter->gameModeEntryTimer = 0.0f;
           filter->gameModeExitTimer = 0.0f;
-          // 어느 필터든 게임 모드면 글로벌 flag set → is_blacklisted가
-          // game-mode-extra (Chrome/Notepad 등)도 자동 적용.
-          sc_set_global_game_mode(true);
-          // [Game mode 진입] 현재 foreground = "the game"으로 캡처.
-          // 이 exe는 게임 모드 동안 블러 안 함 (게임 자체). Chrome 등이
-          // 떠 있는 상태에서 게임모드가 켜지면 그게 게임으로 잘못 잡힐 수 있어
-          // 캡처된 exe를 로그로 명시.
-          wchar_t gameExe[64] = {};
+
+          wchar_t fgExe[64] = {};
           HWND fg = GetForegroundWindow();
-          if (fg && sc_get_hwnd_exe_name(fg, gameExe, 64)) {
-            // 제외 리스트 exe (OBS 등)가 fg면 게임 캡처하지 말기 — 게임 모드는
-            // 켜지지만 "the game" 없음 → 모든 다른 fg에 dialog 떠야 함.
-            if (is_gm_excluded_exe(std::wstring(gameExe))) {
-              std::lock_guard<std::mutex> lock(filter->gameModeMutex);
-              filter->gameModeGameExe.clear();
-              blog(LOG_INFO,
-                   "[SecureCast] Game mode ON (CPU: %.0f%%) — fg '%ls' is "
-                   "excluded, no game captured",
-                   filter->cpuUsage, gameExe);
-            } else {
-              std::lock_guard<std::mutex> lock(filter->gameModeMutex);
-              filter->gameModeGameExe = gameExe;
-              blog(LOG_INFO,
-                   "[SecureCast] Game mode ON (CPU: %.0f%%) — game exe='%ls'",
-                   filter->cpuUsage, gameExe);
-            }
-          } else {
+          const bool fgValid = fg && sc_get_hwnd_exe_name(fg, fgExe, 64);
+          const bool fgIsKnownGame =
+              fgValid && sc_is_known_game_or_user_game(fgExe);
+
+          {
             std::lock_guard<std::mutex> lock(filter->gameModeMutex);
-            filter->gameModeGameExe.clear();
-            blog(LOG_INFO,
-                 "[SecureCast] Game mode ON (CPU: %.0f%%) — no fg captured",
-                 filter->cpuUsage);
+            if (fgIsKnownGame) {
+              filter->gameModeGameExe = fgExe;
+            } else {
+              // 안전 분기: fg가 known game이 아니면 gameModeGameExe 비움 →
+              // render-side empty 가드(T02-2)가 fg 자동 가림을 자동으로
+              // 비활성한다. 사용자가 alt+tab으로 진짜 게임에 들어가도
+              // 게임 자체가 가려지지 않는다.
+              filter->gameModeGameExe.clear();
+            }
           }
-          filter->gameModeLastFg.store(fg, std::memory_order_release);
+          sc_set_global_game_mode(true);
+
+          if (fgIsKnownGame) {
+            blog(LOG_INFO,
+                 "[SecureCast] Game mode ON (trigger=secondary CPU=%.0f%%, "
+                 "game='%ls')",
+                 filter->cpuUsage, fgExe);
+          } else {
+            blog(LOG_WARNING,
+                 "[SecureCast] Game mode ON (trigger=secondary CPU=%.0f%%) "
+                 "but fg '%ls' is not in game list — fg auto-blur disabled "
+                 "for safety",
+                 filter->cpuUsage, fgValid ? fgExe : L"<unknown>");
+          }
         }
       } else {
         filter->gameModeEntryTimer = 0.0f;
       }
     } else {
-      if (filter->cpuUsage <= GM_CPU_EXIT) {
+      if (filter->cpuUsage <= gmCpuExit) {
         filter->gameModeExitTimer += GM_SAMPLE_INTERVAL;
-        if (filter->gameModeExitTimer >= GM_EXIT_TIME) {
+        if (filter->gameModeExitTimer >= gmExitTime) {
           filter->isGameMode.store(false, std::memory_order_release);
           filter->gameModeExitTimer = 0.0f;
-          // 글로벌 flag clear → game-mode-extra 적용 중지.
-          // (TODO: 여러 필터 인스턴스면 모두 false일 때만 clear해야 정확.
-          //  현재는 마지막 게임 모드 탈출 필터가 clear 무방.)
+          // 글로벌 flag clear (refcount 감소 — T01) → 마지막 필터가 OFF면
+          // game-mode-extra 적용 중지.
           sc_set_global_game_mode(false);
-          // [Game mode 탈출] 게임 exe 초기화. whitelist/prompted는 글로벌이므로
-          // 다음 게임 모드 세션까지 유지 — OBS 실행 동안 같은 앱 재질문 안 함.
+          // [Game mode 탈출] 게임 exe 초기화. whitelist는 다음 세션까지 유지.
           {
             std::lock_guard<std::mutex> lock(filter->gameModeMutex);
             filter->gameModeGameExe.clear();
           }
-          filter->gameModeLastFg.store(nullptr, std::memory_order_release);
           blog(LOG_INFO,
-               "[SecureCast] Game mode OFF (CPU: %.0f%%, 5s cooldown)",
-               filter->cpuUsage);
+               "[SecureCast] Game mode OFF (CPU: %.0f%%, hysteresis=%.0fs)",
+               filter->cpuUsage, gmExitTime);
         }
       } else {
         filter->gameModeExitTimer = 0.0f;
@@ -2828,111 +2956,9 @@ static void securecast_video_tick(void *data, float seconds) {
     }
   }
 
-#ifdef _WIN32
-  // [Game mode foreground 변화 감지]
-  // 게임 모드 동안 사용자가 다른 앱을 켜면 (foreground 변화) → 그 앱이
-  // 게임/화이트리스트 외라면 dialog로 허용 여부 확인. 응답 받기 전까지
-  // 자동 블러는 mask building 단계에서 처리.
-  if (filter->isGameMode.load(std::memory_order_acquire)) {
-    HWND curFg = GetForegroundWindow();
-    HWND prevFg = static_cast<HWND>(
-        filter->gameModeLastFg.load(std::memory_order_acquire));
-    if (curFg && curFg != prevFg) {
-      filter->gameModeLastFg.store(curFg, std::memory_order_release);
-      wchar_t fgExe[64] = {};
-      if (sc_get_hwnd_exe_name(curFg, fgExe, 64)) {
-        std::wstring fgExeStr(fgExe);
-        // 디버그: 모든 fg 변화 로그 (어떤 exe가 잡히고 어떤 게 안 잡히는지 확인).
-        blog(LOG_INFO, "[SecureCast][GM-fg] fg changed to '%ls'", fgExe);
-
-        // SecureCast/OBS 자기 자신 같은 제외 리스트 → 절대 dialog/블러 X.
-        if (is_gm_excluded_exe(fgExeStr)) {
-          blog(LOG_INFO, "[SecureCast][GM] '%ls' is excluded — skipping",
-               fgExe);
-        } else {
-          // 게임 자체나 이미 처리된 exe는 skip. whitelist/prompted는 GLOBAL
-          // 사용 — 여러 필터 인스턴스 사이 중복 dialog 방지.
-          bool isGame = false, alreadyPrompted = false, inWhitelist = false;
-          {
-            std::lock_guard<std::mutex> lock(filter->gameModeMutex);
-            isGame = (fgExeStr == filter->gameModeGameExe);
-          }
-          {
-            std::lock_guard<std::mutex> glock(g_gmGlobalMutex);
-            inWhitelist = g_gmWhitelist.count(fgExeStr) > 0;
-            alreadyPrompted = g_gmDialogPromptedExes.count(fgExeStr) > 0;
-          }
-          if (!isGame && !inWhitelist && !alreadyPrompted) {
-          // 분기:
-          //  - 일반 블랙리스트 exe → 항상 silent blur (토글 무관, 사용자가
-          //    '일반 모드에서도 차단'이라 명시한 거)
-          //  - 게임 블랙리스트 exe → 토글 OFF면 silent, ON이면 dialog
-          //  - 둘 다 아닌 exe → 항상 dialog
-          const bool isOnNormalBl = sc_is_blacklisted_exe_normal_only(fgExe);
-          const bool isOnAnyBl = sc_is_blacklisted_exe_game_mode(fgExe);
-          const bool isOnGameOnlyBl = isOnAnyBl && !isOnNormalBl;
-          const bool askForBl =
-              filter->gameModeAskForBlacklist.load(std::memory_order_acquire);
-          if (isOnNormalBl) {
-            blog(LOG_INFO,
-                 "[SecureCast][GM] normal blacklist exe '%ls' — silent blur",
-                 fgExe);
-          } else if (isOnGameOnlyBl && !askForBl) {
-            blog(LOG_INFO,
-                 "[SecureCast][GM] game blacklist exe '%ls' — silent blur "
-                 "(toggle off)",
-                 fgExe);
-          } else {
-            // dialog 띄움. 중복 방지로 prompted set에 미리 추가 (한 앱 한 번만).
-            // GLOBAL set 사용 — 다른 필터 인스턴스에서도 같은 exe는 skip.
-            {
-              std::lock_guard<std::mutex> glock(g_gmGlobalMutex);
-              g_gmDialogPromptedExes.insert(fgExeStr);
-            }
-            wchar_t fgTitle[256] = {};
-            GetWindowTextW(curFg, fgTitle, 256);
-            std::wstring titleStr = fgTitle[0] ? fgTitle : L"(제목 없음)";
-            blog(LOG_INFO,
-                 "[SecureCast][GM] new fg '%ls' (%ls) — spawning consent dialog",
-                 fgExe, titleStr.c_str());
-            std::thread([fgExeStr, titleStr]() {
-              // 경고 스타일 메시지. 창 제목 + exe + 강조 텍스트.
-              std::wstring msg =
-                  L"⚠️ 보안 경고\n\n"
-                  L"앱: " +
-                  titleStr +
-                  L"\n"
-                  L"실행 파일: " +
-                  fgExeStr +
-                  L"\n\n"
-                  L"이 앱에 민감 정보가 포함되어 있을 수 있어 자동으로 블러"
-                  L" 처리됐습니다.\n"
-                  L"방송 송출 화면에 그대로 노출(블러 해제)하시겠습니까?\n\n"
-                  L"[예] = 이번 게임 세션 동안 블러 해제\n"
-                  L"[아니오] = 계속 블러 유지 (권장)";
-              int result = MessageBoxW(
-                  nullptr, msg.c_str(), L"⚠️ SecureCast 보안 경고",
-                  MB_YESNO | MB_TOPMOST | MB_ICONWARNING | MB_DEFBUTTON2 |
-                      MB_SETFOREGROUND);
-              if (result == IDYES) {
-                std::lock_guard<std::mutex> glock(g_gmGlobalMutex);
-                g_gmWhitelist.insert(fgExeStr);
-                blog(LOG_INFO,
-                     "[SecureCast][GM] user allowed '%ls' for this session",
-                     fgExeStr.c_str());
-              } else {
-                blog(LOG_INFO,
-                     "[SecureCast][GM] user kept '%ls' blurred",
-                     fgExeStr.c_str());
-              }
-            }).detach();
-          }
-          } // end of !isGame && !inWhitelist && !alreadyPrompted
-        } // end of !is_gm_excluded_exe
-      }
-    }
-  }
-#endif
+  // [Game mode v2 — T02] 사용자 동의 dialog 제거됨.
+  // 게임 모드 중 fg가 게임/whitelist 외 앱이면 securecast_video_render에서
+  // silent blur로 자동 처리. fg 변화 감지/MessageBox 스레드는 더 이상 필요 없음.
 
   // ── WinEvent: 포그라운드 전환 감지 → Quick Restore ─
   // 게임 모드는 CPU 임계값(≤30%, 5s)으로만 해제한다.
@@ -3007,40 +3033,50 @@ static void securecast_video_tick(void *data, float seconds) {
     }
 
 #ifdef _WIN32
-    // [Game mode 자동 블러] 게임 모드 동안 foreground가 게임/화이트리스트가
-    // 아니면 그 창 전체를 blacklistMask에 추가. dialog 응답 받기 전까지는
-    // 블러 유지. 사용자가 [예] 응답하면 화이트리스트에 들어가 다음 프레임부터
-    // 이 블록이 skip. OBS/explorer 같은 제외 리스트 exe도 skip.
+    // [Game mode v2 — T02] 게임 모드 자동 블러 (silent).
+    // 게임 모드 진입 시 캡처된 gameModeGameExe로 fg를 식별: fg가 그 게임이면
+    // 송출, 아니면 silent blur. OBS/explorer 같은 제외 리스트 exe는 skip.
+    //
+    // [T02-2 empty 가드] gameModeGameExe가 비어있다는 것은 진입 시 게임을
+    // 잡지 못했다는 뜻 (예: CPU 트리거 진입 시 fg가 OBS 같은 제외 앱이었음).
+    // 이 상태에서 자동 블러를 켜면 사용자가 alt+tab으로 진짜 게임 화면에
+    // 들어왔을 때 게임 자체가 가려지는 회귀가 발생한다. 빈 상태면 자동 블러
+    // 비활성 — 일반 블랙리스트(위 outer 블록)는 그대로 작동하므로 보호 누락 없음.
     if (filter->isGameMode.load(std::memory_order_acquire) &&
         outCount < SC_MAX_BLUR_RECTS) {
-      HWND fg = GetForegroundWindow();
-      if (fg) {
-        wchar_t fgExe[64] = {};
-        if (sc_get_hwnd_exe_name(fg, fgExe, 64)) {
-          std::wstring fgExeStr(fgExe);
-          bool block = false;
-          if (!is_gm_excluded_exe(fgExeStr)) {
-            bool isGame = false;
-            {
-              std::lock_guard<std::mutex> lock(filter->gameModeMutex);
-              isGame = (fgExeStr == filter->gameModeGameExe);
+      std::wstring gameExe;
+      {
+        std::lock_guard<std::mutex> lock(filter->gameModeMutex);
+        gameExe = filter->gameModeGameExe;
+      }
+      if (!gameExe.empty()) {
+        HWND fg = GetForegroundWindow();
+        if (fg) {
+          wchar_t fgExe[64] = {};
+          if (sc_get_hwnd_exe_name(fg, fgExe, 64)) {
+            std::wstring fgExeStr(fgExe);
+            bool block = false;
+            if (!is_gm_excluded_exe(fgExeStr)) {
+              const bool isGame = (fgExeStr == gameExe);
+              bool inWhitelist = false;
+              {
+                std::lock_guard<std::mutex> glock(g_gmGlobalMutex);
+                inWhitelist = g_gmWhitelist.count(fgExeStr) > 0;
+              }
+              block = !isGame && !inWhitelist;
             }
-            bool inWhitelist = false;
-            {
-              std::lock_guard<std::mutex> glock(g_gmGlobalMutex);
-              inWhitelist = g_gmWhitelist.count(fgExeStr) > 0;
-            }
-            block = !isGame && !inWhitelist;
-          }
-          if (block) {
-            RECT fgRect{};
-            if (SUCCEEDED(DwmGetWindowAttribute(
-                    fg, DWMWA_EXTENDED_FRAME_BOUNDS, &fgRect,
-                    sizeof(fgRect)))) {
-              filter->blacklistMask.rects[outCount++] = {
-                  (int)fgRect.left, (int)fgRect.top,
-                  (int)(fgRect.right - fgRect.left),
-                  (int)(fgRect.bottom - fgRect.top), 0};
+            if (block) {
+              RECT fgRect{};
+              if (SUCCEEDED(DwmGetWindowAttribute(
+                      fg, DWMWA_EXTENDED_FRAME_BOUNDS, &fgRect,
+                      sizeof(fgRect)))) {
+                filter->blacklistMask.rects[outCount++] = {
+                    (int)fgRect.left, (int)fgRect.top,
+                    (int)(fgRect.right - fgRect.left),
+                    (int)(fgRect.bottom - fgRect.top), 0};
+                // [T13] 가린 사실을 ring buffer에 기록 — UI에서 사용자가 확인.
+                record_recent_blurred(filter, fgExeStr, fg);
+              }
             }
           }
         }
@@ -3150,7 +3186,16 @@ static void securecast_video_tick(void *data, float seconds) {
 // #define SC_SETTING_GAME_MODE   "sc_game_mode"  // [v2] 게임 모드 — 현재
 // 스코프 외
 #define SC_SETTING_MANUAL_RECTS "sc_manual_rects"
-#define SC_SETTING_GM_ASK_BL "sc_gm_ask_blacklist"
+
+// [Game mode v2 — T07] Properties UI 키.
+#define SC_SETTING_GM_AUTO_ENTER "sc_gm_auto_enter"
+#define SC_SETTING_GM_CPU_THRESHOLD "sc_gm_cpu_threshold"
+#define SC_SETTING_GM_ENTER_SECONDS "sc_gm_cpu_seconds"
+#define SC_SETTING_GM_EXIT_SECONDS "sc_gm_exit_seconds"
+#define SC_SETTING_USER_GAMES "sc_user_games"
+#define SC_SETTING_GM_WHITELIST "sc_gm_whitelist"
+// [T13] readonly multiline 표시용 settings 키. update에서 읽지 않음 — 표시 전용.
+#define SC_SETTING_GM_RECENT_BLURRED "sc_gm_recent_blurred"
 
 // manualBlurMask → obs_data_array 직렬화 후 source settings에 write-back.
 // settingsMutex 밖에서 호출해야 함 — obs_source_get_settings가 OBS 내부 락을
@@ -3398,6 +3443,13 @@ static BOOL CALLBACK pa_enum_running_proc(HWND hwnd, LPARAM lparam) {
   return TRUE;
 }
 
+// 본체는 path_to_exe_basename 정의 이후 (Settings/Properties 섹션). 게임 picker
+// 와 dedup 로직이 이들을 사용하므로 여기서 forward 선언.
+static std::string wide_to_utf8(const std::wstring &w);
+static std::wstring utf8_to_wide(const char *utf8);
+static std::wstring path_to_exe_basename(const std::wstring &path);
+static std::wstring extract_exe_from_label(const std::wstring &s);
+
 static void populate_app_picker(obs_property_t *combo) {
   std::vector<PickerApp> apps;
   pa_enum_registry(apps);
@@ -3412,15 +3464,132 @@ static void populate_app_picker(obs_property_t *combo) {
   }
 }
 
+// sc_user_games(editable_list)에 저장된 entry들을 dropdown picker 옵션으로 채움.
+// entry가 이미 "Name (exe)" 형식이면 그대로 label, exe만 저장된 옛날 데이터
+// (예: vgc.exe, vgm.exe)면 시스템 등록 앱 + 실행 중 프로세스에서 친화명을
+// 찾아 "Name (exe)" 라벨로 보강한다. 찾을 수 없으면 exe만 표시.
+// value는 항상 매칭 키 exe basename.
+static void populate_user_game_picker(SecureCastFilter *filter,
+                                      obs_property_t *combo) {
+  obs_property_list_clear(combo);
+  if (!filter || !filter->context)
+    return;
+  obs_data_t *settings = obs_source_get_settings(filter->context);
+  if (!settings)
+    return;
+  obs_data_array_t *arr =
+      obs_data_get_array(settings, SC_SETTING_USER_GAMES);
+  if (!arr) {
+    obs_data_release(settings);
+    return;
+  }
+
+  // 친화명 dictionary — 1회 enum 후 재사용. PickerApp.exe(UTF-8 lower-case)
+  // 기준으로 PickerApp.name lookup. Properties 다이얼로그 열 때만 호출되므로
+  // 100~200ms enum 비용 허용. (pa_enum_*는 이미 다른 picker에서 사용 중)
+  std::vector<PickerApp> apps;
+  pa_enum_registry(apps);
+  pa_enum_windows_apps(apps);
+  EnumWindows(pa_enum_running_proc, reinterpret_cast<LPARAM>(&apps));
+
+  // 1차 매칭: 시스템 enum (설치 프로그램 / 실행 중 프로세스).
+  // 2차 fallback: 빌트인 매핑 (백그라운드 서비스 vgc.exe 등 즉시 매핑).
+  auto lookup_friendly = [&apps](const std::string &exe_utf8) -> std::string {
+    // 1차
+    for (const auto &a : apps) {
+      if (!a.exe.empty() &&
+          _stricmp(a.exe.c_str(), exe_utf8.c_str()) == 0)
+        return a.name; // 첫 매칭 우선
+    }
+    // 2차: 빌트인 매핑 — wstring 으로 변환해 sc_lookup_friendly_name 호출.
+    std::wstring exe_w = utf8_to_wide(exe_utf8.c_str());
+    wchar_t friendly_w[128] = {};
+    if (sc_lookup_friendly_name(exe_w.c_str(), friendly_w, 128))
+      return wide_to_utf8(friendly_w);
+    return {};
+  };
+
+  struct PickerRow {
+    std::string label;
+    std::string value;
+  };
+  std::vector<PickerRow> rows;
+
+  // 친화명 lookup이 성공한 entry는 settings도 in-place 마이그레이션 — 다음
+  // dialog refresh부터는 editable_list도 친화명+exe 형식으로 보인다.
+  int migrated = 0;
+  size_t n = obs_data_array_count(arr);
+  rows.reserve(n);
+  for (size_t i = 0; i < n; ++i) {
+    obs_data_t *item = obs_data_array_item(arr, i);
+    if (!item)
+      continue;
+    const char *v = obs_data_get_string(item, "value");
+    if (v && *v) {
+      std::wstring w = utf8_to_wide(v);
+      std::wstring exe = extract_exe_from_label(path_to_exe_basename(w));
+      std::string exe_utf8 = wide_to_utf8(exe);
+
+      // entry가 이미 "이름  (exe)" 형식인지: '(' 와 '.exe)' 모두 있고
+      // path 구분자가 없으면 라벨로 간주 (사용자/자동 검색이 만든 라벨).
+      const bool already_labeled =
+          (std::strchr(v, '(') != nullptr) &&
+          (std::strstr(v, ".exe)") != nullptr ||
+           std::strstr(v, ".EXE)") != nullptr) &&
+          (std::strchr(v, '\\') == nullptr) &&
+          (std::strchr(v, '/') == nullptr);
+
+      std::string label;
+      if (already_labeled) {
+        label = v;
+      } else {
+        std::string friendly = lookup_friendly(exe_utf8);
+        if (!friendly.empty()) {
+          label = friendly + "  (" + exe_utf8 + ")";
+          // settings entry 자체도 새 라벨로 교체 — editable_list가 다음에
+          // 표시할 때 친화명 + exe 형식으로 보임. obs_source_update는 루프
+          // 끝에서 한 번에 호출.
+          obs_data_set_string(item, "value", label.c_str());
+          ++migrated;
+        } else {
+          label = exe_utf8;
+        }
+      }
+      rows.push_back({std::move(label), std::move(exe_utf8)});
+    }
+    obs_data_release(item);
+  }
+  if (migrated > 0) {
+    obs_data_set_array(settings, SC_SETTING_USER_GAMES, arr);
+    obs_source_update(filter->context, settings);
+    blog(LOG_INFO,
+         "[SecureCast] migrated %d entry/entries in sc_user_games to "
+         "friendly-name format",
+         migrated);
+  }
+  obs_data_array_release(arr);
+  obs_data_release(settings);
+
+  // 라벨 기준 알파벳 정렬 (case-insensitive) — picker가 길어도 찾기 쉬움.
+  std::sort(rows.begin(), rows.end(),
+            [](const PickerRow &a, const PickerRow &b) {
+              return _stricmp(a.label.c_str(), b.label.c_str()) < 0;
+            });
+  for (const auto &r : rows)
+    obs_property_list_add_string(combo, r.label.c_str(), r.value.c_str());
+}
+
 // 콤보박스 선택값 → editable_list 추가 (중복 체크).
-static bool add_picker_to_list(void *data, const char *listKey) {
+// pickerKey: 어떤 picker의 selection을 읽을지 (기본 "sc_app_picker").
+static bool add_picker_to_list(void *data, const char *listKey,
+                               const char *pickerKey = "sc_app_picker") {
   auto *filter = static_cast<SecureCastFilter *>(data);
   if (!filter || !filter->context)
     return false;
   obs_data_t *settings = obs_source_get_settings(filter->context);
   if (!settings)
     return false;
-  const char *sel = obs_data_get_string(settings, "sc_app_picker");
+  const char *sel = obs_data_get_string(settings, pickerKey);
   if (!sel || !*sel) {
     obs_data_release(settings);
     return false;
@@ -3460,7 +3629,16 @@ static bool sc_add_to_game_cb(obs_properties_t *, obs_property_t *,
                               void *data) {
   return add_picker_to_list(data, SC_SETTING_BLACKLIST_GM);
 }
+// 게임 picker에서 선택한 항목 → 게임 모드 허용 앱 (sc_gm_whitelist)에 추가.
+static bool sc_add_game_to_wl_cb(obs_properties_t *, obs_property_t *,
+                                 void *data) {
+  return add_picker_to_list(data, SC_SETTING_GM_WHITELIST,
+                            "sc_user_game_picker");
+}
 
+// [T08] 자동 검색 버튼 콜백 — 본체는 path_to_exe_basename 정의 이후에 위치.
+static bool sc_games_autodetect_btn_cb(obs_properties_t *, obs_property_t *,
+                                       void *data);
 #endif // _WIN32
 
 // 기본값으로 KakaoTalk/Discord/Slack 자동 추가 (사용자 설정 비어있을 때만).
@@ -3484,11 +3662,24 @@ static void securecast_get_defaults(obs_data_t *settings) {
   obs_data_array_t *defGame = make_default_blacklist_array();
   obs_data_set_default_array(settings, SC_SETTING_BLACKLIST_GM, defGame);
   obs_data_array_release(defGame);
-  obs_data_set_default_bool(settings, SC_SETTING_GM_ASK_BL, false);
-
   obs_data_array_t *emptyRectArr = obs_data_array_create();
   obs_data_set_default_array(settings, SC_SETTING_MANUAL_RECTS, emptyRectArr);
   obs_data_array_release(emptyRectArr);
+
+  // [Game mode v2 — T07] 사용자 조정 가능한 trigger 파라미터 기본값.
+  obs_data_set_default_bool(settings, SC_SETTING_GM_AUTO_ENTER, true);
+  obs_data_set_default_int(settings, SC_SETTING_GM_CPU_THRESHOLD, 40);
+  obs_data_set_default_int(settings, SC_SETTING_GM_ENTER_SECONDS, 3);
+  obs_data_set_default_int(settings, SC_SETTING_GM_EXIT_SECONDS, 5);
+
+  obs_data_array_t *emptyGames = obs_data_array_create();
+  obs_data_set_default_array(settings, SC_SETTING_USER_GAMES, emptyGames);
+  obs_data_array_release(emptyGames);
+
+  obs_data_array_t *emptyWhitelist = obs_data_array_create();
+  obs_data_set_default_array(settings, SC_SETTING_GM_WHITELIST,
+                             emptyWhitelist);
+  obs_data_array_release(emptyWhitelist);
 }
 
 static obs_properties_t *securecast_get_properties(void *data) {
@@ -3525,17 +3716,120 @@ static obs_properties_t *securecast_get_properties(void *data) {
   obs_properties_add_group(props, "sc_game_section", "게임 모드 차단 앱",
                            OBS_GROUP_NORMAL, gameGrp);
 
-  // 4) 게임 모드 dialog 옵션
-  obs_property_t *askProp = obs_properties_add_bool(
-      props, SC_SETTING_GM_ASK_BL,
-      "게임 블랙리스트 앱도 노출 전 확인 창 띄우기");
-  obs_property_set_long_description(
-      askProp,
-      "게임 모드 중에 '게임 모드 블랙리스트'에 등록한 앱이 화면에 뜨면, "
-      "송출할지 매번 확인 창으로 물어봅니다. 꺼두면 자동으로 가립니다.\n"
-      "(일반 모드 블랙리스트 앱은 토글과 무관하게 항상 자동으로 가립니다.)");
+  // [Game mode v2 — T02] 사용자 동의 dialog 폐기. 토글 UI도 제거됨.
 
-  // 5) 수동 드래그 블러 초기화 버튼
+  // ── [Game mode v2 — T07] 게임 모드 trigger 그룹 ────────────────────
+  obs_properties_t *gmGrp = obs_properties_create();
+  obs_properties_set_param(gmGrp, data, nullptr);
+  obs_properties_add_bool(
+      gmGrp, SC_SETTING_GM_AUTO_ENTER,
+      "자동 진입 활성 (꺼두면 게임 모드로 전환 안 함)");
+  obs_property_t *cpuProp = obs_properties_add_int_slider(
+      gmGrp, SC_SETTING_GM_CPU_THRESHOLD,
+      "CPU 진입 임계값 (%)", 20, 90, 1);
+  obs_property_set_long_description(
+      cpuProp,
+      "내 게임 목록의 앱이 활성 창이 되면 즉시 게임 모드 ON. 그 외에는 CPU "
+      "사용률이 이 임계값 이상으로 \"진입 지속 시간\" 동안 유지될 때만 "
+      "ON으로 전환.");
+  obs_properties_add_int_slider(gmGrp, SC_SETTING_GM_ENTER_SECONDS,
+                                "진입 지속 시간 (CPU 임계값 위, 초)", 1, 15,
+                                1);
+  obs_properties_add_int_slider(gmGrp, SC_SETTING_GM_EXIT_SECONDS,
+                                "해제 지속 시간 (CPU 낮아진 뒤, 초)", 1, 30,
+                                1);
+  obs_properties_add_group(props, "sc_gm_group", "게임 모드 자동 진입",
+                           OBS_GROUP_NORMAL, gmGrp);
+
+  // ── [Game mode v2 — T07] 내 게임 목록 (Tier 3) ───────────────────────
+  // 그룹 헤더가 이미 "내 게임 목록"이므로 editable_list 라벨은 빈 문자열로 두어
+  // 리스트 영역이 폭을 최대한 차지하게 한다. 사용자 가독성 + 친화명 표시는
+  // entry 자체에 "Lost Ark  (lostark.exe)" 형식으로 저장됨 (자동 검색 결과).
+  obs_properties_t *gamesGrp = obs_properties_create();
+  obs_properties_set_param(gamesGrp, data, nullptr);
+
+  obs_property_t *searchBtnProp = obs_properties_add_button(
+      gamesGrp, "sc_games_search", "게임 자동 검색",
+      sc_games_autodetect_btn_cb);
+  obs_property_set_long_description(
+      searchBtnProp,
+      "Steam / Epic Games / Battle.net / Riot / Microsoft Store(UWP) / "
+      "Xbox Game Bar / Windows 설치 프로그램에서 게임을 찾아 목록에 자동 "
+      "등록합니다.");
+
+  // 게임 picker — dropdown(scroll 가능) 으로 내 게임 목록 표시.
+  // 옆 버튼으로 선택한 게임을 "노출 허용"에 한 번에 추가 가능.
+  obs_property_t *gamePicker = obs_properties_add_list(
+      gamesGrp, "sc_user_game_picker", "게임 선택",
+      OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+  auto *filter = static_cast<SecureCastFilter *>(data);
+  populate_user_game_picker(filter, gamePicker);
+
+  obs_properties_add_button(gamesGrp, "sc_add_game_to_wl_btn",
+                            "선택한 게임을 노출 허용에 추가",
+                            sc_add_game_to_wl_cb);
+
+  obs_properties_add_editable_list(
+      gamesGrp, SC_SETTING_USER_GAMES,
+      "", // 짧은 라벨 — 리스트 폭 최대화
+      OBS_EDITABLE_LIST_TYPE_STRINGS, nullptr, nullptr);
+
+  obs_properties_add_group(props, "sc_games_group", "내 게임 목록",
+                           OBS_GROUP_NORMAL, gamesGrp);
+
+  // ── [Game mode v2 — T07] 화이트리스트 (게임 모드 중 노출 허용) ──────
+  obs_properties_t *wlGrp = obs_properties_create();
+  obs_properties_set_param(wlGrp, data, nullptr);
+  obs_properties_add_editable_list(
+      wlGrp, SC_SETTING_GM_WHITELIST,
+      "", // 짧은 라벨 — 그룹 헤더가 이미 설명
+      OBS_EDITABLE_LIST_TYPE_STRINGS, nullptr, nullptr);
+  obs_properties_add_group(props, "sc_whitelist_group",
+                           "게임 모드 노출 허용 앱", OBS_GROUP_NORMAL, wlGrp);
+
+  // ── [Game mode v2 — T13] 최근 가린 앱 (readonly 표시) ───────────────
+  // Properties 다이얼로그가 열린 시점의 deque snapshot. 사용자가 화이트리스트로
+  // 옮기고 싶으면 위 화이트리스트 그룹에 수동 입력.
+  {
+    auto *filter = static_cast<SecureCastFilter *>(data);
+    std::wstring snapshot_w;
+    {
+      std::lock_guard<std::mutex> lock(filter->recentBlurredMutex);
+      if (filter->recentBlurredApps.empty()) {
+        snapshot_w =
+            L"(게임 모드 진입 후 자동으로 가려진 앱이 없습니다)";
+      } else {
+        uint64_t now = GetTickCount64();
+        for (const auto &app : filter->recentBlurredApps) {
+          uint64_t age_sec =
+              app.timestamp_ms ? (now - app.timestamp_ms) / 1000 : 0;
+          snapshot_w += app.exe;
+          if (!app.window_title.empty())
+            snapshot_w += L"  (" + app.window_title + L")";
+          snapshot_w += L"  — " + std::to_wstring(age_sec) + L"s 전\n";
+        }
+      }
+    }
+    // settings에 push해 두면 MULTILINE 위젯이 그 값을 표시.
+    obs_data_t *settings = obs_source_get_settings(filter->context);
+    if (settings) {
+      obs_data_set_string(settings, SC_SETTING_GM_RECENT_BLURRED,
+                          wide_to_utf8(snapshot_w).c_str());
+      obs_data_release(settings);
+    }
+    obs_property_t *recentProp = obs_properties_add_text(
+        props, SC_SETTING_GM_RECENT_BLURRED,
+        "최근 가린 앱 (참고용 — 가장 최근 항목이 위쪽)",
+        OBS_TEXT_MULTILINE);
+    obs_property_set_enabled(recentProp, false); // readonly
+    obs_property_set_long_description(
+        recentProp,
+        "게임 모드 중 자동으로 가려진 앱들입니다. 이 창을 다시 열면 갱신됩니다."
+        " 특정 앱을 송출에서 보이게 하려면 위 \"게임 모드 노출 허용 앱\" 에 "
+        "추가하세요.");
+  }
+
+  // 4) 수동 드래그 블러 초기화 버튼
   obs_properties_add_button(
       props, "sc_clear_manual", "Clear Manual Blurs",
       [](obs_properties_t *, obs_property_t *, void *btn_data) -> bool {
@@ -3575,6 +3869,32 @@ static std::wstring path_to_exe_basename(const std::wstring &path) {
   return base;
 }
 
+// 사용자에게 보여주는 entry는 "Claude  (claude.exe)" 형식 — 친화명 + exe.
+// 매칭 키는 .exe만이라 괄호 안 .exe basename을 추출한다.
+//   "Claude  (claude.exe)" → "claude.exe"
+//   "claude.exe"            → "claude.exe"  (그대로)
+//   "C:\\foo\\claude.exe"   → "claude.exe"  (path_to_exe_basename 결과)
+static std::wstring extract_exe_from_label(const std::wstring &s) {
+  size_t close = s.rfind(L')');
+  if (close == std::wstring::npos)
+    return s;
+  size_t open = s.rfind(L'(', close);
+  if (open == std::wstring::npos || open >= close)
+    return s;
+  std::wstring inner = s.substr(open + 1, close - open - 1);
+  while (!inner.empty() && (inner.front() == L' ' || inner.front() == L'\t'))
+    inner.erase(inner.begin());
+  while (!inner.empty() && (inner.back() == L' ' || inner.back() == L'\t'))
+    inner.pop_back();
+  if (inner.size() >= 4) {
+    const size_t n = inner.size();
+    if (towlower(inner[n - 4]) == L'.' && towlower(inner[n - 3]) == L'e' &&
+        towlower(inner[n - 2]) == L'x' && towlower(inner[n - 1]) == L'e')
+      return inner;
+  }
+  return s;
+}
+
 // editable_list (obs_data_array_t) → wstring 배열. 각 item의 "value" 키에 path.
 // OBS 자체는 자동 제외 (사용자가 실수로 추가해도 적용 안 함).
 static std::vector<std::wstring>
@@ -3596,7 +3916,8 @@ parse_blacklist_array(obs_data_array_t *arr) {
       if (wlen > 1) {
         std::wstring wide(wlen - 1, L'\0');
         MultiByteToWideChar(CP_UTF8, 0, valUtf8, -1, wide.data(), wlen);
-        std::wstring base = path_to_exe_basename(wide);
+        // path → basename → "name (exe)" 라벨이면 괄호 안 exe만 추출.
+        std::wstring base = extract_exe_from_label(path_to_exe_basename(wide));
         if (!base.empty()) {
           // OBS 자체 제외
           bool isObs = false;
@@ -3640,12 +3961,428 @@ static void apply_user_blacklists(obs_data_array_t *normalArr,
        normal.size(), gm.size());
 }
 
+// ============================================================================
+// [T08] 자동 검색 — Steam enum → 결과 dialog → YES 시 sc_user_games에 추가.
+//
+// Threading:
+//   버튼 콜백은 OBS UI 스레드. enum이 수 초 걸릴 수 있어 detached worker로
+//   분리. g_autodetect_running CAS로 동시 실행 방지. worker는 enum 후 자체적으
+//   로 MessageBoxW로 결과 dialog를 띄우고, YES면 obs_source_update로 settings
+//   에 반영한다 (UI 스레드로 마샬링하지 않음 — OBS 내부가 atomic).
+//
+// 안전성:
+//   filter->isDestroying을 settings 접근 직전에 확인. 두 시점 사이 race는
+//   허용 (필터 삭제와 동시에 사용자가 클릭하는 매우 드문 경우, 기존 T02 dialog
+//   처리와 동일한 trade-off).
+// ============================================================================
+
+static std::string wide_to_utf8(const std::wstring &w) {
+  if (w.empty())
+    return {};
+  int n = WideCharToMultiByte(CP_UTF8, 0, w.data(),
+                              static_cast<int>(w.size()), nullptr, 0, nullptr,
+                              nullptr);
+  if (n <= 0)
+    return {};
+  std::string s(static_cast<size_t>(n), '\0');
+  WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()),
+                      s.data(), n, nullptr, nullptr);
+  return s;
+}
+
+static std::wstring utf8_to_wide(const char *utf8) {
+  if (!utf8 || !*utf8)
+    return {};
+  int n = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, nullptr, 0);
+  if (n <= 1)
+    return {};
+  std::wstring w(static_cast<size_t>(n - 1), L'\0');
+  MultiByteToWideChar(CP_UTF8, 0, utf8, -1, w.data(), n);
+  return w;
+}
+
+static std::wstring lowercase_copy(const std::wstring &s) {
+  std::wstring out(s);
+  for (auto &c : out)
+    c = towlower(c);
+  return out;
+}
+
+// 결과 dialog를 띄우고 YES면 settings의 sc_user_games array에 새 게임을 append.
+// settings를 호출자가 잡고 있어서 호출 후 release는 caller가 한다.
+// (caller: autodetect_worker)
+static void apply_autodetect_to_settings(
+    SecureCastFilter *filter, obs_data_t *settings,
+    const std::vector<securecast::GameInfo> &new_games) {
+  if (filter->isDestroying.load(std::memory_order_acquire)) {
+    blog(LOG_WARNING,
+         "[SecureCast] auto-detect: filter destroyed before apply, skipping");
+    return;
+  }
+  obs_data_array_t *arr = obs_data_get_array(settings, SC_SETTING_USER_GAMES);
+  bool createdArr = false;
+  if (!arr) {
+    arr = obs_data_array_create();
+    createdArr = true;
+  }
+  for (const auto &g : new_games) {
+    // 사용자 가독성: "Lost Ark  (lostark.exe)" 형식. display_name이 비었거나
+    // exe와 동일하면 그냥 exe만 저장 — parse_blacklist_array가 양쪽 다 처리.
+    std::wstring label;
+    if (!g.display_name.empty() && _wcsicmp(g.display_name.c_str(),
+                                            g.exe_basename.c_str()) != 0) {
+      label = g.display_name + L"  (" + g.exe_basename + L")";
+    } else {
+      label = g.exe_basename;
+    }
+    obs_data_t *item = obs_data_create();
+    obs_data_set_string(item, "value", wide_to_utf8(label).c_str());
+    obs_data_array_push_back(arr, item);
+    obs_data_release(item);
+  }
+  // obs_data_set_array는 새로 ref하므로 우리 ref는 release.
+  obs_data_set_array(settings, SC_SETTING_USER_GAMES, arr);
+  obs_data_array_release(arr);
+  (void)createdArr;
+
+  obs_source_update(filter->context, settings);
+  blog(LOG_INFO,
+       "[SecureCast] auto-detect: added %zu game(s) to sc_user_games",
+       new_games.size());
+}
+
+static void autodetect_worker(SecureCastFilter *filter) {
+  // [T09] 7개 source 순차 호출 — 각 source는 자기 실패를 흡수해 빈 vector 반환.
+  // 합산 후 같은 basename은 첫 source가 우선 (Steam > Epic > Battle.net > Riot
+  // > UWP > Game Bar > Installed). 사용자에게 source별 카운트 표시.
+  struct SourceCount {
+    const wchar_t *label;
+    size_t count;
+  };
+  std::vector<securecast::GameInfo> games;
+  SourceCount counts[7] = {
+      {L"Steam", 0},        {L"Epic Games", 0}, {L"Battle.net", 0},
+      {L"Riot", 0},         {L"UWP", 0},        {L"Game Bar", 0},
+      {L"Installed Programs", 0},
+  };
+  auto run_source = [&](size_t idx, auto fn) {
+    auto v = fn();
+    counts[idx].count = v.size();
+    games.insert(games.end(), std::make_move_iterator(v.begin()),
+                 std::make_move_iterator(v.end()));
+  };
+  run_source(0, securecast::enum_steam_games);
+  run_source(1, securecast::enum_epic_games);
+  run_source(2, securecast::enum_battlenet_games);
+  run_source(3, securecast::enum_riot_games);
+  run_source(4, securecast::enum_uwp_games);
+  run_source(5, securecast::enum_gamebar_games);
+  run_source(6, securecast::enum_installed_programs_games);
+
+  if (filter->isDestroying.load(std::memory_order_acquire)) {
+    blog(LOG_WARNING,
+         "[SecureCast] auto-detect: filter destroyed mid-search, aborting");
+    return;
+  }
+
+  // 현재 sc_user_games에 이미 있는 basename 수집 → dedup.
+  // 동시에 옛 형식("vgc.exe" 단독)으로 저장된 entry를 enum 결과의 display_name
+  // 으로 in-place 마이그레이션 ("Riot Vanguard  (vgc.exe)" 형식).
+  std::unordered_set<std::wstring> existing;
+  obs_data_t *settings = obs_source_get_settings(filter->context);
+  bool migrated_any = false;
+  if (settings) {
+    obs_data_array_t *arr =
+        obs_data_get_array(settings, SC_SETTING_USER_GAMES);
+    if (arr) {
+      size_t n = obs_data_array_count(arr);
+      for (size_t i = 0; i < n; ++i) {
+        obs_data_t *item = obs_data_array_item(arr, i);
+        if (item) {
+          const char *v = obs_data_get_string(item, "value");
+          if (v && *v) {
+            std::wstring w = utf8_to_wide(v);
+            std::wstring base =
+                extract_exe_from_label(path_to_exe_basename(w));
+            if (!base.empty())
+              existing.insert(lowercase_copy(base));
+
+            // 마이그레이션: entry가 라벨 형식 아니면 → enum 결과 + 빌트인
+            // 매핑에서 친화명 찾아 entry 교체.
+            const bool labeled =
+                (std::strchr(v, '(') != nullptr) &&
+                (std::strstr(v, ".exe)") != nullptr ||
+                 std::strstr(v, ".EXE)") != nullptr) &&
+                (std::strchr(v, '\\') == nullptr) &&
+                (std::strchr(v, '/') == nullptr);
+            if (!labeled && !base.empty()) {
+              std::wstring friendly;
+              // 1차: enum 결과
+              for (const auto &g : games) {
+                if (_wcsicmp(g.exe_basename.c_str(), base.c_str()) == 0 &&
+                    !g.display_name.empty() &&
+                    _wcsicmp(g.display_name.c_str(),
+                              g.exe_basename.c_str()) != 0) {
+                  friendly = g.display_name;
+                  break;
+                }
+              }
+              // 2차: 빌트인 매핑
+              if (friendly.empty()) {
+                wchar_t buf[128] = {};
+                if (sc_lookup_friendly_name(base.c_str(), buf, 128))
+                  friendly = buf;
+              }
+              if (!friendly.empty()) {
+                std::wstring new_label =
+                    friendly + L"  (" + base + L")";
+                obs_data_set_string(item, "value",
+                                    wide_to_utf8(new_label).c_str());
+                migrated_any = true;
+              }
+            }
+          }
+          obs_data_release(item);
+        }
+      }
+      if (migrated_any) {
+        obs_data_set_array(settings, SC_SETTING_USER_GAMES, arr);
+        // 마이그레이션만으로 변경된 settings를 영구화. 이후 dialog YES 응답
+        // 시 apply_autodetect_to_settings가 또 호출되면 한 번 더 동기화되지만
+        // 두 호출이 안전하게 멱등이므로 무해.
+        obs_source_update(filter->context, settings);
+        blog(LOG_INFO,
+             "[SecureCast] auto-detect: migrated old entries to "
+             "friendly-name format");
+      }
+      obs_data_array_release(arr);
+    }
+  }
+
+  // 새 후보만 추리기 (Tier 1/Tier 3 dedup 포함).
+  std::vector<securecast::GameInfo> new_games;
+  std::unordered_set<std::wstring> seen_new;
+  for (const auto &g : games) {
+    if (g.exe_basename.empty())
+      continue;
+    std::wstring key = lowercase_copy(g.exe_basename);
+    if (existing.count(key) || seen_new.count(key))
+      continue;
+    // Tier 1(빌트인)에 이미 있으면 sc_user_games에 또 넣지 않음.
+    if (sc_is_known_game(g.exe_basename.c_str()))
+      continue;
+    seen_new.insert(std::move(key));
+    new_games.push_back(g);
+  }
+
+  // 메시지 작성.
+  std::wstring msg;
+  std::wstring title = L"SecureCast — 자동 검색 결과";
+
+  // Source별 카운트 헤더.
+  std::wstring source_header;
+  for (const auto &c : counts) {
+    if (c.count == 0)
+      continue;
+    source_header += std::wstring(L"  • ") + c.label + L": " +
+                     std::to_wstring(c.count) + L"개\n";
+  }
+  if (source_header.empty())
+    source_header = L"  (감지된 source 없음)\n";
+
+  if (games.empty()) {
+    msg = L"게임 launcher를 감지하지 못했거나 등록된 게임이 없습니다.\n\n"
+          L"검색한 source:\n" +
+          source_header +
+          L"\n수동으로 \"내 게임 목록\"에 exe 이름(예: lostark.exe)을 추가해 "
+          L"주세요.";
+    MessageBoxW(nullptr, msg.c_str(), title.c_str(),
+                MB_OK | MB_ICONINFORMATION | MB_TOPMOST);
+    if (settings)
+      obs_data_release(settings);
+    return;
+  }
+
+  if (new_games.empty()) {
+    msg = L"자동 검색 완료.\n\nSource별 발견:\n" + source_header +
+          L"\n총 " + std::to_wstring(games.size()) +
+          L"개 게임이 발견됐지만, 모두 빌트인/사용자 목록에 이미 등록되어 "
+          L"있어 추가할 항목이 없습니다.";
+    MessageBoxW(nullptr, msg.c_str(), title.c_str(),
+                MB_OK | MB_ICONINFORMATION | MB_TOPMOST);
+    if (settings)
+      obs_data_release(settings);
+    return;
+  }
+
+  // YES/NO 결정용 본문.
+  msg = L"자동 검색 완료.\n\nSource별 발견:\n" + source_header +
+        L"\n새로 추가할 게임: " + std::to_wstring(new_games.size()) +
+        L"개 (총 " + std::to_wstring(games.size()) + L"개 중 중복 제외)\n\n";
+  const size_t kMaxShow = 25;
+  size_t shown = (new_games.size() < kMaxShow) ? new_games.size() : kMaxShow;
+  for (size_t i = 0; i < shown; ++i) {
+    const auto &g = new_games[i];
+    msg += L"• " + g.display_name + L"  (" + g.exe_basename + L")  [" +
+           g.source + L"]\n";
+  }
+  if (new_games.size() > shown) {
+    msg += L"... 외 " + std::to_wstring(new_games.size() - shown) + L"개\n";
+  }
+  msg +=
+      L"\n주의: Installed Programs는 휴리스틱 매칭이라 게임 아닌 항목이 섞일 "
+      L"수 있습니다.\n[예] 모두 추가 후 목록에서 직접 정리\n[아니오] 추가 안 함";
+
+  int res =
+      MessageBoxW(nullptr, msg.c_str(), title.c_str(),
+                  MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON1 | MB_TOPMOST);
+
+  if (res == IDYES && settings) {
+    apply_autodetect_to_settings(filter, settings, new_games);
+  } else {
+    blog(LOG_INFO,
+         "[SecureCast] auto-detect: user declined (%zu new game candidate(s))",
+         new_games.size());
+  }
+  if (settings)
+    obs_data_release(settings);
+}
+
+static bool sc_games_autodetect_btn_cb(obs_properties_t *, obs_property_t *,
+                                       void *data) {
+  auto *filter = static_cast<SecureCastFilter *>(data);
+  if (!filter)
+    return false;
+
+  bool expected = false;
+  if (!g_autodetect_running.compare_exchange_strong(expected, true,
+                                                    std::memory_order_acq_rel)) {
+    blog(LOG_INFO, "[SecureCast] auto-detect: already running — ignored");
+    MessageBoxW(nullptr,
+                L"자동 검색이 이미 진행 중입니다.\n잠시 후 결과 창이 표시됩니다.",
+                L"SecureCast — 자동 검색", MB_OK | MB_ICONINFORMATION);
+    return false;
+  }
+
+  blog(LOG_INFO,
+       "[SecureCast] auto-detect: starting Steam enum in background");
+
+  std::thread([filter]() {
+    try {
+      autodetect_worker(filter);
+    } catch (const std::exception &e) {
+      blog(LOG_WARNING, "[SecureCast] auto-detect exception: %s", e.what());
+    } catch (...) {
+      blog(LOG_WARNING, "[SecureCast] auto-detect unknown exception");
+    }
+    g_autodetect_running.store(false, std::memory_order_release);
+  }).detach();
+
+  // false = 추가 properties 갱신 불필요. 결과는 비동기로 settings에 반영되며
+  // OBS가 securecast_update를 호출해 editable_list 화면이 자동 새로고침된다.
+  return false;
+}
+
+// ============================================================================
+// [T14] 화이트리스트 영구 저장.
+//
+// 코드 어디서든(미래 단축키/UI 등) 한 줄 호출로 in-memory + 디스크 둘 다 갱신.
+//   - in-memory: g_gmWhitelist (g_gmGlobalMutex로 보호)
+//   - 디스크: filter context의 settings의 sc_gm_whitelist editable_list
+//
+// 부수 효과: obs_source_update를 호출하므로 securecast_update가 즉시 다시
+// 돌면서 settings → g_gmWhitelist 전체 재동기화한다. 같은 스레드 동기 호출
+// 이라 race 없음.
+//
+// 매칭은 현재 case-sensitive (render-side ==), 그러나 이 추가 API의 dedup은
+// case-insensitive — "Discord.exe"가 이미 있으면 "discord.exe" 추가 무시.
+// 이렇게 하면 UI 입력 vs 단축키 입력의 케이스 차이로 중복이 쌓이지 않는다.
+//
+// 반환: true = 새로 추가됨 / false = 이미 존재해서 no-op.
+//        둘 다 호출 측 입장에서 "성공"으로 봐도 무방.
+// ============================================================================
+[[maybe_unused]] static bool
+add_to_whitelist_and_persist(SecureCastFilter *filter,
+                              const std::wstring &exe_in) {
+  if (!filter || exe_in.empty())
+    return false;
+  if (filter->isDestroying.load(std::memory_order_acquire))
+    return false;
+
+  // 경로면 basename만, "name (exe)" 라벨이면 괄호 안 exe만. trim 포함.
+  std::wstring base = extract_exe_from_label(path_to_exe_basename(exe_in));
+  if (base.empty())
+    return false;
+
+  // 1. In-memory dedup + insert (case-insensitive).
+  {
+    std::lock_guard<std::mutex> lock(g_gmGlobalMutex);
+    for (const auto &e : g_gmWhitelist) {
+      if (_wcsicmp(e.c_str(), base.c_str()) == 0) {
+        blog(LOG_INFO,
+             "[SecureCast] whitelist add '%ls' — already present, no-op",
+             base.c_str());
+        return false;
+      }
+    }
+    g_gmWhitelist.insert(base);
+  }
+
+  // 2. OBS settings array 갱신 → obs_source_update.
+  obs_data_t *settings = obs_source_get_settings(filter->context);
+  if (!settings) {
+    blog(LOG_WARNING,
+         "[SecureCast] whitelist add '%ls' — settings unavailable, in-memory "
+         "only",
+         base.c_str());
+    return true;
+  }
+  obs_data_array_t *arr =
+      obs_data_get_array(settings, SC_SETTING_GM_WHITELIST);
+  if (!arr)
+    arr = obs_data_array_create();
+
+  // editable_list array에서도 case-insensitive dedup.
+  std::string utf8 = wide_to_utf8(base);
+  bool already_in_arr = false;
+  size_t count = obs_data_array_count(arr);
+  for (size_t i = 0; i < count; ++i) {
+    obs_data_t *item = obs_data_array_item(arr, i);
+    if (item) {
+      const char *v = obs_data_get_string(item, "value");
+      if (v && _stricmp(v, utf8.c_str()) == 0)
+        already_in_arr = true;
+      obs_data_release(item);
+    }
+    if (already_in_arr)
+      break;
+  }
+
+  if (!already_in_arr) {
+    obs_data_t *item = obs_data_create();
+    obs_data_set_string(item, "value", utf8.c_str());
+    obs_data_array_push_back(arr, item);
+    obs_data_release(item);
+  }
+
+  obs_data_set_array(settings, SC_SETTING_GM_WHITELIST, arr);
+  obs_data_array_release(arr);
+
+  // obs_source_update는 동기 호출 → securecast_update가 즉시 실행.
+  // 우리 in-memory insert와 update 안의 g_gmWhitelist.clear()/re-fill 사이
+  // 같은 스레드이므로 race 없음. 결과: 디스크 ↔ in-memory 일관.
+  obs_source_update(filter->context, settings);
+  obs_data_release(settings);
+
+  blog(LOG_INFO, "[SecureCast] whitelist add '%ls' — persisted%s",
+       base.c_str(),
+       already_in_arr ? " (in-memory only — array already had it)" : "");
+  return true;
+}
+
 static void securecast_update(void *data, obs_data_t *settings) {
   SecureCastFilter *filter = static_cast<SecureCastFilter *>(data);
   std::lock_guard<std::mutex> lock(filter->settingsMutex);
-  filter->gameModeAskForBlacklist.store(
-      obs_data_get_bool(settings, SC_SETTING_GM_ASK_BL),
-      std::memory_order_release);
 
   // 동적 블랙리스트(일반 + 게임 모드) 글로벌에 반영. editable_list는
   // obs_data_array_t로 직렬화됨 — 각 item의 "value"에 파일 path.
@@ -3658,7 +4395,64 @@ static void securecast_update(void *data, obs_data_t *settings) {
     obs_data_array_release(normalArr);
   if (gmArr)
     obs_data_array_release(gmArr);
+
+  // [Game mode v2 — T07] trigger 파라미터 + Tier 3 게임 목록 + 화이트리스트.
+  filter->gameModeAutoEnter =
+      obs_data_get_bool(settings, SC_SETTING_GM_AUTO_ENTER);
+  filter->gameModeCpuThreshold =
+      (int)obs_data_get_int(settings, SC_SETTING_GM_CPU_THRESHOLD);
+  filter->gameModeEnterSeconds =
+      (int)obs_data_get_int(settings, SC_SETTING_GM_ENTER_SECONDS);
+  filter->gameModeExitSeconds =
+      (int)obs_data_get_int(settings, SC_SETTING_GM_EXIT_SECONDS);
+  // 슬라이더가 의도치 않게 0/음수가 되어도 GM 상태머신이 무한 루프에 빠지지
+  // 않도록 최소 1초로 clamp.
+  if (filter->gameModeEnterSeconds < 1)
+    filter->gameModeEnterSeconds = 1;
+  if (filter->gameModeExitSeconds < 1)
+    filter->gameModeExitSeconds = 1;
+  if (filter->gameModeCpuThreshold < 20)
+    filter->gameModeCpuThreshold = 20;
+  if (filter->gameModeCpuThreshold > 90)
+    filter->gameModeCpuThreshold = 90;
+
+#ifdef _WIN32
+  // Tier 3 사용자 게임 목록 → g_userGameList.
+  obs_data_array_t *gamesArr =
+      obs_data_get_array(settings, SC_SETTING_USER_GAMES);
+  auto userGames = parse_blacklist_array(gamesArr);
+  if (gamesArr)
+    obs_data_array_release(gamesArr);
+  std::vector<const wchar_t *> userGamePtrs;
+  userGamePtrs.reserve(userGames.size());
+  for (const auto &g : userGames)
+    userGamePtrs.push_back(g.c_str());
+  sc_set_user_game_list(userGamePtrs.empty() ? nullptr : userGamePtrs.data(),
+                        (int)userGamePtrs.size());
+
+  // 게임 모드 화이트리스트 → g_gmWhitelist 전체 교체. 매칭은 현재 case-sensitive
+  // (T15에서 영구 저장 + 정규화 검토 예정).
+  obs_data_array_t *wlArr =
+      obs_data_get_array(settings, SC_SETTING_GM_WHITELIST);
+  auto whitelist = parse_blacklist_array(wlArr);
+  if (wlArr)
+    obs_data_array_release(wlArr);
+  {
+    std::lock_guard<std::mutex> glock(g_gmGlobalMutex);
+    g_gmWhitelist.clear();
+    for (auto &w : whitelist)
+      g_gmWhitelist.insert(std::move(w));
+  }
+
+  blog(LOG_INFO,
+       "[SecureCast] Settings updated. game-mode auto=%d cpu>=%d%% enter=%ds "
+       "exit=%ds | user games=%zu, whitelist=%zu",
+       filter->gameModeAutoEnter ? 1 : 0, filter->gameModeCpuThreshold,
+       filter->gameModeEnterSeconds, filter->gameModeExitSeconds,
+       userGames.size(), whitelist.size());
+#else
   blog(LOG_INFO, "[SecureCast][D] Settings updated.");
+#endif
 
   // 수동 블러 rect 역직렬화
   obs_data_array_t *arr = obs_data_get_array(settings, SC_SETTING_MANUAL_RECTS);

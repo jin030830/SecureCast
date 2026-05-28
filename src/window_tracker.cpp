@@ -20,6 +20,7 @@
 
 #include "window_tracker.h"
 #include "plugin-support.h"   // obs_log
+#include "known_games.h"      // Tier 1 빌트인 게임 exe 리스트 (T03)
 
 #include <obs.h>
 #include <util/platform.h>    // os_gettime_ns
@@ -71,10 +72,21 @@ std::mutex g_userBlacklistMutex;
 std::vector<std::wstring> g_userBlacklistNormal;
 std::vector<std::wstring> g_userBlacklistGameMode;
 
-// 게임 모드 글로벌 플래그 — 어느 필터든 게임 모드면 true. is_blacklisted가
+// [T03] Tier 3: 사용자가 OBS 설정에서 "이건 게임"으로 등록한 exe 목록.
+// 빌트인(Tier 1)이 놓치는 신작/마이너 게임을 사용자가 직접 보강하는 경로.
+// 블랙리스트와 무관 — 게임 모드 진입/제외 trigger에 사용된다.
+std::mutex g_userGameListMutex;
+std::vector<std::wstring> g_userGameList;
+
+// 게임 모드 글로벌 refcount — 어느 필터든 게임 모드면 > 0. is_blacklisted가
 // 자동으로 game-mode-extra 리스트도 검사하도록 함. enum_proc 등 모든 scan
 // 경로가 자동으로 게임 모드 블랙리스트 적용.
-std::atomic<bool> g_anyFilterInGameMode{false};
+//
+// 다중 인스턴스 안전: 각 필터의 게임 모드 진입/탈출이 +1/-1 짝으로 일어나,
+// 한 쪽이 OFF 되어도 다른 쪽이 여전히 게임 모드면 글로벌이 켜진 상태를 유지.
+// 마지막 필터가 OFF로 내려와야 글로벌도 비활성화. 동일 필터에서 OFF가 두 번
+// 호출되어도 음수로 빠지지 않도록 fetch_sub 후 underflow 가드.
+std::atomic<int> g_gameMode_RefCount{0};
 
 // UWP (Microsoft Store) 앱은 모두 ApplicationFrameHost.exe라는 단일 호스트
 // 프로세스로 보고된다. 실제 앱 식별은 자식 윈도우의 PID를 다시 봐야 가능하므로
@@ -127,7 +139,7 @@ bool is_blacklisted(const wchar_t *exe_name)
 		}
 	}
 	// 3. 어느 필터든 게임 모드면 game-mode-extra도 자동 적용
-	if (g_anyFilterInGameMode.load(std::memory_order_acquire)) {
+	if (g_gameMode_RefCount.load(std::memory_order_acquire) > 0) {
 		for (const wchar_t *entry : kGameModeExtraBlacklist) {
 			if (iequals(entry, exe_name))
 				return true;
@@ -912,9 +924,91 @@ extern "C" void sc_set_user_blacklist_game_mode(const wchar_t *const *exes,
 
 // 어느 필터든 게임 모드면 true로 설정 — is_blacklisted가 자동으로
 // game-mode-extra 적용. enum_proc 등 모든 scan 경로 무수정 적용.
+//
+// 다중 필터 인스턴스 안전: refcount 기반. active=true는 +1, false는 -1.
+// 같은 필터에서 OFF가 중복 호출되어도 음수로 빠지지 않도록 underflow 가드.
 extern "C" void sc_set_global_game_mode(bool active)
 {
-	g_anyFilterInGameMode.store(active, std::memory_order_release);
+	if (active) {
+		g_gameMode_RefCount.fetch_add(1, std::memory_order_acq_rel);
+	} else {
+		int prev = g_gameMode_RefCount.fetch_sub(1, std::memory_order_acq_rel);
+		if (prev <= 0) {
+			// 중복 OFF — 음수가 되지 않도록 되돌림.
+			g_gameMode_RefCount.fetch_add(1, std::memory_order_acq_rel);
+		}
+	}
+}
+
+// refcount > 0 이면 어떤 필터든 게임 모드. OCR 워커 등에서 무거운 작업
+// skip 분기에 사용. lock-free atomic load — 매 프레임 호출 안전.
+extern "C" bool sc_any_filter_in_game_mode()
+{
+	return g_gameMode_RefCount.load(std::memory_order_acquire) > 0;
+}
+
+// [T03] Tier 1 빌트인 게임 리스트 검사. case-insensitive basename 매칭.
+// nullptr/빈 문자열 안전.
+extern "C" bool sc_is_known_game(const wchar_t *exe_name)
+{
+	if (!exe_name || !exe_name[0])
+		return false;
+	for (size_t i = 0; i < securecast::kKnownGameExesCount; ++i) {
+		if (iequals(securecast::kKnownGameExes[i], exe_name))
+			return true;
+	}
+	return false;
+}
+
+// [T03] Tier 1 + Tier 3 통합 검사. 게임 모드 trigger / fg 제외 판정에 사용.
+extern "C" bool sc_is_known_game_or_user_game(const wchar_t *exe_name)
+{
+	if (!exe_name || !exe_name[0])
+		return false;
+	if (sc_is_known_game(exe_name))
+		return true;
+	std::lock_guard<std::mutex> lock(g_userGameListMutex);
+	for (const auto &entry : g_userGameList) {
+		if (iequals(entry.c_str(), exe_name))
+			return true;
+	}
+	return false;
+}
+
+// [T03] Tier 3 사용자 등록 게임 리스트 갱신. settings update 콜백에서 1회 호출.
+// nullptr/빈 entry는 자동 skip.
+extern "C" void sc_set_user_game_list(const wchar_t *const *exes, int count)
+{
+	std::lock_guard<std::mutex> lock(g_userGameListMutex);
+	g_userGameList.clear();
+	if (!exes || count <= 0)
+		return;
+	g_userGameList.reserve(static_cast<size_t>(count));
+	for (int i = 0; i < count; ++i) {
+		if (exes[i] && exes[i][0])
+			g_userGameList.emplace_back(exes[i]);
+	}
+}
+
+// 빌트인 친화명 매핑에서 exe 검색. 매칭되면 out_buf에 복사 후 true.
+extern "C" bool sc_lookup_friendly_name(const wchar_t *exe_name,
+                                          wchar_t *out_buf, size_t out_cap)
+{
+	if (!exe_name || !exe_name[0] || !out_buf || out_cap == 0)
+		return false;
+	for (size_t i = 0; i < securecast::kKnownExeNamesCount; ++i) {
+		const auto &entry = securecast::kKnownExeNames[i];
+		if (iequals(entry.exe, exe_name)) {
+			size_t n = 0;
+			while (entry.name[n] && n + 1 < out_cap) {
+				out_buf[n] = entry.name[n];
+				++n;
+			}
+			out_buf[n] = 0;
+			return true;
+		}
+	}
+	return false;
 }
 
 extern "C" bool sc_get_hwnd_exe_name(HWND hwnd, wchar_t *out, size_t out_cap)

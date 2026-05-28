@@ -148,7 +148,36 @@ void sc_set_user_blacklist_game_mode(const wchar_t *const *exes, int count);
 
 // 어느 필터든 게임 모드면 true → sc_is_blacklisted_exe가 자동으로
 // game-mode-extra까지 검사. 필터의 game mode enter/exit에서 호출.
+// 다중 필터 인스턴스 안전: 내부적으로 refcount(atomic int)로 관리되며,
+// active=true는 fetch_add(+1), false는 fetch_sub(-1) + underflow 가드.
+// 같은 필터가 ON/OFF를 짝지어 호출해야 하며, 마지막 OFF가 들어와야
+// 글로벌이 비활성화된다.
 void sc_set_global_game_mode(bool active);
+
+// 어느 필터든 게임 모드 활성 상태인지 즉시 조회. refcount > 0 이면 true.
+// OCR 워커 등 다른 모듈이 게임 모드 동안 무거운 작업을 skip할 때 사용.
+bool sc_any_filter_in_game_mode();
+
+// =============================================================================
+// Tier 1/3 게임 식별 (Game mode v2 — T03)
+//
+// 게임 모드 진입 trigger와 fg 자동 가림 제외 판정에 함께 사용:
+//   - sc_is_known_game             : 빌트인 정적 리스트(known_games.h) 검사
+//   - sc_is_known_game_or_user_game: 빌트인 + 사용자 등록(Tier 3) 통합 검사
+//   - sc_set_user_game_list        : 사용자가 OBS 설정에서 등록한 게임 exe 갱신
+//
+// 매칭은 모두 case-insensitive (iequals). exe basename 비교.
+// =============================================================================
+bool sc_is_known_game(const wchar_t *exe_name);
+bool sc_is_known_game_or_user_game(const wchar_t *exe_name);
+void sc_set_user_game_list(const wchar_t *const *exes, int count);
+
+// 빌트인 친화명 매핑(known_games.h::kKnownExeNames)에서 exe 검색.
+// 매칭되면 out_buf에 친화명 복사 후 true. 미매칭이면 false / out_buf 미변경.
+// 시스템 enum이 잡지 못하는 백그라운드 서비스(vgc.exe = Riot Vanguard 등)
+// 친화명을 즉시 제공하기 위함.
+bool sc_lookup_friendly_name(const wchar_t *exe_name, wchar_t *out_buf,
+                              size_t out_cap);
 
 // 주어진 HWND의 owner process exe 이름을 base name으로 추출.
 // 성공 시 true 반환. out 버퍼는 wchar 단위 크기.

@@ -223,6 +223,25 @@ if(WIN32)
     PRIVATE
       src/window_tracker.cpp      # Role A: 블랙리스트 앱 좌표 스캐너
       src/window_tracker.h
+      src/known_games.h           # Game mode v2 / T03: Tier 1 빌트인 게임 exe 리스트
+      src/steam_parser.cpp        # Game mode v2 / T04: Valve VDF/ACF 파서 (T06 Steam enum 기반)
+      src/steam_parser.h
+      src/game_sources/common.cpp # Game mode v2 / T09: source enum 공용 헬퍼
+      src/game_sources/common.h
+      src/game_sources/steam.cpp  # Game mode v2 / T06: Steam 라이브러리 게임 enum
+      src/game_sources/steam.h
+      src/game_sources/epic.cpp   # Game mode v2 / T09a: Epic Games Launcher
+      src/game_sources/epic.h
+      src/game_sources/battlenet.cpp # Game mode v2 / T09b: Blizzard Battle.net
+      src/game_sources/battlenet.h
+      src/game_sources/riot.cpp   # Game mode v2 / T09c: Riot (LoL/Valorant/TFT)
+      src/game_sources/riot.h
+      src/game_sources/uwp.cpp    # Game mode v2 / T09d: UWP / MS Store
+      src/game_sources/uwp.h
+      src/game_sources/gamebar.cpp     # Game mode v2 / T09e: Xbox Game Bar
+      src/game_sources/gamebar.h
+      src/game_sources/installed_programs.cpp # Game mode v2 / T09f: Uninstall 휴리스틱
+      src/game_sources/installed_programs.h
       src/win_event_listener.cpp  # Role A: SetWinEventHook push 감지
       src/win_event_listener.h
       src/scroll_motion_hook.cpp  # 글로벌 휠/키 hook (스크롤 모션 인과 신호)

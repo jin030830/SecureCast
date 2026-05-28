@@ -52,8 +52,9 @@ public:
     // 윈도우 파괴 및 메시지 루프 스레드 종료
     void destroy();
 
-    // 보안 상태 갱신 — 임의 스레드에서 호출 가능
-    void setState(SecurityState state);
+    // 보안 상태 갱신 — 임의 스레드에서 호출 가능. gameMode=true면 우측에
+    // 보라색 "GAME" 배지가 추가 표시된다.
+    void setState(SecurityState state, bool gameMode);
 
     bool isCreated() const { return m_hwnd != NULL; }
 
@@ -65,8 +66,9 @@ private:
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg,
                                      WPARAM wParam, LPARAM lParam);
 
-    // 배지를 그리는 GDI 헬퍼 (WM_PAINT 내부에서 호출)
-    static void paintBadge(HWND hwnd, SecurityState state);
+    // 배지를 그리는 GDI 헬퍼 (WM_PAINT 내부에서 호출).
+    // gameMode=true면 본 배지 우측에 보라색 "GAME" 인디케이터 부착.
+    static void paintBadge(HWND hwnd, SecurityState state, bool gameMode);
 
     // ---- 멤버 ----
     HWND               m_hwnd    = NULL;
@@ -76,12 +78,16 @@ private:
     // SecurityState를 int로 저장 (atomic 지원을 위해)
     std::atomic<int>   m_state{static_cast<int>(SecurityState::SAFE)};
 
+    // [T11] 게임 모드 활성 여부. WM_SC_STATE 메시지의 lParam으로 전달됨.
+    std::atomic<bool>  m_gameMode{false};
+
     // 윈도우 클래스 이름 (인스턴스마다 고유)
     static constexpr wchar_t kClassName[] = L"SecureCastOverlayV1";
 
-    // 배지 크기 (픽셀)
-    static constexpr int kWidth  = 200;
-    static constexpr int kHeight =  48;
+    // 배지 크기 (픽셀). 게임 배지 영역을 위해 폭을 확장.
+    static constexpr int kWidth      = 260;  // 200 → 260 (게임 배지 ~60px)
+    static constexpr int kHeight     =  48;
+    static constexpr int kGameBadgeW =  60;  // 우측 게임 배지 폭
 
     // WDA_EXCLUDEFROMCAPTURE 지원 여부 (create()에서 판단, messageLoop()에서 사용)
     bool               m_useExcludeFromCapture{false};

@@ -55,6 +55,10 @@ static constexpr COLORREF kBarPartial   = RGB(240, 200,   0);  // CAUTION: 노�
 static constexpr COLORREF kBarRisk      = RGB(220,  40,  40);  // RISK  : 빨강
 static constexpr COLORREF kBadgeBg      = RGB(20,  20,  20);   // 배지 배경 (어두운 회색)
 static constexpr COLORREF kTextColor    = RGB(255, 255, 255);  // 흰 텍스트
+// [T11] 게임 모드 인디케이터 (우측). 보라색은 SAFE/CAUTION/RISK 어느 것과도
+// 시각적으로 안 겹쳐 한눈에 "지금 게임 모드"라고 인지된다.
+static constexpr COLORREF kGameBadgeBg  = RGB(120,  40, 200);  // 보라
+static constexpr COLORREF kGameTextColor = RGB(255, 255, 255);
 
 // ---- 레이아웃 상수 ----
 static constexpr int kBarWidth = 10;   // 왼쪽 색상 바 너비(px)
@@ -90,15 +94,19 @@ LRESULT CALLBACK OverlayWindow::WndProc(HWND hwnd, UINT msg,
     // ------------------------------------------------------------------
     case WM_PAINT: {
         SecurityState state = static_cast<SecurityState>(self->m_state.load());
-        paintBadge(hwnd, state);
+        bool gameMode = self->m_gameMode.load();
+        paintBadge(hwnd, state, gameMode);
         return 0;
     }
 
     // ------------------------------------------------------------------
     // WM_SC_STATE: setState() 에서 전달하는 상태 변경 메시지
+    //   wParam = SecurityState as int
+    //   lParam = gameMode as bool (0/1)
     // ------------------------------------------------------------------
     case WM_APP + 0: {
         self->m_state.store(static_cast<int>(wParam));
+        self->m_gameMode.store(lParam != 0);
         InvalidateRect(hwnd, nullptr, FALSE);  // 다음 메시지 루프에서 WM_PAINT 발생
         return 0;
     }
@@ -116,7 +124,7 @@ LRESULT CALLBACK OverlayWindow::WndProc(HWND hwnd, UINT msg,
 // paintBadge — GDI 배지 렌더링
 //   레이아웃: [■ colorBar(10px) | 배지 배경 | 텍스트 "SECURECAST  SAFE"]
 // =============================================================================
-void OverlayWindow::paintBadge(HWND hwnd, SecurityState state)
+void OverlayWindow::paintBadge(HWND hwnd, SecurityState state, bool gameMode)
 {
     PAINTSTRUCT ps;
     HDC hdc = BeginPaint(hwnd, &ps);
@@ -126,13 +134,16 @@ void OverlayWindow::paintBadge(HWND hwnd, SecurityState state)
     int w = rc.right;
     int h = rc.bottom;
 
+    // [T11] 본 배지 영역(좌측). gameMode면 우측 kGameBadgeW만큼 양보.
+    const int mainW = gameMode ? (w - kGameBadgeW) : w;
+
     // --- 1. 전체 배경을 colorkey 색으로 채움 (투명 영역) ---
     HBRUSH bgBrush = CreateSolidBrush(kBgColor);
     FillRect(hdc, &rc, bgBrush);
     DeleteObject(bgBrush);
 
-    // --- 2. 배지 배경 (어두운 회색) ---
-    RECT badgeRect = {0, 0, w, h};
+    // --- 2. 본 배지 배경 (어두운 회색) ---
+    RECT badgeRect = {0, 0, mainW, h};
     HBRUSH badgeBrush = CreateSolidBrush(kBadgeBg);
     FillRect(hdc, &badgeRect, badgeBrush);
     DeleteObject(badgeBrush);
@@ -162,7 +173,6 @@ void OverlayWindow::paintBadge(HWND hwnd, SecurityState state)
 
     // --- 4. 텍스트 "SecureCast  <STATE>" ---
     SetBkMode(hdc, TRANSPARENT);
-    SetTextColor(hdc, kTextColor);
 
     // 첫 줄: "SecureCast" (작은 회색)
     SetTextColor(hdc, RGB(160, 160, 160));
@@ -172,8 +182,9 @@ void OverlayWindow::paintBadge(HWND hwnd, SecurityState state)
         CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
     HFONT oldFont = static_cast<HFONT>(SelectObject(hdc, smallFont));
 
-    RECT labelRect = {kBarWidth + kMargin, 4, w - 4, h / 2};
-    DrawText(hdc, L"SecureCast", -1, &labelRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    RECT labelRect = {kBarWidth + kMargin, 4, mainW - 4, h / 2};
+    DrawText(hdc, L"SecureCast", -1, &labelRect,
+             DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
     // 두 번째 줄: 상태 텍스트 (굵은 흰색)
     HFONT boldFont = CreateFont(
@@ -183,8 +194,22 @@ void OverlayWindow::paintBadge(HWND hwnd, SecurityState state)
     SelectObject(hdc, boldFont);
     SetTextColor(hdc, kTextColor);
 
-    RECT stateRect = {kBarWidth + kMargin, h / 2, w - 4, h - 4};
-    DrawText(hdc, stateText, -1, &stateRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    RECT stateRect = {kBarWidth + kMargin, h / 2, mainW - 4, h - 4};
+    DrawText(hdc, stateText, -1, &stateRect,
+             DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    // --- 5. [T11] 게임 모드 배지 (우측) ---
+    if (gameMode) {
+        RECT gameRect = {mainW, 0, w, h};
+        HBRUSH gameBrush = CreateSolidBrush(kGameBadgeBg);
+        FillRect(hdc, &gameRect, gameBrush);
+        DeleteObject(gameBrush);
+
+        SetTextColor(hdc, kGameTextColor);
+        // "GAME" 텍스트 (굵은 흰색) — 본 배지의 굵은 폰트 재사용.
+        DrawText(hdc, L"GAME", -1, &gameRect,
+                 DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
 
     // 폰트 정리
     SelectObject(hdc, oldFont);
@@ -335,14 +360,15 @@ void OverlayWindow::destroy()
 // =============================================================================
 // setState — 임의 스레드에서 상태 갱신 (PostMessage로 UI 스레드에 전달)
 // =============================================================================
-void OverlayWindow::setState(SecurityState state)
+void OverlayWindow::setState(SecurityState state, bool gameMode)
 {
     if (!m_hwnd)
         return;
 
-    // PostMessage는 thread-safe — 메시지 큐에 비동기로 전달
-    PostMessage(m_hwnd, WM_SC_STATE,
-                static_cast<WPARAM>(state), 0);
+    // PostMessage는 thread-safe — 메시지 큐에 비동기로 전달.
+    // wParam = SecurityState, lParam = gameMode (0/1).
+    PostMessage(m_hwnd, WM_SC_STATE, static_cast<WPARAM>(state),
+                static_cast<LPARAM>(gameMode ? 1 : 0));
 }
 
 #endif // _WIN32

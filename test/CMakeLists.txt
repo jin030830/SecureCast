@@ -99,3 +99,25 @@ add_test(
     COMMAND test_tracker
     WORKING_DIRECTORY "$<TARGET_FILE_DIR:test_tracker>"
 )
+
+# ──────────────────────────────────────────────
+# [T15] test_steam_parser: Valve VDF/ACF 파서 단위 테스트
+# ──────────────────────────────────────────────
+add_executable(test_steam_parser
+    test_steam_parser.cpp
+    obs_stub.cpp
+    ../src/steam_parser.cpp
+)
+
+target_compile_features(test_steam_parser PRIVATE cxx_std_17)
+
+# steam_parser.cpp 가 <obs.h> 를 include (blog 사용) → OBS SDK 헤더 경로 필요.
+# 런타임 라이브러리는 링크 안 함 — blog 심볼은 obs_stub.cpp 가 정의.
+target_include_directories(test_steam_parser PRIVATE
+    $<TARGET_PROPERTY:OBS::libobs,INTERFACE_INCLUDE_DIRECTORIES>)
+
+add_test(
+    NAME steam_parser
+    COMMAND test_steam_parser
+    WORKING_DIRECTORY "$<TARGET_FILE_DIR:test_steam_parser>"
+)

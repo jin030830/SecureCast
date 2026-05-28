@@ -22,6 +22,7 @@
 #include <unordered_set>
 #include <atomic>
 #include <condition_variable>
+#include <deque>
 #include <functional>
 #include <mutex>
 #include <stdint.h>
@@ -213,21 +214,34 @@ struct SecureCastFilter {
   std::atomic<bool> isGameMode{
       false}; // CPU 임계값 기반 자동 전환 (render/tick 크로스 스레드)
 
-  // ----- [Game Mode 세션 화이트리스트] -----
-  // 게임 모드 ON 동안: OCR 중단 + foreground 변화 시 게임 외 모든 앱 자동 블러
-  // + dialog로 사용자 허용 받음. 사용자 OK → 세션 화이트리스트 추가 → 그 앱은
-  // 이 세션 동안 블러 안 함. 게임 모드 OFF 시 화이트리스트 폐기.
+  // ----- [Game Mode v2] -----
+  // 게임 모드 ON 동안: OCR 완전 정지 (T01) + 게임/whitelist 외 fg 앱 silent
+  // blur (T02). dialog 없음. 게임 식별은 진입 시점 fg를 캡처하는 방식이며,
+  // 캡처 실패 시 gameModeGameExe는 비어있고 자동 블러는 안전하게 비활성된다.
   std::mutex gameModeMutex;
-  // 게임 모드 진입 시 캡처한 게임 프로세스 exe (이 exe는 블러 안 함)
+  // 게임 모드 진입 시 캡처한 게임 프로세스 exe (이 exe는 블러 안 함).
+  // 비어있으면 fg 자동 블러 비활성 — render-side empty 가드 참조.
   std::wstring gameModeGameExe;
-  // 사용자 허용 받은 exe 목록 (lower-case)
-  std::unordered_set<std::wstring> gameModeWhitelist;
-  // dialog 중복 방지: dialog 중이거나 응답받은 exe (lower-case)
-  std::unordered_set<std::wstring> gameModeDialogPromptedExes;
-  // 직전 폴링 시 foreground HWND (변화 감지용)
-  std::atomic<void *> gameModeLastFg{nullptr};
-  // 설정: 블랙리스트 exe도 dialog로 물어볼지 여부 (기본 false = 항상 블러, 안 물음)
-  std::atomic<bool> gameModeAskForBlacklist{false};
+
+  // ----- [Game Mode v2 — T07] Properties UI에서 조정 가능한 trigger 파라미터.
+  // settingsMutex 보호. video_tick이 매 사이클 atomic read 안 해도 되도록 plain
+  // int/bool — 값 변경은 securecast_update가 settingsMutex 안에서 수행.
+  bool gameModeAutoEnter = true; // false면 Primary/Secondary 둘 다 비활성
+  int gameModeCpuThreshold = 40; // Secondary 진입 임계값 (%)
+  int gameModeEnterSeconds = 3;  // 진입 hysteresis (초)
+  int gameModeExitSeconds = 5;   // 해제 hysteresis (초, CPU ≤ exit 임계값에서)
+
+  // [Game Mode v2 — T13] 최근 자동 블러된 fg 앱들의 ring buffer.
+  // 사용자가 "어떤 앱들이 가려졌는지 확인 후 화이트리스트에 추가할지 결정"하는
+  // 용도. render 스레드에서 push, GUI 스레드(get_properties)에서 snapshot.
+  struct RecentBlurredApp {
+    std::wstring exe;
+    std::wstring window_title;
+    uint64_t timestamp_ms; // GetTickCount64() 기준
+  };
+  static constexpr size_t kMaxRecentBlurred = 10;
+  std::mutex recentBlurredMutex;
+  std::deque<RecentBlurredApp> recentBlurredApps;
   SecurityState currentState =
       SecurityState::SAFE; // 현재 보안 등급 (SAFE/PARTIAL/RISK)
 
@@ -320,6 +334,10 @@ struct SecureCastFilter {
   // ----- [Role D] 수동 드래그 블러 선택 오버레이 -----
   SelectionOverlay selectionOverlay;
   obs_hotkey_id selectHotkeyId = OBS_INVALID_HOTKEY_ID;
+
+  // [T12] 블랙리스트/화이트리스트 UI 핫키 (기본 Ctrl+Shift+L) — 게임 모드
+  // 중에도 사용자가 빠르게 차단 앱/허용 앱을 편집할 수 있도록.
+  obs_hotkey_id blacklistUiHotkeyId = OBS_INVALID_HOTKEY_ID;
 #endif
 
   // ----- [Role D] 알림 영역 자동 블러 -----
