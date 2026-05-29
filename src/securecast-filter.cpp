@@ -2690,9 +2690,10 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
   //           서브 사각형으로 쪼개질 수 있으므로 windowSnapshot×2와 lingering에
   //           sub-rect 계수를 곱한다.
   // MAX_TRACKERS는 VisualTrackerManager 클래스 static 상수이므로
-  // securecast-filter.cpp에서는 직접 사용 불가. 실제 값(8)을 리터럴로 대체.
+  // securecast-filter.cpp에서는 직접 사용 불가. 실제 값을 리터럴로 미러링한다.
+  // ★ VisualTrackerManager::MAX_TRACKERS와 반드시 동일하게 유지(#6: 8→24).
   // x2: 슬롯의 N프레임 전 snap + 현재 snap 둘 다 사용 (anim 지연 보정).
-  static constexpr int kMaxTrackerSlots = 8;
+  static constexpr int kMaxTrackerSlots = 24;
   BlurRect all_rects[SC_MAX_BLUR_RECTS * 2 +
                      SC_MAX_TRACKED_WINDOWS * SC_MAX_VISIBLE_SUBRECTS * 2 +
                      SC_MAX_LINGERING * SC_MAX_VISIBLE_SUBRECTS +

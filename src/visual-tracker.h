@@ -55,8 +55,12 @@ public:
       250; // lastScore <  SCORE_OK 일 때 반경 (P0-A: 60→250, 빠른 이동 대응)
 
   // P0-2: ghost-kill 상한
+  // [#6] 8 → 24: 다수 PII(폼/목록에서 10~20개 이상)가 동시에 보일 때 8개만
+  // 추적돼 나머지가 노출되던 문제 해결(계측: OCR 19~21 검출, 트래커 8 캡).
+  // 트래커당 NCC(30Hz)/owner DWM 조회 비용이 늘므로 관측 최대(21)+여유로 24.
+  // securecast-filter.cpp의 all_rects 사이징 kMaxTrackerSlots도 동일하게 유지.
   static constexpr int MAX_TRACKERS =
-      8; // 동시 트래커 최대 수 (초과 시 신규 등록 거부)
+      24; // 동시 트래커 최대 수 (초과 시 가장 stale한 트래커 evict)
   static constexpr int HARD_EXPIRY =
       30; // OCR 미확인 시 최대 수명 (30 cycles ≈ 1s @ 30Hz)
   // 1-A / 3-A: 동시성·안정성
