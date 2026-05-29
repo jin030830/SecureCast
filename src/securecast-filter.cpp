@@ -347,6 +347,45 @@ static void render_solid_black_frame(uint32_t w, uint32_t h) {
     gs_draw_sprite(nullptr, 0, w, h);
 }
 
+// [Freeze T03] "분석 중" 인디케이터.
+// freeze(프레임 멈춤) 분기에서만 호출. 화면 좌상단에 노란 점을 그려
+// 스트리머·시청자에게 "화면이 멈춘 건 SecureCast가 새 화면을 분석 중이라
+// 의도된 동작"임을 알린다 (Q3). isSafeToRender 통과 시에는 호출되지 않으므로
+// freeze가 끝나면 점은 자동으로 사라진다.
+//
+// 크기는 캔버스 폭에 비례(최소 16px)해 4K에서도 보이게 하고, 밝은 배경에서도
+// 대비가 확보되도록 어두운 외곽선을 먼저 깐다. 좌표계는 video_render의 소스
+// 픽셀 공간(좌상단 원점)이라 translate (margin,margin)이 좌상단을 가리킨다.
+static void render_analyzing_indicator(uint32_t w, uint32_t h) {
+  (void)h;
+  const float sz = std::max(16.0f, (float)w / 80.0f); // 1080p≈24px, 4K≈48px
+  const float margin = std::max(8.0f, sz * 0.5f);
+  const float border = std::max(2.0f, sz * 0.15f);
+
+  gs_effect_t *solid = obs_get_base_effect(OBS_EFFECT_SOLID);
+  gs_eparam_t *colorParam = gs_effect_get_param_by_name(solid, "color");
+
+  // 1) 어두운 반투명 외곽선 (밝은 배경 대비 확보)
+  gs_effect_set_color(colorParam, 0xCC000000);
+  while (gs_effect_loop(solid, "Solid")) {
+    gs_matrix_push();
+    gs_matrix_identity();
+    gs_matrix_translate3f(margin - border, margin - border, 0.0f);
+    gs_draw_sprite(nullptr, 0, (uint32_t)(sz + border * 2.0f),
+                   (uint32_t)(sz + border * 2.0f));
+    gs_matrix_pop();
+  }
+  // 2) 노란 사각형 (0xAABBGGRR → 0xFF00FFFF = 불투명 노랑)
+  gs_effect_set_color(colorParam, 0xFF00FFFF);
+  while (gs_effect_loop(solid, "Solid")) {
+    gs_matrix_push();
+    gs_matrix_identity();
+    gs_matrix_translate3f(margin, margin, 0.0f);
+    gs_draw_sprite(nullptr, 0, (uint32_t)sz, (uint32_t)sz);
+    gs_matrix_pop();
+  }
+}
+
 static void draw_texture_full_frame(gs_texture_t *tex, uint32_t w, uint32_t h) {
   if (!tex)
     return;
@@ -1190,8 +1229,28 @@ static void ocr_worker_loop(SecureCastFilter *filter) {
     //   downscale 차단(min 1.0×)으로 progression 차단.
     // 첫 사이클(avgH=0): 무조건 2× 업스케일 (1440p+ fallback 0.5×도 제거).
     constexpr float kOcrTargetH = 16.0f; // Windows.Media.Ocr 최적 구간 중간값
-    constexpr float kScaleMin = 1.0f;    // 0.5 → 1.0 (다운스케일 차단)
     constexpr float kScaleMax = 2.5f;
+    // [Freeze T06] 다운스케일 하한을 사용자 정책으로 결정. 1.0f면 다운스케일
+    // 금지(작은 글씨 우선), 0.5f면 0.5× 다운 허용(빠름). default는 금지(1.0f) —
+    // 표/작은 데이터 행 누락 회귀 방지.
+    // ★ 중요: 아래 다운스케일 적용 경로는 0.5× 고정(width/2, SIMD)만 지원하고
+    //   좌표 복원이 0.5× 전제(coordScale=1/adaptScale=2.0)다. 따라서 하한은
+    //   0.5f 또는 1.0f만 의미가 있다 — 0.7f 같은 중간값은 0.5× 다운되면서 좌표만
+    //   1.43×로 복원돼 블러가 어긋난다. AutoByResolution도 0.5/1.0 둘 중 하나만 사용.
+    float kScaleMin;
+    switch (filter->adaptScaleMode.load(std::memory_order_relaxed)) {
+    case AdaptScaleMode::AllowDownscale:
+      kScaleMin = 0.5f;
+      break;
+    case AdaptScaleMode::AutoByResolution:
+      // 1440p(2560)+ 에서만 0.5× 다운 허용, 1080p 이하는 금지.
+      kScaleMin = (width >= 2560) ? 0.5f : 1.0f;
+      break;
+    case AdaptScaleMode::NoDownscale:
+    default:
+      kScaleMin = 1.0f;
+      break;
+    }
     const float avgLineH =
         filter->ocrEngine ? filter->ocrEngine->averageLineHeight() : 0.0f;
 
@@ -1202,6 +1261,13 @@ static void ocr_worker_loop(SecureCastFilter *filter) {
     } else {
       adaptScale = 2.0f; // 첫 사이클 fallback: 항상 2× 업
     }
+
+    // [Freeze T06] 다운스케일 적용 경로는 0.5× 고정만 지원하고 좌표 복원이
+    // coordScale=1/adaptScale 이므로 adaptScale이 정확히 0.5가 아니면 좌표가
+    // 어긋난다. 다운스케일 영역([min,1.0))의 어떤 값이든 0.5로 snap해 좌표 정합을
+    // 보장한다 (downscale은 어차피 0.5× 한 종류뿐).
+    if (adaptScale < 1.0f)
+      adaptScale = 0.5f;
 
     // 스케일 적용 (0.5× 다운 or 2× 업만 SIMD; 그 외 스칼라 bilinear)
     std::vector<uint8_t> scaledBuf;
@@ -1430,6 +1496,17 @@ static void ocr_worker_loop(SecureCastFilter *filter) {
            filter->lastLoggedOcrCount, boxCount);
       filter->lastLoggedOcrCount = boxCount;
     }
+
+    // [Freeze T02] Smart Backfill — 박스 수가 직전 사이클보다 늘면 새 PII가
+    // 등장한 것으로 보고 flag를 세운다. 렌더 스레드의 backfill 분기가 모드에
+    // 따라 이를 소비한다 (균형/최대보안에서만). 박스 수 감소·동일은 새 노출
+    // 위험이 없으므로 무시. (한계: 한 PII 사라지고 다른 PII가 동시 등장해
+    // 카운트가 유지되는 드문 경우는 감지 못 함 — 단, 균형 모드의 게이트 마진
+    // 안에서 다음 사이클에 재검출되어 보정됨.)
+    if (boxCount > filter->lastOcrBoxCount) {
+      filter->newPiiDetectedFlag.store(true, std::memory_order_release);
+    }
+    filter->lastOcrBoxCount = boxCount;
 
     // 이 프레임은 OCR + tracker registration까지 완료됨. 렌더 스레드가
     // 같은 frameId를 가진 ring-buffer slot에 완료 표시를 붙이고, 완료되지
@@ -2323,14 +2400,35 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
       // analysisSlot은 방금 제출되었으므로, 자신을 대표 ID로 삼음 (const cast 필요)
       const_cast<FrameRingBuffer::Slot *>(analysisSlot)->dependentOcrFrameId =
           analysisSlot->frameId;
-      // [Backfill — 빈도 1/4]
-      // 매 OCR claim마다 backfill을 호출하면 링 내 모든 슬롯 dependent가
-      // 최신 OCR frameId로 끌어올려져 freeze가 자주 발생.
-      // 4번에 1번만 발동 → 새 PII 보호는 유지하되 freeze 빈도 1/4로 감소.
-      // 사이 3번은 pushFrame이 박은 dependent=lastSubmitted로 자연스럽게
-      // 게이트 통과 (정상 운영 시).
-      if (++filter->ocrBackfillCounter_ >= 4) {
-        filter->ocrBackfillCounter_ = 0;
+      // [Freeze T02] Smart Backfill — 보호 강도 모드에 따라 backfill 정책 분기.
+      // backfill은 링 내 기존 슬롯들의 dependent를 최신 OCR로 끌어올려, 그
+      // OCR이 완료될 때까지 freeze시킨다. 자주 호출할수록 새 PII 보호는 강해
+      // 지지만 freeze가 늘어난다.
+      //   최대 보안: 4사이클 주기 + 새 PII 검출 시 즉시 (둘 다)
+      //   균형     : 새 PII 검출 시만 (A2-b) — 정적 화면에선 freeze 거의 0
+      //   부드러움 : 비활성 — backfill 0회
+      const bool newPii =
+          filter->newPiiDetectedFlag.exchange(false, std::memory_order_acq_rel);
+      bool shouldBackfill = false;
+      switch (filter->protectionMode.load(std::memory_order_relaxed)) {
+      case PiiProtectionMode::MaxSecurity:
+        if (++filter->ocrBackfillCounter_ >= 4) {
+          filter->ocrBackfillCounter_ = 0;
+          shouldBackfill = true;
+        }
+        if (newPii)
+          shouldBackfill = true;
+        break;
+      case PiiProtectionMode::Balanced:
+        if (newPii)
+          shouldBackfill = true;
+        break;
+      case PiiProtectionMode::Smooth:
+      default:
+        // 비활성 — freeze를 사실상 0으로.
+        break;
+      }
+      if (shouldBackfill) {
         filter->ringBuffer.backfillDependentOcr(analysisSlot->frameId);
       }
     } else {
@@ -2470,16 +2568,69 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
   // 완료되지 않았다면 원본 송출 금지. 마스크까지 합성해둔 마지막 안전 출력 프레임을 재송출(Freeze)한다.
   uint64_t safeWatermarkId = filter->lastCompletedOcrFrameId.load(std::memory_order_acquire);
   uint64_t delayedId = delayedSlot ? delayedSlot->frameId : 0;
-  // 게이트 +2 마진: OCR이 2프레임(≈33ms@60fps) 늦어도 통과 허용.
-  // 60fps 환경에서 OCR 완료 ~ render의 watermark 갱신 사이 1~2프레임 race가
-  // 발생해 4프레임 차이만으로도 freeze 진입하던 문제를 완화. 노출 시간은
-  // 최대 33ms(2프레임)로 제한되어 체감 노출은 거의 없음.
-  static constexpr uint64_t kGateMarginFrames = 2;
+  // [Freeze T01] 게이트 마진을 사용자 보호 강도 모드로 동적 결정.
+  // 마진이 클수록 OCR이 늦어도 통과를 허용 → freeze 감소, 대신 새 PII의
+  // 순간 노출 시간 증가 (60fps 기준 1프레임 ≈ 16.6ms).
+  //   MaxSecurity +0  : 노출 0, freeze 자주
+  //   Balanced    +10 : 노출 최대 ~166ms (default)
+  //   Smooth      +30 : 노출 최대 ~500ms
+  // (기존 고정 +2 마진은 watermark 갱신 race 완화용이었으나, 모드별 마진이
+  //  이를 모두 포함한다 — 최소 모드인 MaxSecurity도 엄격(+0)을 의도함.)
+  uint64_t gateMargin;
+  switch (filter->protectionMode.load(std::memory_order_relaxed)) {
+  case PiiProtectionMode::MaxSecurity:
+    gateMargin = 0;
+    break;
+  case PiiProtectionMode::Smooth:
+    gateMargin = 30;
+    break;
+  case PiiProtectionMode::Balanced:
+  default:
+    gateMargin = 10;
+    break;
+  }
   bool isSafeToRender = (safeWatermarkId > 0) && delayedSlot &&
                         (delayedSlot->dependentOcrFrameId <=
-                         safeWatermarkId + kGateMarginFrames);
+                         safeWatermarkId + gateMargin);
+
+  // [Freeze T07] freeze 진단. obs 프레임 시계(ns)를 ms로. freeze 여부와 무관하게
+  // 매 프레임 1분 통계 창을 점검해 요약을 주기 출력한다 (T01~T03 효과 측정용).
+  const uint64_t nowMsT07 = obs_get_video_frame_time() / 1000000ULL;
+  if (filter->statsWindowStartMs == 0)
+    filter->statsWindowStartMs = nowMsT07;
+  if (nowMsT07 - filter->statsWindowStartMs >= 60000ULL) {
+    const double avgMs =
+        filter->statsFreezeEvents > 0
+            ? (double)filter->statsFreezeDurTotalMs / filter->statsFreezeEvents
+            : 0.0;
+    blog(LOG_INFO,
+         "[SecureCast][freeze-stats] 지난 60s: freeze %d회, 누적 %llu프레임, "
+         "평균 %.0fms, 최대 %llums (mode=%d)",
+         filter->statsFreezeEvents,
+         (unsigned long long)filter->statsFreezeFramesTotal, avgMs,
+         (unsigned long long)filter->statsFreezeDurMaxMs,
+         (int)filter->protectionMode.load(std::memory_order_relaxed));
+    filter->statsFreezeEvents = 0;
+    filter->statsFreezeFramesTotal = 0;
+    filter->statsFreezeDurTotalMs = 0;
+    filter->statsFreezeDurMaxMs = 0;
+    filter->statsWindowStartMs = nowMsT07;
+  }
 
   if (!delayedSlot || !delayedSlot->getTexture() || !isSafeToRender) {
+    // [Freeze T07] freeze 시작/지속 추적. count가 0→1이면 시작 시각 기록.
+    if (filter->freezeFrameCount == 0)
+      filter->freezeStartMs = nowMsT07;
+    filter->freezeFrameCount++;
+    if (filter->freezeFrameCount % 60 == 0) { // 1초마다 경고
+      blog(LOG_WARNING,
+           "[SecureCast][freeze] %ds+ 지속 delayed=%llu dep=%llu watermark=%llu",
+           filter->freezeFrameCount / 60, (unsigned long long)delayedId,
+           (unsigned long long)(delayedSlot ? delayedSlot->dependentOcrFrameId
+                                            : 0),
+           (unsigned long long)safeWatermarkId);
+    }
+
     if (++filter->unverifiedFrameLogCounter >= 60) {
       filter->unverifiedFrameLogCounter = 0;
       blog(LOG_WARNING,
@@ -2489,9 +2640,25 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
     }
     if (!render_last_safe_frame(filter, w, h))
       render_solid_black_frame(w, h);
+    // [Freeze T03] freeze 중임을 알리는 좌상단 노란 점. 안전 프레임 위에
+    // 덧그린다 (이 분기 외에는 호출 안 됨 → freeze 종료 시 자동 소멸).
+    render_analyzing_indicator(w, h);
     return;
   }
   filter->unverifiedFrameLogCounter = 0;
+
+  // [Freeze T07] safe 경로 진입 = 직전 freeze가 끝남. 종료 로그 + 1분 통계 누적.
+  if (filter->freezeFrameCount > 0) {
+    const uint64_t durMs = nowMsT07 - filter->freezeStartMs;
+    blog(LOG_INFO, "[SecureCast][freeze-end] frames=%d duration=%llums",
+         filter->freezeFrameCount, (unsigned long long)durMs);
+    filter->statsFreezeEvents++;
+    filter->statsFreezeFramesTotal += (uint64_t)filter->freezeFrameCount;
+    filter->statsFreezeDurTotalMs += durMs;
+    if (durMs > filter->statsFreezeDurMaxMs)
+      filter->statsFreezeDurMaxMs = durMs;
+    filter->freezeFrameCount = 0;
+  }
 
   const FrameRingBuffer::Slot *outputSlot = delayedSlot;
   gs_texture_t *outputTex = outputSlot->getTexture();
@@ -3187,6 +3354,15 @@ static void securecast_video_tick(void *data, float seconds) {
 // 스코프 외
 #define SC_SETTING_MANUAL_RECTS "sc_manual_rects"
 
+// [Freeze T01] PII 보호 강도 콤보 박스 키 (0=최대 보안, 1=균형, 2=부드러움).
+#define SC_SETTING_PROTECTION_MODE "sc_protection_mode"
+
+// [Freeze T05] sticky 보호 지속 시간(ms) 슬라이더 키.
+#define SC_SETTING_STICKY_MS "sc_sticky_ms"
+
+// [Freeze T06] OCR 입력 다운스케일 정책 콤보 키 (0=금지, 1=허용, 2=자동).
+#define SC_SETTING_ADAPT_SCALE_MODE "sc_adapt_scale_mode"
+
 // [Game mode v2 — T07] Properties UI 키.
 #define SC_SETTING_GM_AUTO_ENTER "sc_gm_auto_enter"
 #define SC_SETTING_GM_CPU_THRESHOLD "sc_gm_cpu_threshold"
@@ -3666,6 +3842,15 @@ static void securecast_get_defaults(obs_data_t *settings) {
   obs_data_set_default_array(settings, SC_SETTING_MANUAL_RECTS, emptyRectArr);
   obs_data_array_release(emptyRectArr);
 
+  // [Freeze T01] PII 보호 강도 기본값 = 균형(1). 기존 사용자 회귀 방지.
+  obs_data_set_default_int(settings, SC_SETTING_PROTECTION_MODE, 1);
+
+  // [Freeze T05] sticky 보호 지속 시간 기본값 = 1500ms (기존 동작 유지).
+  obs_data_set_default_int(settings, SC_SETTING_STICKY_MS, 1500);
+
+  // [Freeze T06] OCR 다운스케일 정책 기본값 = 금지(0, 1.0f). 기존 동작 유지.
+  obs_data_set_default_int(settings, SC_SETTING_ADAPT_SCALE_MODE, 0);
+
   // [Game mode v2 — T07] 사용자 조정 가능한 trigger 파라미터 기본값.
   obs_data_set_default_bool(settings, SC_SETTING_GM_AUTO_ENTER, true);
   obs_data_set_default_int(settings, SC_SETTING_GM_CPU_THRESHOLD, 40);
@@ -3684,6 +3869,56 @@ static void securecast_get_defaults(obs_data_t *settings) {
 
 static obs_properties_t *securecast_get_properties(void *data) {
   obs_properties_t *props = obs_properties_create();
+
+  // ── [Freeze T01] PII 보호 강도 ───────────────────────────────────
+  // freeze(프레임 멈춤) 빈도와 새 PII 순간 노출 위험의 트레이드오프를
+  // 사용자가 직접 선택. 게이트 마진(0/10/30 프레임)으로 환산되어 video_render
+  // 에 즉시 반영된다.
+  obs_property_t *modeList = obs_properties_add_list(
+      props, SC_SETTING_PROTECTION_MODE, "보호 강도",
+      OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+  obs_property_list_add_int(
+      modeList, "최대 보안 (Freeze 자주, 새 PII 노출 0)", 0);
+  obs_property_list_add_int(
+      modeList, "균형 (권장) - 새 PII만 잠시 freeze", 1);
+  obs_property_list_add_int(
+      modeList, "부드러움 우선 (게임/라이브용)", 2);
+  obs_property_set_long_description(
+      modeList,
+      "최대 보안: 분석이 끝난 안전 프레임만 송출 — freeze가 자주 보이지만 새 "
+      "민감정보가 단 한 프레임도 노출되지 않습니다 (금융/의료 시연용).\n"
+      "균형: 새 민감정보가 등장한 직후 ~0.17초까지 노출을 허용하는 대신 freeze "
+      "를 거의 없앱니다 (일반 스트리밍 권장).\n"
+      "부드러움 우선: 최대 ~0.5초 노출을 허용하고 freeze를 사실상 0으로 만듭니다 "
+      "(게임/라이브 방송용).");
+
+  // ── [Freeze T05] Sticky 보호 지속 시간 ───────────────────────────
+  // 창을 이동/리사이즈한 직후, 추적이 완벽히 안정될 때까지 블러를 넉넉히
+  // 유지하는 기간. 길수록 이동 중 노출은 줄지만 멈춘 뒤 블러가 늦게 풀린다.
+  obs_property_t *stickyProp = obs_properties_add_int_slider(
+      props, SC_SETTING_STICKY_MS, "Sticky 보호 지속 시간 (ms)", 200, 3000,
+      100);
+  obs_property_set_long_description(
+      stickyProp,
+      "창을 옮기거나 크기를 바꾼 뒤 블러 보호를 얼마나 더 유지할지 정합니다. "
+      "값이 클수록 이동 중 노출 위험은 줄지만, 창을 멈춘 뒤 블러가 풀리는 데 "
+      "더 오래 걸립니다. 기본 1500ms 권장.");
+
+  // ── [Freeze T06] OCR 입력 다운스케일 정책 ────────────────────────
+  obs_property_t *scaleList = obs_properties_add_list(
+      props, SC_SETTING_ADAPT_SCALE_MODE, "OCR 입력 다운스케일",
+      OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+  obs_property_list_add_int(
+      scaleList, "다운스케일 금지 (작은 글씨 검출 우선, 권장)", 0);
+  obs_property_list_add_int(scaleList, "허용 (큰 글씨 화면에서 빠름)", 1);
+  obs_property_list_add_int(
+      scaleList, "해상도별 자동 (1440p+ 다운, 1080p 금지)", 2);
+  obs_property_set_long_description(
+      scaleList,
+      "OCR에 넣기 전 화면을 줄일지 정합니다. 금지하면 작은 글씨·표 데이터까지 "
+      "잘 잡지만 OCR이 느려질 수 있고, 허용하면 빨라지지만 작은 글씨를 놓칠 수 "
+      "있습니다. '해상도별 자동'은 4K/1440p에서만 줄이고 1080p에선 줄이지 "
+      "않습니다. 기본은 금지(권장).");
 
 #ifdef _WIN32
   // 1) 공유 앱 picker — 시스템 설치 앱 + 실행 중 앱 (친화명 + exe).
@@ -4395,6 +4630,49 @@ static void securecast_update(void *data, obs_data_t *settings) {
     obs_data_array_release(normalArr);
   if (gmArr)
     obs_data_array_release(gmArr);
+
+  // [Freeze T01] PII 보호 강도 → atomic. 범위 밖 값은 Balanced로 clamp.
+  {
+    int rawMode = (int)obs_data_get_int(settings, SC_SETTING_PROTECTION_MODE);
+    PiiProtectionMode mode;
+    switch (rawMode) {
+    case 0:
+      mode = PiiProtectionMode::MaxSecurity;
+      break;
+    case 2:
+      mode = PiiProtectionMode::Smooth;
+      break;
+    case 1:
+    default:
+      mode = PiiProtectionMode::Balanced;
+      break;
+    }
+    filter->protectionMode.store(mode, std::memory_order_relaxed);
+  }
+
+  // [Freeze T05] sticky 보호 지속 시간 → tracker(단일 진실원천). setter가
+  // 200~3000ms로 clamp.
+  filter->trackerMgr.setStickyDurationMs(
+      (int)obs_data_get_int(settings, SC_SETTING_STICKY_MS));
+
+  // [Freeze T06] OCR 다운스케일 정책 → atomic. 범위 밖은 NoDownscale로 clamp.
+  {
+    int rawScale = (int)obs_data_get_int(settings, SC_SETTING_ADAPT_SCALE_MODE);
+    AdaptScaleMode sm;
+    switch (rawScale) {
+    case 1:
+      sm = AdaptScaleMode::AllowDownscale;
+      break;
+    case 2:
+      sm = AdaptScaleMode::AutoByResolution;
+      break;
+    case 0:
+    default:
+      sm = AdaptScaleMode::NoDownscale;
+      break;
+    }
+    filter->adaptScaleMode.store(sm, std::memory_order_relaxed);
+  }
 
   // [Game mode v2 — T07] trigger 파라미터 + Tier 3 게임 목록 + 화이트리스트.
   filter->gameModeAutoEnter =

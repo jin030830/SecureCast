@@ -198,6 +198,39 @@ private:
 };
 
 // ----------------------------------------------------
+// [Freeze T01] PII 보호 강도 모드
+//
+// 사용자가 Properties에서 선택하는 3단계 모드. video_render의 게이트 마진
+// (delayedSlot->dependentOcrFrameId 와 safeWatermarkId 의 허용 차이, 프레임 단위)
+// 을 동적으로 결정한다. 값이 클수록 freeze는 줄지만 새 PII의 순간 노출 시간이
+// 늘어난다 (60fps 기준 1프레임 ≈ 16.6ms).
+//   MaxSecurity(+0): freeze 자주, 새 PII 노출 0
+//   Balanced(+10 ≈166ms): freeze 거의 없음, 노출 최대 ~166ms (default)
+//   Smooth(+30 ≈500ms): freeze 거의 0, 노출 최대 ~500ms
+// ----------------------------------------------------
+enum class PiiProtectionMode : int8_t {
+  MaxSecurity = 0,
+  Balanced = 1, // default
+  Smooth = 2,
+};
+
+// ----------------------------------------------------
+// [Freeze T06] OCR 입력 다운스케일 정책
+//
+// ocr_worker_loop의 적응형 스케일에서 하한(kScaleMin)을 결정한다. 하한이 1.0f면
+// 다운스케일 금지(작은 글씨 검출 우선), 0.5f면 큰 글씨 화면에서 다운스케일 허용
+// (OCR 빨라짐). 표/작은 데이터 행 누락 회귀 때문에 default는 금지(1.0f).
+//   NoDownscale(1.0f)     : 다운스케일 금지 (default)
+//   AllowDownscale(0.5f)  : 항상 허용
+//   AutoByResolution      : 4K 0.5f / 1440p 0.7f / 1080p 1.0f
+// ----------------------------------------------------
+enum class AdaptScaleMode : int8_t {
+  NoDownscale = 0,      // default — 1.0f
+  AllowDownscale = 1,   // 0.5f
+  AutoByResolution = 2, // 해상도별 차등
+};
+
+// ----------------------------------------------------
 // Core Filter Context
 // ----------------------------------------------------
 struct SecureCastFilter {
@@ -213,6 +246,14 @@ struct SecureCastFilter {
   bool isActive = true; // 필터 활성화 여부
   std::atomic<bool> isGameMode{
       false}; // CPU 임계값 기반 자동 전환 (render/tick 크로스 스레드)
+
+  // [Freeze T01] PII 보호 강도 — securecast_update(GUI 스레드)가 store,
+  // video_render(렌더 스레드)가 매 프레임 load. 게이트 마진을 동적으로 결정.
+  std::atomic<PiiProtectionMode> protectionMode{PiiProtectionMode::Balanced};
+
+  // [Freeze T06] OCR 입력 다운스케일 정책 — GUI 스레드 store / OCR 워커 스레드가
+  // 매 사이클 load해 kScaleMin 결정. default는 다운스케일 금지(1.0f).
+  std::atomic<AdaptScaleMode> adaptScaleMode{AdaptScaleMode::NoDownscale};
 
   // ----- [Game Mode v2] -----
   // 게임 모드 ON 동안: OCR 완전 정지 (T01) + 게임/whitelist 외 fg 앱 silent
@@ -450,11 +491,32 @@ struct SecureCastFilter {
   // M8: OCR 엔진 초기화 영구 실패 여부. 렌더 루프에서 확인 후 RISK 상태로 전환.
   std::atomic<bool> ocrIsDown{false};
 
+  // [Freeze T02] Smart Backfill — OCR 워커가 직전 사이클 대비 박스 수 증가를
+  // 감지하면 set, 렌더 스레드가 backfill 분기에서 exchange(false)로 소비.
+  // 생산자=OCR 워커 단독, 소비자=렌더 스레드 단독.
+  std::atomic<bool> newPiiDetectedFlag{false};
+
   // 직전 OCR 사이클의 박스 수. 변경 시에만 LOG_INFO, 매 사이클은 LOG_DEBUG.
   int lastLoggedOcrCount = -1;
 
+  // [Freeze T02] 직전 OCR 사이클의 박스 수 (newPii 증가 감지용). OCR 워커
+  // 스레드 단독 접근 — 함수-scope static 대신 멤버로 두어 다중 필터 인스턴스
+  // 간 상태 공유 방지 ([C2-3]와 동일 이유).
+  int lastOcrBoxCount = 0;
+
   // [SC-tracker] 주기 로그 카운터 (150 readback ≈ 5초마다 1회 @ 30Hz)
   int trackerLogCounter = 0;
+
+  // [Freeze T07] freeze 진단 (효과 측정용). 모두 video_render(렌더 스레드)
+  // 단독 접근이라 atomic 불필요.
+  int freezeFrameCount = 0;    // 진행 중 freeze 프레임 수 (0 = freeze 아님)
+  uint64_t freezeStartMs = 0;  // 현재 freeze 시작 시각 (ms, obs 프레임 시계)
+  // 1분 통계 창 누적값.
+  uint64_t statsWindowStartMs = 0;     // 통계 창 시작 시각 (0 = 미초기화)
+  int statsFreezeEvents = 0;           // 창 내 완료된 freeze 횟수
+  uint64_t statsFreezeFramesTotal = 0; // 창 내 누적 freeze 프레임
+  uint64_t statsFreezeDurTotalMs = 0;  // 창 내 freeze 지속 시간 합 (평균 계산용)
+  uint64_t statsFreezeDurMaxMs = 0;    // 창 내 최대 freeze 지속 시간
 
   // [backfill 빈도 제어] OCR claim 성공 4번에 1번만 backfill 호출.
   // 매번 호출 시 링 내 모든 슬롯 dependent를 새 frameId로 끌어올려 freeze가

@@ -122,6 +122,17 @@ public:
 
   void clear();
 
+  // [Freeze T05] sticky 보호 지속 시간(ms) 설정. Properties 슬라이더 값이
+  // securecast_update → 이 setter로 전달된다. snapshot_for_push의 sticky
+  // expansion 유지 기간 + 리사이즈 lookback에 함께 적용. 200~3000ms로 clamp.
+  void setStickyDurationMs(int ms) {
+    if (ms < 200)
+      ms = 200;
+    if (ms > 3000)
+      ms = 3000;
+    stickyDurationMs_.store(ms, std::memory_order_relaxed);
+  }
+
   // 재사용 버퍼 버전: 2× 박스-필터 다운샘플 (gray → gray/2, public static).
   // 렌더 스레드에서 트래커에 half-res gray를 전달할 때 직접 호출 가능.
   // out_w/out_h = gw/2, gh/2 (정수 나눗셈).
@@ -217,6 +228,10 @@ private:
   // 가장 최근 시각(ms, steady_clock). 한 번 감지되면 일정 시간 동안 maximize/
   // restore 애니메이션 진행 중으로 간주해 padding boost를 유지한다.
   mutable std::atomic<int64_t> lastResizeDetectedMs_{0};
+
+  // [Freeze T05] sticky 보호 지속 시간(ms). default 1500 (현재 동작 유지).
+  // GUI 스레드(setStickyDurationMs) store / 렌더 스레드(snapshot_for_push) load.
+  std::atomic<int> stickyDurationMs_{1500};
 
   // 모션 hysteresis 활성 시 박스 h를 위아래로 확장. src_h>0이면 하단 clamp.
   // src_w 인자는 미사용 (수직 확장만) — 인터페이스 일관성을 위해 받음.

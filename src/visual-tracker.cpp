@@ -21,6 +21,7 @@
 #include <dwmapi.h>
 #include "window_tracker.h" // sc_compute_visible_subrects (z-order 차감)
 #include "scroll_motion_hook.h" // 글로벌 휠/키 hook 시각 query
+#include "visible_subrects_cache.h" // [Freeze T04] 가시영역 캐시 (DWM 호출 격감)
 #endif
 
 // SIMD intrinsics
@@ -38,6 +39,26 @@
 #elif defined(__SSSE3__)
 #include <tmmintrin.h>
 #define SC_HAS_SSSE3 1
+#endif
+
+#ifdef _WIN32
+// [Freeze T04] 가시영역 캐시 (프로세스 전역, 단일 인스턴스 가정 — WinEventListener
+// 와 동일). snapshot_for_push가 const 멤버라 객체 멤버 대신 파일-scope에 둔다.
+// OS 창 상태가 전역이고 키가 HWND라 인스턴스 간 공유해도 안전. 내부 shared_mutex
+// 로 thread-safe.
+//
+// ★ 의도적 leak: 정적 전역 객체로 두면 OBS 플러그인 DLL 언로드 시점에 소멸자
+//   (~unordered_map / ~shared_mutex)가 실행되는데, 이때 CRT 힙 teardown 순서나
+//   다른 스레드와의 경합으로 _CrtIsValidHeapPointer 실패(힙 손상)가 날 수 있다.
+//   프로세스 수명 캐시이므로 heap 할당 후 해제하지 않아 소멸자를 아예 돌리지
+//   않는다 (plugin-global 표준 패턴). 첫 호출 시 thread-safe하게 1회 초기화.
+//
+// [Freeze T04 — 현재 비활성] stale 정확성 회귀로 호출처에서 직접 호출로 되돌림.
+// 향후 안전한 재구현 시 재활성화 대비해 정의는 남겨둔다 (maybe_unused).
+[[maybe_unused]] static VisibleSubrectsCache &visible_cache() {
+  static VisibleSubrectsCache *inst = new VisibleSubrectsCache();
+  return *inst;
+}
 #endif
 
 // ──────────────────────────────────────────────────────────────
@@ -1339,15 +1360,20 @@ VisualTrackerManager::snapshot_for_push(uint32_t src_w, uint32_t src_h) const {
               // (2) MOVESIZESTART/END WinEvent → 사용자 드래그 리사이즈 감지
               // 둘 중 하나라도 active면 sticky 즉시 강제 활성. delta 기반보다
               // 정확한 신호 (cur가 아직 안 변해도 트랜지션 시작 감지).
+              // [Freeze T05] sticky 지속 시간 = 사용자 설정값(Properties 슬라이더,
+              // default 1500ms). 리사이즈 lookback과 sticky 유지 기간 모두에 동일
+              // 적용 — 둘 다 "이동/리사이즈 후 보호를 얼마나 끌고 갈지"를 의미.
+              const int64_t stickyMs =
+                  stickyDurationMs_.load(std::memory_order_relaxed);
               sc_notify_showcmd_change(target);
-              if (sc_is_window_resizing(target, 1500)) {
+              if (sc_is_window_resizing(target, static_cast<int>(stickyMs))) {
                 lastResizeDetectedMs_.store(nowMs, std::memory_order_release);
               }
 
               const int64_t lastResize =
                   lastResizeDetectedMs_.load(std::memory_order_acquire);
               const bool stickyActive =
-                  (lastResize > 0) && (nowMs - lastResize < 1500);
+                  (lastResize > 0) && (nowMs - lastResize < stickyMs);
 
               // [Move vs Resize 구분]
               // 드래그 이동(크기 변화 없음)은 top-left translation 공식으로 정확
@@ -1419,6 +1445,11 @@ VisualTrackerManager::snapshot_for_push(uint32_t src_w, uint32_t src_h) const {
               boxScreen.bottom = mi.rcMonitor.top +
                                  static_cast<LONG>((outY + tr.bh) / sy);
 
+              // [Freeze T04 — 비활성화] 가시영역 캐시는 stale 데이터로 PII를
+              // 놓치는 정확성 회귀를 일으켜 제거했다(보안 도구에선 정확성 > 성능).
+              // 매 프레임 z-order를 실시간 차감하는 직접 호출로 복귀.
+              // 캐시 코드(visible_subrects_cache.*)와 WinEventListener 세대 인프라는
+              // 향후 안전한 재구현을 위해 파일에 남겨둔다(현재 미사용).
               RECT visRects[SC_MAX_VISIBLE_SUBRECTS];
               const int visCount = sc_compute_visible_subrects(
                   target, boxScreen, visRects, SC_MAX_VISIBLE_SUBRECTS);

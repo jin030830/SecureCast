@@ -244,6 +244,8 @@ if(WIN32)
       src/game_sources/installed_programs.h
       src/win_event_listener.cpp  # Role A: SetWinEventHook push 감지
       src/win_event_listener.h
+      src/visible_subrects_cache.cpp # Freeze T04: 가시영역(z-order 차감) 캐시
+      src/visible_subrects_cache.h
       src/scroll_motion_hook.cpp  # 글로벌 휠/키 hook (스크롤 모션 인과 신호)
       src/scroll_motion_hook.h
       src/overlay-window.cpp      # Role D: 스트리머 전용 보안 상태 HUD (캡처 제외)
