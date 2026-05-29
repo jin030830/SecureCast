@@ -220,6 +220,13 @@ private:
   static constexpr int64_t MOTION_MAX_HOLD_MS = 5000;
   static constexpr float MOTION_BLUR_EXPAND_PX = 60.0f; // 위/아래 각각
 
+  // [스크롤 밴드 #6 C2] 스크롤 신호 기준 동작 구간 (steady_clock ms).
+  static constexpr int64_t kScrollActiveMs = 700;  // 밴드 ON + 트래커 보존
+  // 멈춘 뒤에도 창 전체 밴드를 유지하는 시간. 무작정 늘리면 옛 트래커 만료
+  // (owner-bound ~5초) 시점과 겹쳐 오히려 커버리지가 떨어지므로 2초 유지.
+  static constexpr int64_t kScrollSettleMs = 2000;
+  static constexpr int kScrollBandMaxPx = 1200; // (현재 미사용 — 창 전체 확장)
+
   // update_all_gray가 매 사이클 갱신. 모든 활성 트래커가 lastScore>=SCORE_OK +
   // framesSinceMatch==0이면 true. helper가 종료 조건으로 사용.
   mutable std::atomic<bool> allTrackersStable_{true};

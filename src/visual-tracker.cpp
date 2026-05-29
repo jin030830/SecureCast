@@ -1159,8 +1159,6 @@ void VisualTrackerManager::register_or_update_gray(
   for (int n = 0; n < N; ++n) {
     if (matchedOcr[n])
       continue;
-    if (static_cast<int>(trackers_.size()) >= MAX_TRACKERS)
-      break;
 
     const auto &box = ocr_boxes[n];
     int tcx = static_cast<int>(box.x), tcy = static_cast<int>(box.y);
@@ -1178,6 +1176,29 @@ void VisualTrackerManager::register_or_update_gray(
     auto crop = extract_gray_crop(gray, gw, gw, gh, tcx, tcy, tcw, tch, tw, th);
     if (crop.empty())
       continue;
+
+    // [#6 스크롤] 슬롯이 꽉 찼으면, 이번 OCR에 매칭 안 된(=현재 화면에 없는 옛
+    // 위치) 트래커 중 가장 stale(framesSinceOcrValidate 최대)한 것을 evict해 이
+    // 새 검출에 자리를 준다. 스크롤 후 옛 위치 트래커가 MAX_TRACKERS 슬롯을
+    // 점유해 새 위치 PII(EMAIL 포함)가 검출돼도 트래커를 못 만들고 노출되던
+    // 문제 해결 — 옛 트래커 5초 만료를 기다리지 않는다. 이번 사이클에 매칭됐거나
+    // 방금 새로 만든 트래커(matchedTr=true)는 evict 대상에서 제외.
+    if (static_cast<int>(trackers_.size()) >= MAX_TRACKERS) {
+      int evictIdx = -1, evictStale = -1;
+      for (int i = 0; i < static_cast<int>(trackers_.size()); ++i) {
+        if (i < static_cast<int>(matchedTr.size()) && matchedTr[i])
+          continue;
+        if (trackers_[i].framesSinceOcrValidate > evictStale) {
+          evictStale = trackers_[i].framesSinceOcrValidate;
+          evictIdx = i;
+        }
+      }
+      if (evictIdx < 0)
+        break; // 모두 이번 사이클 유효 → 진짜 초과(보류)
+      trackers_.erase(trackers_.begin() + evictIdx);
+      if (evictIdx < static_cast<int>(matchedTr.size()))
+        matchedTr.erase(matchedTr.begin() + evictIdx);
+    }
 
     Tracker tr{};
     tr.id = nextId_++;
@@ -1207,6 +1228,7 @@ void VisualTrackerManager::register_or_update_gray(
     }
     precompute_tmpl_stats(tr);
     trackers_.push_back(std::move(tr));
+    matchedTr.push_back(true); // 방금 만든 트래커 보호 (이후 evict 후보 제외)
   }
 }
 
@@ -1444,6 +1466,31 @@ VisualTrackerManager::snapshot_for_push(uint32_t src_w, uint32_t src_h) const {
                                 static_cast<LONG>((outX + tr.bw) / sx);
               boxScreen.bottom = mi.rcMonitor.top +
                                  static_cast<LONG>((outY + tr.bh) / sy);
+
+              // [스크롤 밴드 #6 C2] 창은 안 움직이지만 콘텐츠가 스크롤되는 케이스.
+              // 스크롤 중에는 PII가 창 안 어디로 이동/새로 진입할지 불확실하므로
+              // boxScreen을 owner 창 전체(cur)로 확장한다("창 전체 블러"). 세로 띠만
+              // 덮으면 다른 x열로 새로 스크롤돼 들어오는 PII가 트래커 생기기 전 잠깐
+              // 노출됐다 — 창 전체로 그 구멍을 닫는다. cur로 clamp되어 창 밖으로 안
+              // 번지고, 아래 z-order 차감이 위에 덮인 창은 자동 제외(위 창에 블러 X).
+              // NCC/anchor 위치 자체는 안 건드림 → 정적 화면 100% 동일.
+              //
+              // [T-B] 스크롤 중 + 멈춘 뒤 settle 구간(kScrollSettleMs)까지 유지한다.
+              // 노출은 "멈춘 직후" 정밀 마스크(refX)가 새 위치로 수렴(OCR 재검출)하기
+              // 전 틈에서 발생 → 밴드를 그 수렴 시간까지 끌고 가 메운다. 시간 기반
+              // 단조라 깜빡임 없음. (kScrollBandMaxPx는 현재 미사용 — 창 전체 확장.)
+              {
+                const int64_t lastScroll =
+                    securecast::last_scroll_motion_time_ms();
+                const bool scrollBandActive =
+                    (lastScroll > 0) && ((nowMs - lastScroll) < kScrollSettleMs);
+                if (scrollBandActive) {
+                  boxScreen.left = cur.left;
+                  boxScreen.top = cur.top;
+                  boxScreen.right = cur.right;
+                  boxScreen.bottom = cur.bottom;
+                }
+              }
 
               // [Freeze T04 — 비활성화] 가시영역 캐시는 stale 데이터로 PII를
               // 놓치는 정확성 회귀를 일으켜 제거했다(보안 도구에선 정확성 > 성능).

@@ -34,6 +34,7 @@
 #include <obs-frontend-api.h> // obs_hotkey_register_frontend
 #endif
 #include "ocr-engine.h" // Role B: OCR engine
+#include "scroll_motion_hook.h" // [Scroll #6] 스크롤 시 OCR 캐시 강제 무효화용
 
 #include <algorithm>
 #include <chrono>
@@ -1192,6 +1193,25 @@ static void ocr_worker_loop(SecureCastFilter *filter) {
                                               std::memory_order_acq_rel)) {
       if (filter->ocrEngine)
         filter->ocrEngine->clearDHashCache();
+    }
+
+    // [Scroll #6] 스크롤 중/직후에는 OCR dHash 캐시를 매 사이클 비운다.
+    // L2 라인 캐시는 OCR 시점의 "고정된 라인 위치"를 들고 있어, 콘텐츠가 스크롤
+    // 되면 그 고정 위치만 crop-OCR하느라 새 레이아웃을 재발견 못 하고 mask가
+    // 1개로 떨어져 5~9초에 걸쳐 천천히 회복했다(로그 확인). 캐시를 비우면 다음
+    // 사이클이 full OCR이라 새 레이아웃을 ~1사이클(≈250ms)에 재검출 → 멈춘 직후
+    // 노출 갭이 사라진다. 마지막 스크롤 입력 후 kScrollOcrFreshMs 동안 적용.
+    {
+      constexpr int64_t kScrollOcrFreshMs = 1000;
+      const int64_t lastScroll = securecast::last_scroll_motion_time_ms();
+      const int64_t nowScrollMs =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::steady_clock::now().time_since_epoch())
+              .count();
+      if (lastScroll > 0 && (nowScrollMs - lastScroll) < kScrollOcrFreshMs) {
+        if (filter->ocrEngine)
+          filter->ocrEngine->clearDHashCache();
+      }
     }
 
     if (!ocrReady) {
