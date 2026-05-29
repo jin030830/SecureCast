@@ -2855,36 +2855,8 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
     }
   }
 
-  // [Role D] 보안 상태 테두리 오버레이 (색상: SAFE=초록, PARTIAL=노랑,
-  // RISK=빨강)
-  {
-    uint32_t borderColor = 0xFF00FF00;
-    if (newState == SecurityState::PARTIAL)
-      borderColor = 0xFFFFFF00;
-    else if (newState == SecurityState::RISK)
-      borderColor = 0xFFFF0000;
-
-    constexpr int BORDER = 6;
-    gs_effect_t *solid = obs_get_base_effect(OBS_EFFECT_SOLID);
-    gs_effect_set_color(gs_effect_get_param_by_name(solid, "color"),
-                        borderColor);
-    gs_matrix_push();
-    while (gs_effect_loop(solid, "Solid")) {
-      gs_matrix_identity();
-      gs_matrix_translate3f(0.0f, 0.0f, 0.0f);
-      gs_draw_sprite(nullptr, 0, w, (uint32_t)BORDER);
-      gs_matrix_identity();
-      gs_matrix_translate3f(0.0f, (float)(h - BORDER), 0.0f);
-      gs_draw_sprite(nullptr, 0, w, (uint32_t)BORDER);
-      gs_matrix_identity();
-      gs_matrix_translate3f(0.0f, 0.0f, 0.0f);
-      gs_draw_sprite(nullptr, 0, (uint32_t)BORDER, h);
-      gs_matrix_identity();
-      gs_matrix_translate3f((float)(w - BORDER), 0.0f, 0.0f);
-      gs_draw_sprite(nullptr, 0, (uint32_t)BORDER, h);
-    }
-    gs_matrix_pop();
-  }
+  // [Role D] 보안 상태 테두리 오버레이 제거 — 상태 표시는 OverlayWindow(HUD)의
+  // RISK 경광등으로 일원화. 출력 화면(스트림)엔 색 테두리를 그리지 않는다.
 
 #endif
 }
@@ -3393,6 +3365,8 @@ static void securecast_video_tick(void *data, float seconds) {
 #define SC_SETTING_GM_WHITELIST "sc_gm_whitelist"
 // [T13] readonly multiline 표시용 settings 키. update에서 읽지 않음 — 표시 전용.
 #define SC_SETTING_GM_RECENT_BLURRED "sc_gm_recent_blurred"
+// [UI] 상세 설정 그룹 표시 토글. update에서 읽지 않음 — Properties UI 표시 전용.
+#define SC_SETTING_SHOW_ADVANCED "sc_show_advanced"
 
 // manualBlurMask → obs_data_array 직렬화 후 source settings에 write-back.
 // settingsMutex 밖에서 호출해야 함 — obs_source_get_settings가 OBS 내부 락을
@@ -3826,11 +3800,11 @@ static bool sc_add_to_game_cb(obs_properties_t *, obs_property_t *,
                               void *data) {
   return add_picker_to_list(data, SC_SETTING_BLACKLIST_GM);
 }
-// 게임 picker에서 선택한 항목 → 게임 모드 허용 앱 (sc_gm_whitelist)에 추가.
-static bool sc_add_game_to_wl_cb(obs_properties_t *, obs_property_t *,
-                                 void *data) {
-  return add_picker_to_list(data, SC_SETTING_GM_WHITELIST,
-                            "sc_user_game_picker");
+// 상단 앱 picker(sc_app_picker)에서 선택한 앱 → 게임 모드 노출 허용 앱
+// (화이트리스트, sc_gm_whitelist)에 추가. 블랙리스트 Add 버튼과 동일 패턴.
+static bool sc_add_to_whitelist_cb(obs_properties_t *, obs_property_t *,
+                                   void *data) {
+  return add_picker_to_list(data, SC_SETTING_GM_WHITELIST);
 }
 
 // [T08] 자동 검색 버튼 콜백 — 본체는 path_to_exe_basename 정의 이후에 위치.
@@ -3888,15 +3862,34 @@ static void securecast_get_defaults(obs_data_t *settings) {
   obs_data_array_release(emptyWhitelist);
 }
 
+// [UI] "상세 설정 펼치기" 체크박스 토글 시 sc_advanced 그룹을 표시/숨김.
+// OBS 필터 Properties엔 별도 페이지 진입 기능이 없어(커스텀 Qt 필요), 체크박스로
+// 상세 설정 그룹을 펼치고 접는 방식으로 "클릭해서 들어가기"를 구현한다.
+static bool sc_show_advanced_modified(obs_properties_t *props, obs_property_t *,
+                                      obs_data_t *settings) {
+  const bool show = obs_data_get_bool(settings, SC_SETTING_SHOW_ADVANCED);
+  obs_property_t *grp = obs_properties_get(props, "sc_advanced");
+  if (grp)
+    obs_property_set_visible(grp, show);
+  return true; // 가시성 변경 → UI 갱신 요청
+}
+
 static obs_properties_t *securecast_get_properties(void *data) {
   obs_properties_t *props = obs_properties_create();
+
+  // [UI] 상세 설정 그룹 — 핵심 4개(앱 선택 / 일반·게임 차단 앱 / 게임 노출 허용
+  // 앱)만 밖에 두고, 나머지 모든 설정은 이 접이식 "상세 설정" 안에 넣는다.
+  // 항목은 advGrp에 추가하고, 그룹 자체는 함수 끝에서 props에 마지막으로 등록해
+  // 맨 아래에 표시한다. set_param: 그룹 내 버튼 콜백(Clear 등)이 filter를 받도록.
+  obs_properties_t *advGrp = obs_properties_create();
+  obs_properties_set_param(advGrp, data, nullptr);
 
   // ── [Freeze T01] PII 보호 강도 ───────────────────────────────────
   // freeze(프레임 멈춤) 빈도와 새 PII 순간 노출 위험의 트레이드오프를
   // 사용자가 직접 선택. 게이트 마진(0/10/30 프레임)으로 환산되어 video_render
   // 에 즉시 반영된다.
   obs_property_t *modeList = obs_properties_add_list(
-      props, SC_SETTING_PROTECTION_MODE, "보호 강도",
+      advGrp, SC_SETTING_PROTECTION_MODE, "보호 강도",
       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
   obs_property_list_add_int(
       modeList, "최대 보안 (Freeze 자주, 새 PII 노출 0)", 0);
@@ -3917,7 +3910,7 @@ static obs_properties_t *securecast_get_properties(void *data) {
   // 창을 이동/리사이즈한 직후, 추적이 완벽히 안정될 때까지 블러를 넉넉히
   // 유지하는 기간. 길수록 이동 중 노출은 줄지만 멈춘 뒤 블러가 늦게 풀린다.
   obs_property_t *stickyProp = obs_properties_add_int_slider(
-      props, SC_SETTING_STICKY_MS, "Sticky 보호 지속 시간 (ms)", 200, 3000,
+      advGrp, SC_SETTING_STICKY_MS, "Sticky 보호 지속 시간 (ms)", 200, 3000,
       100);
   obs_property_set_long_description(
       stickyProp,
@@ -3927,7 +3920,7 @@ static obs_properties_t *securecast_get_properties(void *data) {
 
   // ── [Freeze T06] OCR 입력 다운스케일 정책 ────────────────────────
   obs_property_t *scaleList = obs_properties_add_list(
-      props, SC_SETTING_ADAPT_SCALE_MODE, "OCR 입력 다운스케일",
+      advGrp, SC_SETTING_ADAPT_SCALE_MODE, "OCR 입력 다운스케일",
       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
   obs_property_list_add_int(
       scaleList, "다운스케일 금지 (작은 글씨 검출 우선, 권장)", 0);
@@ -3972,6 +3965,21 @@ static obs_properties_t *securecast_get_properties(void *data) {
   obs_properties_add_group(props, "sc_game_section", "게임 모드 차단 앱",
                            OBS_GROUP_NORMAL, gameGrp);
 
+  // 3-b) 게임 모드 노출 허용 앱(화이트리스트) — 차단 앱 바로 아래 배치.
+  // 상단 앱 picker에서 선택한 앱을 "선택한 앱 추가" 버튼으로 등록(블랙리스트와
+  // 동일 방식). 게임 모드 중 여기 등록된 앱은 가리지 않고 그대로 송출된다.
+  obs_properties_t *wlGrp = obs_properties_create();
+  obs_properties_set_param(wlGrp, data, nullptr);
+  obs_properties_add_button(wlGrp, "sc_add_wl_btn", "선택한 앱 추가",
+                            sc_add_to_whitelist_cb);
+  obs_properties_add_editable_list(
+      wlGrp, SC_SETTING_GM_WHITELIST,
+      "게임 모드 노출 허용 앱 (게임모드 ON에서 가리지 않음)",
+      OBS_EDITABLE_LIST_TYPE_STRINGS, nullptr, nullptr);
+  obs_properties_add_group(props, "sc_whitelist_group",
+                           "게임 모드 노출 허용 앱 (화이트리스트)",
+                           OBS_GROUP_NORMAL, wlGrp);
+
   // [Game mode v2 — T02] 사용자 동의 dialog 폐기. 토글 UI도 제거됨.
 
   // ── [Game mode v2 — T07] 게임 모드 trigger 그룹 ────────────────────
@@ -3994,7 +4002,7 @@ static obs_properties_t *securecast_get_properties(void *data) {
   obs_properties_add_int_slider(gmGrp, SC_SETTING_GM_EXIT_SECONDS,
                                 "해제 지속 시간 (CPU 낮아진 뒤, 초)", 1, 30,
                                 1);
-  obs_properties_add_group(props, "sc_gm_group", "게임 모드 자동 진입",
+  obs_properties_add_group(advGrp, "sc_gm_group", "게임 모드 자동 진입",
                            OBS_GROUP_NORMAL, gmGrp);
 
   // ── [Game mode v2 — T07] 내 게임 목록 (Tier 3) ───────────────────────
@@ -4014,34 +4022,19 @@ static obs_properties_t *securecast_get_properties(void *data) {
       "등록합니다.");
 
   // 게임 picker — dropdown(scroll 가능) 으로 내 게임 목록 표시.
-  // 옆 버튼으로 선택한 게임을 "노출 허용"에 한 번에 추가 가능.
   obs_property_t *gamePicker = obs_properties_add_list(
       gamesGrp, "sc_user_game_picker", "게임 선택",
       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
   auto *filter = static_cast<SecureCastFilter *>(data);
   populate_user_game_picker(filter, gamePicker);
 
-  obs_properties_add_button(gamesGrp, "sc_add_game_to_wl_btn",
-                            "선택한 게임을 노출 허용에 추가",
-                            sc_add_game_to_wl_cb);
-
   obs_properties_add_editable_list(
       gamesGrp, SC_SETTING_USER_GAMES,
       "", // 짧은 라벨 — 리스트 폭 최대화
       OBS_EDITABLE_LIST_TYPE_STRINGS, nullptr, nullptr);
 
-  obs_properties_add_group(props, "sc_games_group", "내 게임 목록",
+  obs_properties_add_group(advGrp, "sc_games_group", "내 게임 목록",
                            OBS_GROUP_NORMAL, gamesGrp);
-
-  // ── [Game mode v2 — T07] 화이트리스트 (게임 모드 중 노출 허용) ──────
-  obs_properties_t *wlGrp = obs_properties_create();
-  obs_properties_set_param(wlGrp, data, nullptr);
-  obs_properties_add_editable_list(
-      wlGrp, SC_SETTING_GM_WHITELIST,
-      "", // 짧은 라벨 — 그룹 헤더가 이미 설명
-      OBS_EDITABLE_LIST_TYPE_STRINGS, nullptr, nullptr);
-  obs_properties_add_group(props, "sc_whitelist_group",
-                           "게임 모드 노출 허용 앱", OBS_GROUP_NORMAL, wlGrp);
 
   // ── [Game mode v2 — T13] 최근 가린 앱 (readonly 표시) ───────────────
   // Properties 다이얼로그가 열린 시점의 deque snapshot. 사용자가 화이트리스트로
@@ -4074,7 +4067,7 @@ static obs_properties_t *securecast_get_properties(void *data) {
       obs_data_release(settings);
     }
     obs_property_t *recentProp = obs_properties_add_text(
-        props, SC_SETTING_GM_RECENT_BLURRED,
+        advGrp, SC_SETTING_GM_RECENT_BLURRED,
         "최근 가린 앱 (참고용 — 가장 최근 항목이 위쪽)",
         OBS_TEXT_MULTILINE);
     obs_property_set_enabled(recentProp, false); // readonly
@@ -4087,7 +4080,7 @@ static obs_properties_t *securecast_get_properties(void *data) {
 
   // 4) 수동 드래그 블러 초기화 버튼
   obs_properties_add_button(
-      props, "sc_clear_manual", "Clear Manual Blurs",
+      advGrp, "sc_clear_manual", "Clear Manual Blurs",
       [](obs_properties_t *, obs_property_t *, void *btn_data) -> bool {
         auto *filter = static_cast<SecureCastFilter *>(btn_data);
         MaskPayload snapshot{};
@@ -4105,6 +4098,27 @@ static obs_properties_t *securecast_get_properties(void *data) {
 #else
   (void)data;
 #endif
+
+  // [UI] "상세 설정 펼치기" 토글 체크박스 — 켜면 아래 상세 설정 그룹이 나타나고
+  // 끄면 숨겨진다 (클릭해서 들어가는 동작). 핵심 4개 아래, 그룹 바로 위에 배치.
+  obs_property_t *showAdv = obs_properties_add_bool(
+      props, SC_SETTING_SHOW_ADVANCED, "상세 설정 펼치기");
+  obs_property_set_modified_callback(showAdv, sc_show_advanced_modified);
+
+  // 상세 설정 그룹을 맨 마지막에 등록 → 핵심 4개 아래에 표시.
+  obs_property_t *advProp = obs_properties_add_group(
+      props, "sc_advanced", "상세 설정", OBS_GROUP_NORMAL, advGrp);
+
+  // 초기 가시성 = 저장된 토글값 (기본 false → 처음엔 접힌 상태).
+  if (data) {
+    obs_data_t *curSettings =
+        obs_source_get_settings(static_cast<SecureCastFilter *>(data)->context);
+    if (curSettings) {
+      obs_property_set_visible(
+          advProp, obs_data_get_bool(curSettings, SC_SETTING_SHOW_ADVANCED));
+      obs_data_release(curSettings);
+    }
+  }
 
   return props;
 }

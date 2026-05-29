@@ -94,8 +94,7 @@ LRESULT CALLBACK OverlayWindow::WndProc(HWND hwnd, UINT msg,
     // ------------------------------------------------------------------
     case WM_PAINT: {
         SecurityState state = static_cast<SecurityState>(self->m_state.load());
-        bool gameMode = self->m_gameMode.load();
-        paintBadge(hwnd, state, gameMode);
+        paintBadge(hwnd, state, self->m_riskStartMs.load());
         return 0;
     }
 
@@ -105,8 +104,15 @@ LRESULT CALLBACK OverlayWindow::WndProc(HWND hwnd, UINT msg,
     //   lParam = gameMode as bool (0/1)
     // ------------------------------------------------------------------
     case WM_APP + 0: {
-        self->m_state.store(static_cast<int>(wParam));
+        const int newSt = static_cast<int>(wParam);
+        const int oldSt = self->m_state.exchange(newSt);
         self->m_gameMode.store(lParam != 0);
+        // SAFE/CAUTION → RISK 전환 시에만 RISK 시작 시각 기록(깜빡임 타이밍 기준).
+        // RISK 지속 중에는 갱신하지 않아 10초 후 솔리드로 넘어간다. RISK가 풀리면
+        // 다음 RISK 진입 때 다시 기록되어 깜빡임이 새로 시작된다.
+        const int risk = static_cast<int>(SecurityState::RISK);
+        if (newSt == risk && oldSt != risk)
+            self->m_riskStartMs.store(GetTickCount64());
         InvalidateRect(hwnd, nullptr, FALSE);  // 다음 메시지 루프에서 WM_PAINT 발생
         return 0;
     }
@@ -121,100 +127,58 @@ LRESULT CALLBACK OverlayWindow::WndProc(HWND hwnd, UINT msg,
 }
 
 // =============================================================================
-// paintBadge — GDI 배지 렌더링
-//   레이아웃: [■ colorBar(10px) | 배지 배경 | 텍스트 "SECURECAST  SAFE"]
+// paintBadge — 경광등 렌더링
+//   평소(SAFE/CAUTION): 초록 동그라미.
+//   RISK: 진입 후 kRiskBlinkMs(10초)간 빨강 깜빡임(on/off), 이후 솔리드 빨강.
+//   RISK가 풀리면 다시 초록(깜빡임 도중에 풀려도 즉시 초록).
+//   setState가 매 프레임 호출 → 매 프레임 repaint로 시간 기반 깜빡임이 갱신됨.
 // =============================================================================
-void OverlayWindow::paintBadge(HWND hwnd, SecurityState state, bool gameMode)
+void OverlayWindow::paintBadge(HWND hwnd, SecurityState state,
+                               uint64_t riskStartMs)
 {
     PAINTSTRUCT ps;
     HDC hdc = BeginPaint(hwnd, &ps);
 
     RECT rc;
     GetClientRect(hwnd, &rc);
-    int w = rc.right;
-    int h = rc.bottom;
 
-    // [T11] 본 배지 영역(좌측). gameMode면 우측 kGameBadgeW만큼 양보.
-    const int mainW = gameMode ? (w - kGameBadgeW) : w;
-
-    // --- 1. 전체 배경을 colorkey 색으로 채움 (투명 영역) ---
+    // 전체 배경을 colorkey(투명)로 채움 → 원 바깥은 투명.
     HBRUSH bgBrush = CreateSolidBrush(kBgColor);
     FillRect(hdc, &rc, bgBrush);
     DeleteObject(bgBrush);
 
-    // --- 2. 본 배지 배경 (어두운 회색) ---
-    RECT badgeRect = {0, 0, mainW, h};
-    HBRUSH badgeBrush = CreateSolidBrush(kBadgeBg);
-    FillRect(hdc, &badgeRect, badgeBrush);
-    DeleteObject(badgeBrush);
-
-    // --- 3. 왼쪽 색상 바 ---
-    COLORREF barColor;
-    const wchar_t* stateText;
-    switch (state) {
-    case SecurityState::PARTIAL:
-        barColor  = kBarPartial;
-        stateText = L"CAUTION";
-        break;
-    case SecurityState::RISK:
-        barColor  = kBarRisk;
-        stateText = L"  RISK ";
-        break;
-    default: // SAFE
-        barColor  = kBarSafe;
-        stateText = L"  SAFE ";
-        break;
+    // 색/표시 결정: 기본 초록, RISK면 빨강(깜빡 또는 솔리드).
+    COLORREF color = kBarSafe; // 초록
+    bool draw = true;
+    if (state == SecurityState::RISK) {
+        color = kBarRisk; // 빨강
+        const uint64_t elapsed = GetTickCount64() - riskStartMs;
+        if (elapsed < kRiskBlinkMs) {
+            // 깜빡임 구간: kRiskBlinkHalf 주기로 on/off. off면 안 그림(투명).
+            draw = ((elapsed / kRiskBlinkHalf) % 2) == 0;
+        }
+        // elapsed >= kRiskBlinkMs → 솔리드 빨강(draw=true 유지).
     }
 
-    RECT barRect = {0, 0, kBarWidth, h};
-    HBRUSH barBrush = CreateSolidBrush(barColor);
-    FillRect(hdc, &barRect, barBrush);
-    DeleteObject(barBrush);
-
-    // --- 4. 텍스트 "SecureCast  <STATE>" ---
-    SetBkMode(hdc, TRANSPARENT);
-
-    // 첫 줄: "SecureCast" (작은 회색)
-    SetTextColor(hdc, RGB(160, 160, 160));
-    HFONT smallFont = CreateFont(
-        12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
-    HFONT oldFont = static_cast<HFONT>(SelectObject(hdc, smallFont));
-
-    RECT labelRect = {kBarWidth + kMargin, 4, mainW - 4, h / 2};
-    DrawText(hdc, L"SecureCast", -1, &labelRect,
-             DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-
-    // 두 번째 줄: 상태 텍스트 (굵은 흰색)
-    HFONT boldFont = CreateFont(
-        16, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
-    SelectObject(hdc, boldFont);
-    SetTextColor(hdc, kTextColor);
-
-    RECT stateRect = {kBarWidth + kMargin, h / 2, mainW - 4, h - 4};
-    DrawText(hdc, stateText, -1, &stateRect,
-             DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-
-    // --- 5. [T11] 게임 모드 배지 (우측) ---
-    if (gameMode) {
-        RECT gameRect = {mainW, 0, w, h};
-        HBRUSH gameBrush = CreateSolidBrush(kGameBadgeBg);
-        FillRect(hdc, &gameRect, gameBrush);
-        DeleteObject(gameBrush);
-
-        SetTextColor(hdc, kGameTextColor);
-        // "GAME" 텍스트 (굵은 흰색) — 본 배지의 굵은 폰트 재사용.
-        DrawText(hdc, L"GAME", -1, &gameRect,
-                 DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    if (draw) {
+        // 테두리 = 채움색의 진한 버전 (각 채널 ~55%).
+        const COLORREF dark = RGB(GetRValue(color) * 55 / 100,
+                                  GetGValue(color) * 55 / 100,
+                                  GetBValue(color) * 55 / 100);
+        // 펜 두께를 감안해 ellipse 사각형을 안쪽으로 들여, 테두리가 창 밖으로
+        // 잘리지 않게 한다.
+        const int pad = 2 + kBeaconBorderPx / 2;
+        HBRUSH brush = CreateSolidBrush(color);
+        HPEN pen = CreatePen(PS_SOLID, kBeaconBorderPx, dark);
+        HBRUSH oldBrush = static_cast<HBRUSH>(SelectObject(hdc, brush));
+        HPEN oldPen = static_cast<HPEN>(SelectObject(hdc, pen));
+        Ellipse(hdc, rc.left + pad, rc.top + pad, rc.right - pad,
+                rc.bottom - pad);
+        SelectObject(hdc, oldPen);
+        SelectObject(hdc, oldBrush);
+        DeleteObject(brush);
+        DeleteObject(pen);
     }
-
-    // 폰트 정리
-    SelectObject(hdc, oldFont);
-    DeleteObject(smallFont);
-    DeleteObject(boldFont);
 
     EndPaint(hwnd, &ps);
 }
@@ -238,11 +202,10 @@ void OverlayWindow::messageLoop()
 
     RegisterClassEx(&wc);  // 이미 등록된 경우 무시 (ERROR_CLASS_ALREADY_EXISTS)
 
-    // --- 배치: 기본 모니터 우하단 ---
+    // --- 배치: 기본 모니터 우상단 (RISK 경광등) ---
     int screenW = GetSystemMetrics(SM_CXSCREEN);
-    int screenH = GetSystemMetrics(SM_CYSCREEN);
-    int posX    = screenW - kWidth  - 16;
-    int posY    = screenH - kHeight - 48;  // 작업표시줄 위
+    int posX    = screenW - kWidth - 24;
+    int posY    = 24;
 
     HWND hwnd = CreateWindowEx(
         WS_EX_LAYERED   |    // 투명 처리 지원

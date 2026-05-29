@@ -21,6 +21,7 @@
 
 #include <Windows.h>
 #include <atomic>
+#include <cstdint>
 #include <thread>
 
 #include "securecast-types.h"  // SecurityState
@@ -66,9 +67,10 @@ private:
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg,
                                      WPARAM wParam, LPARAM lParam);
 
-    // 배지를 그리는 GDI 헬퍼 (WM_PAINT 내부에서 호출).
-    // gameMode=true면 본 배지 우측에 보라색 "GAME" 인디케이터 부착.
-    static void paintBadge(HWND hwnd, SecurityState state, bool gameMode);
+    // 경광등을 그리는 GDI 헬퍼 (WM_PAINT 내부에서 호출).
+    // 평소 초록 원, RISK 진입 후 kRiskBlinkMs 동안 빨강 깜빡임, 이후 솔리드 빨강.
+    // riskStartMs: RISK로 진입한 시각(GetTickCount64). RISK가 아니면 무시.
+    static void paintBadge(HWND hwnd, SecurityState state, uint64_t riskStartMs);
 
     // ---- 멤버 ----
     HWND               m_hwnd    = NULL;
@@ -81,13 +83,23 @@ private:
     // [T11] 게임 모드 활성 여부. WM_SC_STATE 메시지의 lParam으로 전달됨.
     std::atomic<bool>  m_gameMode{false};
 
+    // [UI] RISK로 진입한 시각(GetTickCount64 ms). RISK 진입 시 갱신, 깜빡임/솔리드
+    // 판정에 사용. RISK가 아니면 의미 없음(초록 경광등).
+    std::atomic<uint64_t> m_riskStartMs{0};
+
+    // RISK 진입 후 이 시간(ms) 동안 빨강 깜빡임, 이후 솔리드 빨강.
+    static constexpr uint64_t kRiskBlinkMs   = 10000;  // 깜빡임 지속 10초
+    static constexpr uint64_t kRiskBlinkHalf = 500;    // on/off 반주기(ms)
+
     // 윈도우 클래스 이름 (인스턴스마다 고유)
     static constexpr wchar_t kClassName[] = L"SecureCastOverlayV1";
 
-    // 배지 크기 (픽셀). 게임 배지 영역을 위해 폭을 확장.
-    static constexpr int kWidth      = 260;  // 200 → 260 (게임 배지 ~60px)
-    static constexpr int kHeight     =  48;
-    static constexpr int kGameBadgeW =  60;  // 우측 게임 배지 폭
+    // [UI] 경광등 창 크기 — 우상단의 작은 정사각. 평소 초록 / RISK 빨강 원을
+    // 채움색 + 그 진한 색 테두리로 그린다.
+    static constexpr int kWidth      = 26;
+    static constexpr int kHeight     = 26;
+    static constexpr int kGameBadgeW =  0;  // (미사용 — 게임 배지 폐기)
+    static constexpr int kBeaconBorderPx = 3;  // 동그라미 테두리 두께(px)
 
     // WDA_EXCLUDEFROMCAPTURE 지원 여부 (create()에서 판단, messageLoop()에서 사용)
     bool               m_useExcludeFromCapture{false};
