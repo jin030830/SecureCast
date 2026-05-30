@@ -270,7 +270,12 @@ struct SecureCastFilter {
   bool gameModeAutoEnter = true; // false면 Primary/Secondary 둘 다 비활성
   int gameModeCpuThreshold = 40; // Secondary 진입 임계값 (%)
   int gameModeEnterSeconds = 3;  // 진입 hysteresis (초)
-  int gameModeExitSeconds = 5;   // 해제 hysteresis (초, CPU ≤ exit 임계값에서)
+  int gameModeExitSeconds = 8;   // 해제 hysteresis (초, CPU ≤ exit 임계값에서)
+
+  // [게임 목록 자동 갱신] 스토어(Steam/Epic/…) 설치 게임을 주기적으로 무인
+  // 스캔해 "내 게임 목록"에 자동 추가하기 위한 타이머. video_tick 단독 접근.
+  float gameAutodetectTimer = 0.0f;     // 경과 시간 누산(초)
+  bool gameAutodetectFirstDone = false; // 시작 직후 최초 1회 스캔 완료 여부
 
   // [Game Mode v2 — T13] 최근 자동 블러된 fg 앱들의 ring buffer.
   // 사용자가 "어떤 앱들이 가려졌는지 확인 후 화이트리스트에 추가할지 결정"하는
@@ -290,10 +295,9 @@ struct SecureCastFilter {
   FrameRingBuffer
       ringBuffer; // Bounded Exposure(송출 지연) 구현용 N-프레임 텍스처 버퍼
 
-#ifdef _WIN32
-  OverlayWindow
-      overlay; // [Role D] 스트리머 전용 보안 상태 HUD (OBS 캡처에서 제외됨)
-#endif
+  // [Role D] 보안 상태 경광등(HUD)은 BeaconManager 싱글톤이 프로세스 전역에서
+  // 단 하나만 보유한다. 필터는 securecast_create/destroy에서 acquire/release로
+  // 등록·해제하고, 상태는 reportState로 보고한다 (overlay-window.h 참조).
 
   // ----- [Role D] UI 설정 -----
   mutable std::mutex

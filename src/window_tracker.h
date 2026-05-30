@@ -183,6 +183,25 @@ bool sc_lookup_friendly_name(const wchar_t *exe_name, wchar_t *out_buf,
 // 성공 시 true 반환. out 버퍼는 wchar 단위 크기.
 bool sc_get_hwnd_exe_name(HWND hwnd, wchar_t *out, size_t out_cap);
 
+// =============================================================================
+// [실시간 경로 매칭] 게임 스토어 설치 폴더 기반 게임 판정
+//
+//   sc_set_game_dirs   : 게임 스토어 설치 폴더 prefix 목록 갱신(autodetect가 호출).
+//   sc_is_game_by_path : exe 전체 경로가 그 폴더들 아래면 true.
+//   sc_hwnd_is_game    : 창의 owner exe를 1회 조회해 "목록 OR 경로"로 게임 판정.
+//                        out_exe(null 허용)에 exe basename을 채움(진입 캡처용).
+//
+// 목록(빌트인/사용자)에 없어도, Steam 등 스토어 설치 폴더에서 실행되면 게임으로
+// 인지한다 → 신작·마이너 게임을 수동 등록 없이 실시간 인지.
+// =============================================================================
+void sc_set_game_dirs(const wchar_t *const *dirs, int count);
+bool sc_is_game_by_path(const wchar_t *full_exe_path);
+bool sc_hwnd_is_game(HWND hwnd, wchar_t *out_exe, size_t out_cap);
+
+// [사용자 추가 제외] OBS 설정 "게임 아님 폴더" 목록 갱신. 경로 매칭에서 이 폴더
+// 아래 실행파일은 게임으로 보지 않는다(Wallpaper Engine 등 빌트인 제외 보강).
+void sc_set_user_path_excludes(const wchar_t *const *names, int count);
+
 // 폴링 진입점: 호출자(visual-tracker)가 owner HWND 별로 showCmd 변화를 감지해
 // 위 맵에 트랜지션을 기록한다. graceMs 동안 sc_is_window_resizing이 true.
 void sc_notify_showcmd_change(HWND hwnd);

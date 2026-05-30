@@ -990,6 +990,167 @@ extern "C" void sc_set_user_game_list(const wchar_t *const *exes, int count)
 	}
 }
 
+// ============================================================
+// [실시간 경로 매칭] 게임 스토어 설치 폴더 기반 게임 판정.
+//   g_gameDirs: 정규화(소문자, 끝에 '\')된 게임 설치 폴더 prefix 목록.
+//   활성창 exe의 전체 경로가 이 중 하나로 시작하면 "게임"으로 인지한다.
+//   autodetect(주기/수동)가 스토어 설치 경로를 모아 sc_set_game_dirs로 갱신.
+// ============================================================
+std::mutex g_gameDirMutex;
+std::vector<std::wstring> g_gameDirs;
+
+// [사용자 추가 제외 — "게임 제외 목록"] OBS 설정에서 사용자가 입력한 항목.
+//   - exe 이름(.exe로 끝남)  → g_userExcludeExes (basename 정확 일치로 제외)
+//   - 그 외(폴더 이름)        → g_userExcludeSegs (\name\ 경로 세그먼트로 제외)
+// 둘 다 소문자. 제외에 걸리면 목록/경로/CPU와 무관하게 "게임 아님"으로 판정.
+std::mutex g_pathExcludeMutex;
+std::vector<std::wstring> g_userExcludeSegs;
+std::vector<std::wstring> g_userExcludeExes;
+
+static std::wstring sc_lower_ws(const wchar_t *s)
+{
+	std::wstring r;
+	if (!s)
+		return r;
+	for (; *s; ++s)
+		r.push_back(static_cast<wchar_t>(towlower(*s)));
+	return r;
+}
+
+extern "C" void sc_set_game_dirs(const wchar_t *const *dirs, int count)
+{
+	std::lock_guard<std::mutex> lock(g_gameDirMutex);
+	g_gameDirs.clear();
+	if (!dirs || count <= 0)
+		return;
+	g_gameDirs.reserve(static_cast<size_t>(count));
+	for (int i = 0; i < count; ++i) {
+		if (!dirs[i] || !dirs[i][0])
+			continue;
+		std::wstring d = sc_lower_ws(dirs[i]);
+		if (d.empty())
+			continue;
+		if (d.back() != L'\\')
+			d.push_back(L'\\');  // prefix 매칭 시 폴더 경계 보장
+		g_gameDirs.push_back(std::move(d));
+	}
+}
+
+// 게임 스토어 폴더(특히 ...\steamapps\common) 아래에 있지만 게임이 아닌 항목들.
+// 경로 매칭에서 제외해 OCR이 잘못 꺼지는 것을 막는다(PII 노출 위험 회피).
+// 경로 세그먼트(앞뒤 '\')로 매칭 → 폴더 이름 전체가 일치해야 함. 전부 소문자.
+// 필요 시 여기에 폴더명을 추가하면 됨(예: 새로운 비-게임 Steam 앱).
+static const wchar_t *const kPathExcludeSegments[] = {
+	L"\\steamworks common redistributables\\", // Steam 재배포 패키지
+	L"\\steamvr\\",                            // SteamVR 런타임
+	L"\\wallpaper_engine\\",                   // Wallpaper Engine (폴더명)
+	L"\\wallpaper engine\\",                   // (혹시 모를 변형)
+	L"\\spacewar\\",                           // Steam 테스트 앱
+	L"\\steam linux runtime\\",                // Linux 런타임
+	L"\\proton\\",                             // Proton(Linux 호환)
+};
+
+// [게임 제외 목록] OBS 설정 항목 갱신. update 콜백에서 호출.
+//   "Wallpaper Engine"(폴더) → "\wallpaper engine\" 세그먼트
+//   "wallpaper64.exe"(exe)   → "wallpaper64.exe" exe 이름
+extern "C" void sc_set_user_path_excludes(const wchar_t *const *names, int count)
+{
+	std::lock_guard<std::mutex> lock(g_pathExcludeMutex);
+	g_userExcludeSegs.clear();
+	g_userExcludeExes.clear();
+	if (!names || count <= 0)
+		return;
+	for (int i = 0; i < count; ++i) {
+		if (!names[i] || !names[i][0])
+			continue;
+		std::wstring s = sc_lower_ws(names[i]);
+		// 앞뒤 공백/슬래시 제거.
+		size_t b = s.find_first_not_of(L" \t\\/");
+		size_t e = s.find_last_not_of(L" \t\\/");
+		if (b == std::wstring::npos)
+			continue;
+		s = s.substr(b, e - b + 1);
+		if (s.empty())
+			continue;
+		// ".exe"로 끝나면 exe 이름 제외, 아니면 폴더 세그먼트 제외.
+		if (s.size() >= 4 && s.compare(s.size() - 4, 4, L".exe") == 0)
+			g_userExcludeExes.push_back(std::move(s));
+		else
+			g_userExcludeSegs.push_back(L"\\" + s + L"\\");
+	}
+}
+
+// [게임 제외 판정] 빌트인 폴더 + 사용자 폴더/exe 제외에 걸리면 true(=게임 아님).
+//   path_lower: 소문자 전체 경로, base_lower: 소문자 exe basename.
+static bool sc_is_excluded_from_game(const std::wstring &path_lower,
+                                     const std::wstring &base_lower)
+{
+	for (const wchar_t *seg : kPathExcludeSegments) {
+		if (path_lower.find(seg) != std::wstring::npos)
+			return true;
+	}
+	std::lock_guard<std::mutex> lock(g_pathExcludeMutex);
+	for (const auto &seg : g_userExcludeSegs) {
+		if (path_lower.find(seg) != std::wstring::npos)
+			return true;
+	}
+	for (const auto &exe : g_userExcludeExes) {
+		if (base_lower == exe)
+			return true;
+	}
+	return false;
+}
+
+// 경로 기반 게임 판정(순수). 제외 처리는 sc_hwnd_is_game에서 별도로 수행한다.
+extern "C" bool sc_is_game_by_path(const wchar_t *full_exe_path)
+{
+	if (!full_exe_path || !full_exe_path[0])
+		return false;
+	const std::wstring p = sc_lower_ws(full_exe_path);
+	std::lock_guard<std::mutex> lock(g_gameDirMutex);
+	for (const auto &d : g_gameDirs) {
+		if (d.size() <= p.size() && p.compare(0, d.size(), d) == 0)
+			return true;
+	}
+	return false;
+}
+
+extern "C" bool sc_hwnd_is_game(HWND hwnd, wchar_t *out_exe, size_t out_cap)
+{
+	if (out_exe && out_cap)
+		out_exe[0] = 0;
+	if (!hwnd)
+		return false;
+	DWORD pid = 0;
+	GetWindowThreadProcessId(hwnd, &pid);
+	if (pid == 0)
+		return false;
+	HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+	if (!proc)
+		return false;
+	wchar_t exe_path[MAX_PATH] = {};
+	DWORD path_size = MAX_PATH;
+	bool ok = QueryFullProcessImageNameW(proc, 0, exe_path, &path_size) != 0;
+	CloseHandle(proc);
+	if (!ok)
+		return false;
+	wchar_t base[128] = {};
+	path_basename(exe_path, base, 128);
+	if (out_exe && out_cap)
+		lstrcpynW(out_exe, base, static_cast<int>(out_cap));
+	// [게임 제외 목록] 제외에 걸리면 목록/경로와 무관하게 "게임 아님".
+	const std::wstring path_lower = sc_lower_ws(exe_path);
+	const std::wstring base_lower = sc_lower_ws(base);
+	if (sc_is_excluded_from_game(path_lower, base_lower))
+		return false;
+	// 목록(빌트인/사용자) 또는 실시간 경로(스토어 설치 폴더) 중 하나라도 맞으면 게임.
+	if (sc_is_known_game_or_user_game(base))
+		return true;
+	if (sc_is_game_by_path(exe_path))
+		return true;
+	return false;
+}
+
 // 빌트인 친화명 매핑에서 exe 검색. 매칭되면 out_buf에 복사 후 true.
 extern "C" bool sc_lookup_friendly_name(const wchar_t *exe_name,
                                           wchar_t *out_buf, size_t out_cap)
