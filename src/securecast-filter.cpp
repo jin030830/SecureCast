@@ -127,6 +127,48 @@ static std::unordered_set<std::wstring> g_gmWhitelist;
 // [T08] 자동 검색 동시 실행 방지. 사용자가 버튼을 연타해도 한 번에 enum 1회.
 static std::atomic<bool> g_autodetect_running{false};
 
+// [UAF-fix] detached 자동탐지 워커의 use-after-free 방지.
+// 자동탐지는 결과를 빠르게 못 받아도 되는 백그라운드 작업이라 detached 스레드로
+// 돌리는데(차단 MessageBox가 OBS UI를 막지 않도록), 그 스레드가 filter 파괴 후에도
+// 살아남아 filter->context를 건드리면 크래시(_CrtIsValidHeapPointer/segfault)한다.
+// 해법: 살아있는 filter 포인터 집합을 전역으로 두고, 워커는 filter 접근을
+// sc_with_live_filter()로 감싼다. 이 헬퍼는 (1) 락 하에 생존을 확인하고 "접근 중"
+// 으로 표시한 뒤, (2) 락을 놓고 obs_*를 호출하고, (3) 다시 락을 잡아 표시를 해제한다.
+// obs_* 호출 중에는 락을 쥐지 않으므로 OBS 내부 락과의 AB-BA 데드락이 없다.
+// destroy는 teardown 전에 집합에서 자신을 제거(이후 워커 접근은 no-op)하고, 진행 중인
+// 접근이 있으면 그것이 끝날 때까지만 condition_variable로 대기한다(차단 MessageBox는
+// 가드 밖이라 종료가 막히지 않는다).
+// (settings(obs_data_t*)는 독립 refcount라 filter와 무관하게 안전하게 다룰 수 있다.)
+static std::mutex g_liveFiltersMutex;
+static std::condition_variable g_liveFiltersCv;
+static std::unordered_set<SecureCastFilter *> g_liveFilters;
+// 현재 obs_source_*로 filter->context에 접근 중인 filter (없으면 nullptr).
+// 자동탐지는 g_autodetect_running CAS로 전역 1개만 동시 실행되므로 단일 슬롯이면
+// 충분하다. (동시 워커를 허용하게 바뀌면 per-filter refcount로 확장 필요.)
+static SecureCastFilter *g_liveAccessing = nullptr;
+
+// filter가 아직 살아있으면 fn()을 실행하고 true를, 죽었으면 false를 반환한다.
+// 핵심: obs_* 호출(fn) 동안에는 g_liveFiltersMutex를 잡지 않는다 —— OBS 내부 락과
+// 이 뮤텍스 사이의 AB-BA 데드락을 막기 위함. 대신 접근 중인 filter를 표시해두고,
+// destroy가 "그 접근이 끝날 때까지만" 기다리게 한다. fn에는 빠른 obs_* 호출만 넣고
+// 차단(MessageBox 등)은 넣지 않는다(넣으면 destroy가 그만큼 대기하게 됨).
+template <class Fn>
+static bool sc_with_live_filter(SecureCastFilter *filter, Fn &&fn) {
+  {
+    std::lock_guard<std::mutex> lk(g_liveFiltersMutex);
+    if (g_liveFilters.find(filter) == g_liveFilters.end())
+      return false;
+    g_liveAccessing = filter;
+  }
+  fn(); // 뮤텍스 미보유 상태에서 obs_* 호출 (데드락 방지)
+  {
+    std::lock_guard<std::mutex> lk(g_liveFiltersMutex);
+    g_liveAccessing = nullptr;
+    g_liveFiltersCv.notify_all();
+  }
+  return true;
+}
+
 // SecureCast/OBS 자기 자신 등 절대 블러 대상이 아닌 exe 목록.
 // OBS는 스트리밍 도구라 화면에 보여도 안전 — game mode 자동 블러에서 제외.
 static bool is_gm_excluded_exe(const std::wstring &exe) {
@@ -1940,6 +1982,12 @@ static void *securecast_create(obs_data_t *settings, obs_source_t *context) {
     blog(LOG_INFO,
          "[SecureCast] downsample effect loaded (Tier 1 GPU gray active).");
 
+  // [UAF-fix] 자동탐지 detached 워커가 생존 여부를 확인할 수 있도록 등록.
+  {
+    std::lock_guard<std::mutex> lk(g_liveFiltersMutex);
+    g_liveFilters.insert(filter);
+  }
+
   return filter;
 }
 
@@ -1951,6 +1999,17 @@ static void securecast_destroy(void *data) {
 
   // 진행 중인 핫키 콜백이 filter 멤버에 접근하지 못하도록 즉시 플래그 설정
   filter->isDestroying.store(true, std::memory_order_release);
+
+  // [UAF-fix] teardown 전에 live 집합에서 제거. 이후로는 detached 자동탐지 워커가
+  // sc_with_live_filter()에서 "죽음"으로 보고 filter 접근을 건너뛴다. 마침 이
+  // filter에 대한 obs_* 접근이 진행 중이면 그 짧은 호출이 끝날 때까지만 대기한다
+  // (obs_* 호출 중에는 이 뮤텍스를 안 쥐므로 데드락 없음). MessageBox는 가드 밖이라
+  // 종료가 막히지 않는다.
+  {
+    std::unique_lock<std::mutex> lk(g_liveFiltersMutex);
+    g_liveFilters.erase(filter);
+    g_liveFiltersCv.wait(lk, [filter] { return g_liveAccessing != filter; });
+  }
 
 #ifdef _WIN32
   // [Game mode v2 — T01] 게임 모드 활성 상태인 채로 필터가 파괴되면 글로벌
@@ -4578,11 +4637,9 @@ static std::wstring lowercase_copy(const std::wstring &s) {
 static void apply_autodetect_to_settings(
     SecureCastFilter *filter, obs_data_t *settings,
     const std::vector<securecast::GameInfo> &new_games) {
-  if (filter->isDestroying.load(std::memory_order_acquire)) {
-    blog(LOG_WARNING,
-         "[SecureCast] auto-detect: filter destroyed before apply, skipping");
-    return;
-  }
+  // [UAF-fix] settings 가공은 filter와 무관하므로 그대로 진행하고, 실제
+  // filter->context 접근(obs_source_update)만 아래에서 live 가드로 감싼다.
+  // (이전의 filter->isDestroying 직접 접근은 그 자체가 UAF 가능성이 있었다.)
   obs_data_array_t *arr = obs_data_get_array(settings, SC_SETTING_USER_GAMES);
   bool createdArr = false;
   if (!arr) {
@@ -4609,7 +4666,12 @@ static void apply_autodetect_to_settings(
   obs_data_array_release(arr);
   (void)createdArr;
 
-  obs_source_update(filter->context, settings);
+  if (!sc_with_live_filter(
+          filter, [&] { obs_source_update(filter->context, settings); })) {
+    blog(LOG_WARNING,
+         "[SecureCast] auto-detect: filter destroyed before apply, skipping");
+    return;
+  }
   blog(LOG_INFO,
        "[SecureCast] auto-detect: added %zu game(s) to sc_user_games",
        new_games.size());
@@ -4688,7 +4750,9 @@ static void autodetect_worker(SecureCastFilter *filter, bool silent) {
   if (!silent)
     run_source(6, securecast::enum_installed_programs_games);
 
-  if (filter->isDestroying.load(std::memory_order_acquire)) {
+  // [UAF-fix] filter->isDestroying 직접 접근(그 자체가 UAF 가능)을 live-집합
+  // 확인으로 대체. 이후 update_game_dirs_from/dedup 등은 filter를 안 건드린다.
+  if (!sc_with_live_filter(filter, [] {})) {
     blog(LOG_WARNING,
          "[SecureCast] auto-detect: filter destroyed mid-search, aborting");
     return;
@@ -4702,7 +4766,15 @@ static void autodetect_worker(SecureCastFilter *filter, bool silent) {
   // 동시에 옛 형식("vgc.exe" 단독)으로 저장된 entry를 enum 결과의 display_name
   // 으로 in-place 마이그레이션 ("Riot Vanguard  (vgc.exe)" 형식).
   std::unordered_set<std::wstring> existing;
-  obs_data_t *settings = obs_source_get_settings(filter->context);
+  obs_data_t *settings = nullptr;
+  // [UAF-fix] filter->context 접근을 live 가드로 감싼다.
+  if (!sc_with_live_filter(filter, [&] {
+        settings = obs_source_get_settings(filter->context);
+      })) {
+    blog(LOG_WARNING,
+         "[SecureCast] auto-detect: filter destroyed before reading settings");
+    return;
+  }
   bool migrated_any = false;
   if (settings) {
     obs_data_array_t *arr =
@@ -4763,7 +4835,8 @@ static void autodetect_worker(SecureCastFilter *filter, bool silent) {
         // 마이그레이션만으로 변경된 settings를 영구화. 이후 dialog YES 응답
         // 시 apply_autodetect_to_settings가 또 호출되면 한 번 더 동기화되지만
         // 두 호출이 안전하게 멱등이므로 무해.
-        obs_source_update(filter->context, settings);
+        sc_with_live_filter(
+            filter, [&] { obs_source_update(filter->context, settings); });
         blog(LOG_INFO,
              "[SecureCast] auto-detect: migrated old entries to "
              "friendly-name format");

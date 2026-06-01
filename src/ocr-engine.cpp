@@ -1067,12 +1067,12 @@ static bool valid_email(const std::string &e) {
   const auto at = e.find('@');
   if (at == std::string::npos || at < 1)
     return false;
-  // RFC 5321: local-part 최대 64자
+  // RFC 5321: local-part 최대 64자.
+  // (이전엔 바로 뒤에 at>40 검사가 있어 41~64자 local-part 이메일이 EMAIL로
+  //  분류되지 않아 마스킹에서 누락됐다. 죽은 코드였던 40자 상한을 제거하고
+  //  RFC 5321 상한(64)만 적용한다. 나머지 형식 검증(점 위치/TLD 길이/연속점
+  //  금지)이 오탐을 막으므로 상한 완화로 인한 false positive 위험은 미미.)
   if (at > 64)
-    return false;
-  // 전체 이메일 주소가 지나치게 길면(> 254자) 유효하지 않음 (RFC 5321)
-  // 또는 local-part 자체가 비현실적으로 길면 더미/스팸으로 간주
-  if (at > 40)
     return false;
   const auto dot = e.rfind('.');
   if (dot == std::string::npos || dot < at + 2 || dot >= e.size() - 2)

@@ -718,12 +718,17 @@ void CALLBACK MinimizeEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd,
 
 extern "C" void sc_minimize_tracker_init()
 {
-	if (g_minimizeRefCount.fetch_add(1, std::memory_order_acq_rel) != 0)
-		return; // 이미 등록됨
-	g_minimizeHook = SetWinEventHook(
-		EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND,
-		nullptr, MinimizeEventProc, 0, 0,
-		WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+	// refcount는 shutdown과 1:1로 페어링되는 "훅을 원하는 필터 수"다(항상 +1).
+	// 여기서 refcount를 롤백하면 shutdown의 -1과 짝이 안 맞아 언더플로가 난다.
+	g_minimizeRefCount.fetch_add(1, std::memory_order_acq_rel);
+	// [Hook-fix] 훅이 아직 없으면(첫 참조이거나 이전 SetWinEventHook 실패) (재)시도.
+	// 이전엔 첫 참조에서 실패하면 refcount만 오르고 영영 재시도하지 않아, 살아있는
+	// 필터가 있는 동안 최소화 추적이 비활성이었다. null일 때만 거는 것으로 교정.
+	if (!g_minimizeHook)
+		g_minimizeHook = SetWinEventHook(
+			EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND,
+			nullptr, MinimizeEventProc, 0, 0,
+			WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
 }
 
 extern "C" void sc_minimize_tracker_shutdown()
@@ -824,12 +829,14 @@ void CALLBACK ResizeEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd,
 
 extern "C" void sc_resize_tracker_init()
 {
-	if (g_resizeRefCount.fetch_add(1, std::memory_order_acq_rel) != 0)
-		return;
-	g_resizeHook = SetWinEventHook(
-		EVENT_SYSTEM_MOVESIZESTART, EVENT_SYSTEM_MOVESIZEEND, nullptr,
-		ResizeEventProc, 0, 0,
-		WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+	// refcount는 shutdown과 페어링되므로 항상 +1 (롤백하면 언더플로).
+	g_resizeRefCount.fetch_add(1, std::memory_order_acq_rel);
+	// [Hook-fix] 훅이 null일 때만 (재)시도 (minimize와 동일 — 영구 비활성 방지).
+	if (!g_resizeHook)
+		g_resizeHook = SetWinEventHook(
+			EVENT_SYSTEM_MOVESIZESTART, EVENT_SYSTEM_MOVESIZEEND, nullptr,
+			ResizeEventProc, 0, 0,
+			WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
 }
 
 extern "C" void sc_resize_tracker_shutdown()

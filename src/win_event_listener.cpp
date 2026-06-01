@@ -76,13 +76,26 @@ void WinEventListener::run()
     }
 
     // 메시지 펌프 — WINEVENT_OUTOFCONTEXT 콜백은 이 펌프에서 dispatch 됨.
+    // [Hang-fix] WM_QUIT에 의존하지 않고 100ms마다 m_running을 재확인한다.
+    // stop()은 m_threadId(비원자적)를 동기화 없이 읽어, 스레드가 막 시작돼
+    // m_threadId가 아직 0이면 WM_QUIT를 보내지 못한다. 또 스레드 메시지 큐가
+    // 생성되기 전에 PostThreadMessage가 호출되면 WM_QUIT가 유실된다. 둘 중
+    // 어느 경우든 기존 GetMessage는 영원히 블록되어 stop()의 join()이 데드락
+    // 했다. 타임아웃 펌프는 그 상황에서도 100ms 내에 루프를 종료한다.
+    // (OUTOFCONTEXT 콜백은 PeekMessage 펌프로도 정상 dispatch 된다.)
     MSG msg{};
     while (m_running.load(std::memory_order_acquire)) {
-        BOOL ret = GetMessage(&msg, nullptr, 0, 0);
-        if (ret <= 0) // WM_QUIT 또는 에러
+        DWORD wr = MsgWaitForMultipleObjectsEx(0, nullptr, 100, QS_ALLINPUT, 0);
+        if (wr == WAIT_FAILED)
             break;
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
+        while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) {
+                m_running.store(false, std::memory_order_release);
+                break;
+            }
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
     }
 
     if (m_hookGroup1) UnhookWinEvent(m_hookGroup1);
