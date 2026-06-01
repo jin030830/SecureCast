@@ -97,8 +97,15 @@ if(WIN32)
   if(DEFINED ENV{VCPKG_INSTALLATION_ROOT}
      AND EXISTS "$ENV{VCPKG_INSTALLATION_ROOT}/installed/x64-windows")
     list(APPEND CMAKE_PREFIX_PATH "$ENV{VCPKG_INSTALLATION_ROOT}/installed/x64-windows")
+    set(SC_VCPKG_BIN "$ENV{VCPKG_INSTALLATION_ROOT}/installed/x64-windows/bin")
   elseif(EXISTS "C:/vcpkg/installed/x64-windows")
     list(APPEND CMAKE_PREFIX_PATH "C:/vcpkg/installed/x64-windows")
+    set(SC_VCPKG_BIN "C:/vcpkg/installed/x64-windows/bin")
+  endif()
+  # RE2_DIR(.../share/re2)만 지정된 경우에도 런타임 DLL이 있는 bin을 유추.
+  if(NOT DEFINED SC_VCPKG_BIN AND DEFINED ENV{RE2_DIR}
+     AND EXISTS "$ENV{RE2_DIR}/../../bin")
+    get_filename_component(SC_VCPKG_BIN "$ENV{RE2_DIR}/../../bin" ABSOLUTE)
   endif()
 endif()
 
@@ -279,8 +286,49 @@ if(WIN32)
     VERBATIM
   )
 endif()
-# [핵심 해결] downsample.effect 등 필수 리소스를 OBS가 인식하는 표준 데이터 폴더로 복사
-install(DIRECTORY data/ DESTINATION "data/obs-plugins/${CMAKE_PROJECT_NAME}")
+
+# [런타임 의존성 동봉] securecast.dll은 re2.dll을 동적 링크하고, re2는
+# abseil_dll.dll을 필요로 한다. 이 둘이 빠지면 OBS가 플러그인을 못 읽는다
+# ("Failed to load plugin"). POST_BUILD(로컬 자동 배포)와 install(cmake --install
+# /CI) 양쪽에 동봉해, 어느 경로로 패키징하든 완전한 zip이 되게 한다.
+# (DLL 출처는 vcpkg release bin. cross-CRT 안전: RE2 캡처는 StringPiece로 전환돼
+#  std::string이 DLL 경계를 넘지 않으므로 Debug 빌드에서도 문제없음.)
+if(WIN32)
+  set(SC_RUNTIME_DLLS "")
+  if(DEFINED SC_VCPKG_BIN)
+    foreach(_dll re2.dll abseil_dll.dll)
+      if(EXISTS "${SC_VCPKG_BIN}/${_dll}")
+        list(APPEND SC_RUNTIME_DLLS "${SC_VCPKG_BIN}/${_dll}")
+      endif()
+    endforeach()
+  endif()
+  if(SC_RUNTIME_DLLS)
+    add_custom_command(
+      TARGET ${CMAKE_PROJECT_NAME}
+      POST_BUILD
+      COMMAND "${CMAKE_COMMAND}" -E copy_if_different ${SC_RUNTIME_DLLS}
+        "${CMAKE_INSTALL_PREFIX}/${CMAKE_PROJECT_NAME}/bin/64bit/"
+      COMMENT "Copy re2/abseil runtime DLLs to ${CMAKE_PROJECT_NAME} plugin bin"
+      COMMAND_EXPAND_LISTS
+      VERBATIM
+    )
+    install(FILES ${SC_RUNTIME_DLLS}
+            DESTINATION "${CMAKE_PROJECT_NAME}/bin/64bit")
+    message(STATUS "SecureCast: bundling runtime DLLs -> ${SC_RUNTIME_DLLS}")
+  else()
+    message(WARNING
+      "SecureCast: re2.dll/abseil_dll.dll을 찾지 못해 동봉하지 못함 "
+      "(SC_VCPKG_BIN='${SC_VCPKG_BIN}'). 배포 zip에 런타임 DLL이 빠질 수 있음 — "
+      "vcpkg 경로를 확인하세요.")
+  endif()
+endif()
+
+# data/ 리소스 설치는 OBS 템플릿의 set_target_properties_plugin →
+# target_install_resources(cmake/windows/helpers.cmake)가 신형 레이아웃
+# (${name}/data)으로 이미 처리한다. 과거의
+#   install(DIRECTORY data/ DESTINATION "data/obs-plugins/${name}")
+# 은 구형(pre-28) 경로라 패키지에 잉여 data/obs-plugins/... 트리를 만들었으므로
+# 제거했다. (신형 레이아웃 하나로 통일.)
 
 # =============================================================================
 # 단위 테스트 (BUILD_TESTING=ON 일 때만 빌드)
