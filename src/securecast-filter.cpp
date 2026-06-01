@@ -1148,6 +1148,13 @@ static void ocr_worker_loop(SecureCastFilter *filter) {
   }
 
   while (true) {
+    // [계측][diag] 워커 루프 본문을 try로 감싼다. 예외가 스레드 밖으로 새어나가면
+    // std::terminate() -> abort() ("abort() has been called")가 호출되므로 — 이번
+    // 진단 대상 — 여기서 잡아 어떤 예외가 어디서 났는지 로그로 남기고, back-pressure
+    // 를 풀어 게이트가 영구 freeze 되지 않게 한 뒤 다음 프레임으로 진행한다.
+    // (lastCompletedOcrFrameId는 갱신하지 않으므로 미검증 프레임은 계속 freeze =
+    //  Zero-Exposure 유지.) 진단과 안전망을 겸한다.
+    try {
     std::vector<uint8_t> pixels;
     int width = 0;
     int height = 0;
@@ -1379,8 +1386,29 @@ static void ocr_worker_loop(SecureCastFilter *filter) {
       }
     }
 
+    // [계측][diag][ocr-timing] OCR 1회 처리시간 측정. 이 값이 화면전환 시
+    // freeze 지속시간의 실질 병목이다. 입력 해상도(in)와 함께 30회마다 last/
+    // avg/max(ms)를 찍어 느린 PC·멀티모니터(큰 입력)에서 얼마나 느려지는지
+    // 수치로 확인한다. os_gettime_ns()는 단조 시계(util/platform.h).
+    const uint64_t scOcrT0Ns = os_gettime_ns();
     auto ocrBoxes =
         filter->ocrEngine->analyze_bgra_frame(ocrPx, ocrW2, ocrH2, ocrStride2);
+    {
+      const uint64_t scOcrDurMs = (os_gettime_ns() - scOcrT0Ns) / 1000000ULL;
+      static thread_local uint64_t scOcrN = 0, scOcrSumMs = 0, scOcrMaxMs = 0;
+      scOcrN++;
+      scOcrSumMs += scOcrDurMs;
+      if (scOcrDurMs > scOcrMaxMs)
+        scOcrMaxMs = scOcrDurMs;
+      if (scOcrN % 30 == 0)
+        blog(LOG_INFO,
+             "[SecureCast][diag][ocr-timing] last=%llums avg=%llums max=%llums "
+             "in=%dx%d boxes=%zu (n=%llu)",
+             (unsigned long long)scOcrDurMs,
+             (unsigned long long)(scOcrSumMs / scOcrN),
+             (unsigned long long)scOcrMaxMs, ocrW2, ocrH2, ocrBoxes.size(),
+             (unsigned long long)scOcrN);
+    }
 
     // 좌표를 원본 해상도로 복원 (coordScale = 1/adaptScale)
     if (coordScale != 1.0f) {
@@ -1540,6 +1568,24 @@ static void ocr_worker_loop(SecureCastFilter *filter) {
 
     // back-pressure 해제: 다음 프레임 readback 허용
     filter->ocrWorkerIdle.store(true, std::memory_order_release);
+    } catch (const std::exception &e) {
+      // 게이트가 영구 freeze 되지 않도록 back-pressure를 반드시 푼다.
+      filter->ocrWorkerIdle.store(true, std::memory_order_release);
+      static thread_local uint64_t scOcrExcCount = 0;
+      if (scOcrExcCount++ % 30 == 0)
+        blog(LOG_ERROR,
+             "[SecureCast][diag][ocr-thread] std::exception escaped loop "
+             "(#%llu): %s",
+             (unsigned long long)scOcrExcCount, e.what());
+    } catch (...) {
+      filter->ocrWorkerIdle.store(true, std::memory_order_release);
+      static thread_local uint64_t scOcrExcCountU = 0;
+      if (scOcrExcCountU++ % 30 == 0)
+        blog(LOG_ERROR,
+             "[SecureCast][diag][ocr-thread] non-std exception escaped loop "
+             "(#%llu) — likely WinRT/hresult_error or SEH",
+             (unsigned long long)scOcrExcCountU);
+    }
   }
 
   blog(LOG_INFO, "[securecast][ocr] OCR worker stopped.");
@@ -1588,8 +1634,26 @@ static void tracker_thread_loop(SecureCastFilter *filter) {
       filter->trackerInputReady_ = false;
     }
 
-    if (!gray.empty() && w > 0 && h > 0)
-      filter->trackerMgr.update_all_gray(gray.data(), w, h);
+    if (!gray.empty() && w > 0 && h > 0) {
+      // [계측][diag] NCC 추적 연산에서 예외가 새면 이 스레드가 죽으며
+      // std::terminate()->abort()가 난다. 잡아서 어느 스레드인지 로그로 남기고
+      // 다음 프레임으로 진행한다(진단+안전망).
+      try {
+        filter->trackerMgr.update_all_gray(gray.data(), w, h);
+      } catch (const std::exception &e) {
+        static thread_local uint64_t scTrkExc = 0;
+        if (scTrkExc++ % 30 == 0)
+          blog(LOG_ERROR,
+               "[SecureCast][diag][tracker-thread] std::exception (#%llu): %s",
+               (unsigned long long)scTrkExc, e.what());
+      } catch (...) {
+        static thread_local uint64_t scTrkExcU = 0;
+        if (scTrkExcU++ % 30 == 0)
+          blog(LOG_ERROR,
+               "[SecureCast][diag][tracker-thread] non-std exception (#%llu)",
+               (unsigned long long)scTrkExcU);
+      }
+    }
   }
 }
 
@@ -3201,12 +3265,20 @@ static void securecast_video_tick(void *data, float seconds) {
       if (g_autodetect_running.compare_exchange_strong(
               expected, true, std::memory_order_acq_rel)) {
         std::thread([filter]() {
+          // [계측][diag][autodetect] detached 워커라 필터 파괴 후에도 살아있으면
+          // 해제된 filter 접근(use-after-free)으로 크래시 가능 — 2순위 용의자.
+          // begin은 찍혔는데 end가 없고 그 사이 'Destroying filter'가 보이면
+          // 이 detached 워커의 UAF를 의심한다.
+          blog(LOG_INFO,
+               "[SecureCast][diag][autodetect] periodic worker begin (detached)");
           try {
             autodetect_worker(filter, /*silent=*/true);
           } catch (...) {
             blog(LOG_WARNING, "[SecureCast] 주기 자동검색 예외 발생");
           }
           g_autodetect_running.store(false, std::memory_order_release);
+          blog(LOG_INFO,
+               "[SecureCast][diag][autodetect] periodic worker end (detached)");
         }).detach();
       }
     }

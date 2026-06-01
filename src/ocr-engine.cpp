@@ -1194,10 +1194,15 @@ SecureCastOcrEngine::detect_pii(const std::vector<SecureCastOcrLine> &lines) {
 
     // === STEP 2-2: 이메일은 문자 기반이므로 먼저 검사 ===
     {
-      std::string emailMatch;
-      if (re2::RE2::PartialMatch(rawText, PATTERN_EMAIL, &emailMatch) &&
-          valid_email(emailMatch)) {
-        type = "EMAIL";
+      // [CRT-fix] RE2가 std::string 출력에 직접 쓰면 그 버퍼가 re2.dll 힙(Release
+      // /MD)에 할당되고, 플러그인(Debug /MDd) 힙에서 해제될 때
+      // _CrtIsValidHeapPointer assertion이 난다. 입력을 가리키는 뷰(StringPiece,
+      // 할당 없음)로 캡처한 뒤 std::string은 플러그인 힙에서 직접 만든다.
+      re2::StringPiece m;
+      if (re2::RE2::PartialMatch(rawText, PATTERN_EMAIL, &m)) {
+        const std::string emailMatch(m.data(), m.size());
+        if (valid_email(emailMatch))
+          type = "EMAIL";
       }
     }
 
@@ -1208,20 +1213,24 @@ SecureCastOcrEngine::detect_pii(const std::vector<SecureCastOcrLine> &lines) {
       if (!rawText.empty() && rawText[0] == '@' && i > 0) {
         // 현재 라인이 @-파트 → 직전 라인과 결합
         const std::string combined = lines[i - 1].text + rawText;
-        std::string emailMatch;
-        if (RE2::PartialMatch(combined, PATTERN_EMAIL, &emailMatch) &&
-            valid_email(emailMatch))
-          type = "EMAIL";
+        re2::StringPiece m;
+        if (RE2::PartialMatch(combined, PATTERN_EMAIL, &m)) {
+          const std::string emailMatch(m.data(), m.size());
+          if (valid_email(emailMatch))
+            type = "EMAIL";
+        }
       }
       if (type == nullptr && i + 1 < static_cast<int>(lines.size())) {
         const std::string &nextText = lines[i + 1].text;
         // 다음 라인이 @-파트 → 현재 라인과 결합
         if (!nextText.empty() && nextText[0] == '@') {
           const std::string combined = rawText + nextText;
-          std::string emailMatch;
-          if (RE2::PartialMatch(combined, PATTERN_EMAIL, &emailMatch) &&
-              valid_email(emailMatch))
-            type = "EMAIL";
+          re2::StringPiece m;
+          if (RE2::PartialMatch(combined, PATTERN_EMAIL, &m)) {
+            const std::string emailMatch(m.data(), m.size());
+            if (valid_email(emailMatch))
+              type = "EMAIL";
+          }
         }
       }
     }
@@ -1251,8 +1260,9 @@ SecureCastOcrEngine::detect_pii(const std::vector<SecureCastOcrLine> &lines) {
     // 성씨 시작 + 블랙리스트 통과 조건으로 "고객님", "선생님" 등 일반 호칭
     // 배제.
     if (type == nullptr) {
-      std::string honorName;
-      if (RE2::PartialMatch(rawText, PATTERN_NAME_HONORIFIC, &honorName)) {
+      re2::StringPiece honorPiece;
+      if (RE2::PartialMatch(rawText, PATTERN_NAME_HONORIFIC, &honorPiece)) {
+        const std::string honorName(honorPiece.data(), honorPiece.size());
         const std::string h = extract_hangul_syllables_utf8(honorName);
         const int hc = count_hangul_syllables(h);
         if (hc >= 2 && hc <= 4 && starts_with_common_korean_surname(h) &&
@@ -1298,10 +1308,12 @@ SecureCastOcrEngine::detect_pii(const std::vector<SecureCastOcrLine> &lines) {
     if (type == nullptr) {
       // (f) 숫자 cluster 추출 → normalize → 각 cluster에 대해 패턴 검사
       re2::StringPiece input(rawText);
-      std::string cluster;
+      re2::StringPiece cluster; // [CRT-fix] StringPiece 캡처 (재할당 없음)
       std::string normalizedLine; // cluster를 붙여 재조합한 보정 텍스트
       while (RE2::FindAndConsume(&input, PATTERN_NUMERIC_CLUSTER, &cluster)) {
-        normalizedLine += normalize_numeric_candidate(cluster) + " ";
+        normalizedLine += normalize_numeric_candidate(
+                              std::string(cluster.data(), cluster.size())) +
+                          " ";
       }
       // 클러스터 추출 실패 시(OCR 오류 문자 포함): rawText 전체를 직접 정규화
       // 예: "O1O-1234-5678" → 클러스터 미추출 → normalize 직접 적용 →
@@ -1313,9 +1325,10 @@ SecureCastOcrEngine::detect_pii(const std::vector<SecureCastOcrLine> &lines) {
 
       // (d) RRN: 패턴 매칭 후 체크섬 검증
       {
-        std::string d1, d2;
+        re2::StringPiece d1, d2;
         if (RE2::PartialMatch(normalizedLine, PATTERN_RRN, &d1, &d2)) {
-          std::string digits13 = d1 + d2;
+          const std::string digits13 = std::string(d1.data(), d1.size()) +
+                                        std::string(d2.data(), d2.size());
           static const auto rrn_checksum = [](const std::string &d) -> bool {
             if (d.size() != 13)
               return false;
@@ -1353,19 +1366,24 @@ SecureCastOcrEngine::detect_pii(const std::vector<SecureCastOcrLine> &lines) {
 
       // CARD: 4-4-4-4(일반) 또는 4-6-5(AmEx) + Luhn + IIN 검증
       if (type == nullptr) {
-        std::string g1, g2, g3, g4;
+        re2::StringPiece g1, g2, g3, g4;
         if (RE2::PartialMatch(normalizedLine, PATTERN_CARD, &g1, &g2, &g3,
                               &g4)) {
-          const std::string digits = g1 + g2 + g3 + g4;
+          const std::string digits = std::string(g1.data(), g1.size()) +
+                                      std::string(g2.data(), g2.size()) +
+                                      std::string(g3.data(), g3.size()) +
+                                      std::string(g4.data(), g4.size());
           if (luhn_check(digits) && valid_card_iin(digits))
             type = "CARD";
         }
         // AmEx: 4-6-5 구조, 15자리, Luhn 검증
         if (type == nullptr) {
-          std::string a1, a2, a3;
+          re2::StringPiece a1, a2, a3;
           if (RE2::PartialMatch(normalizedLine, PATTERN_CARD_AMEX, &a1, &a2,
                                 &a3)) {
-            const std::string digits15 = a1 + a2 + a3;
+            const std::string digits15 = std::string(a1.data(), a1.size()) +
+                                         std::string(a2.data(), a2.size()) +
+                                         std::string(a3.data(), a3.size());
             // AmEx는 34 또는 37로 시작
             if ((digits15[0] == '3' &&
                  (digits15[1] == '4' || digits15[1] == '7')) &&
@@ -1389,11 +1407,13 @@ SecureCastOcrEngine::detect_pii(const std::vector<SecureCastOcrLine> &lines) {
 
       // (a) IP: 옥텟 범위 + 사설/예약/멀티캐스트 대역 제외 검증
       if (type == nullptr) {
-        std::string oa, ob, oc, od;
+        re2::StringPiece oa, ob, oc, od;
         re2::StringPiece ipInput(normalizedLine);
         while (RE2::FindAndConsume(&ipInput, PATTERN_IP, &oa, &ob, &oc, &od)) {
-          int a = std::stoi(oa), b = std::stoi(ob), c = std::stoi(oc),
-              d = std::stoi(od);
+          int a = std::stoi(std::string(oa.data(), oa.size())),
+              b = std::stoi(std::string(ob.data(), ob.size())),
+              c = std::stoi(std::string(oc.data(), oc.size())),
+              d = std::stoi(std::string(od.data(), od.size()));
           if (a > 255 || b > 255 || c > 255 || d > 255)
             continue;
           if (a == 10)
@@ -1471,8 +1491,9 @@ SecureCastOcrEngine::detect_pii(const std::vector<SecureCastOcrLine> &lines) {
       if (type == nullptr && sameLineLabel) {
         static const re2::RE2 PAT_ENG_NAME(
             R"((?:[A-Z][a-z]{1,14}\s){1,2}[A-Z][a-z]{1,14})");
-        std::string engName;
-        if (RE2::PartialMatch(rawText, PAT_ENG_NAME, &engName)) {
+        re2::StringPiece engPiece;
+        if (RE2::PartialMatch(rawText, PAT_ENG_NAME, &engPiece)) {
+          const std::string engName(engPiece.data(), engPiece.size());
           static const std::unordered_set<std::string> ENG_NAME_BLOCKLIST = {
               "Full Name", "First Name", "Last Name",
               "User Name", "Error Code", "Build Version"};
