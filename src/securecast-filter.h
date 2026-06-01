@@ -371,18 +371,15 @@ struct SecureCastFilter {
   // 못하도록
   std::atomic<bool> isDestroying{false};
 
-  // ----- [Panic Button] Ctrl+Shift+F12 -----
-  std::atomic<bool> panicMode{false};
-  obs_hotkey_id panicHotkeyId = OBS_INVALID_HOTKEY_ID;
+  // [단축키 전역화] 패닉/OCR 토글 상태와 모든 단축키 등록은 모듈 전역(.cpp의
+  // g_panicMode/g_ocrDisabled/g_*HotkeyId)으로 이동했다 — 필터가 여러 개여도 OBS
+  // 단축키 목록에 한 번만 보이고, 토글은 모든 필터에 동시 적용된다. 드래그 블러
+  // 선택 단축키는 제거됨. 그래서 여기엔 per-instance 핫키/토글 멤버가 없다.
 
 #ifdef _WIN32
   // ----- [Role D] 수동 드래그 블러 선택 오버레이 -----
+  // (전용 단축키는 제거됐지만 오버레이 인프라는 향후 재사용 대비 유지)
   SelectionOverlay selectionOverlay;
-  obs_hotkey_id selectHotkeyId = OBS_INVALID_HOTKEY_ID;
-
-  // [T12] 블랙리스트/화이트리스트 UI 핫키 (기본 Ctrl+Shift+L) — 게임 모드
-  // 중에도 사용자가 빠르게 차단 앱/허용 앱을 편집할 수 있도록.
-  obs_hotkey_id blacklistUiHotkeyId = OBS_INVALID_HOTKEY_ID;
 #endif
 
   // ----- [Role D] 알림 영역 자동 블러 -----

@@ -1745,17 +1745,119 @@ static void stop_ocr_worker(SecureCastFilter *filter) {
 // Filter Lifecycle Callbacks
 // ================================================================
 
-// Panic 핫키 콜백 — 누를 때(pressed=true)만 토글. 해제 이벤트는 무시.
-static void panic_hotkey_cb(void *data, obs_hotkey_id, obs_hotkey_t *,
-                            bool pressed) {
+// ============================================================================
+// [전역 단축키] 필터 인스턴스가 여러 개여도 OBS 단축키 목록에 한 번만 보이도록
+// 모듈 전역에 1회만 등록한다(refcount). 첫 필터 생성 시 등록, 마지막 필터 파괴
+// 시 해제. 패닉·OCR 토글 상태도 전역 공유 → 한 번 누르면 모든 SecureCast 필터에
+// 동시 적용. 블랙리스트 UI는 "현재 활성(가장 최근 렌더된) 필터"의 속성을 연다.
+// 드래그 블러 선택 단축키는 제거됨.
+// ============================================================================
+static std::atomic<int> g_scHotkeyRefCount{0};
+static obs_hotkey_id g_panicHotkeyId = OBS_INVALID_HOTKEY_ID;
+static obs_hotkey_id g_ocrToggleHotkeyId = OBS_INVALID_HOTKEY_ID;
+static obs_hotkey_id g_blacklistUiHotkeyId = OBS_INVALID_HOTKEY_ID;
+static std::atomic<bool> g_panicMode{false};   // 전역 패닉 (모든 필터가 읽음)
+static std::atomic<bool> g_ocrDisabled{false}; // 전역 OCR 토글 (모든 필터가 읽음)
+// 블랙리스트 UI 단축키 대상: 가장 최근 렌더된(=화면에 보이는) 필터. video_render
+// 에서 매 프레임 갱신. raw 포인터라 사용 전 g_liveFilters로 생존 확인(UAF 방지).
+static std::atomic<SecureCastFilter *> g_lastActiveFilter{nullptr};
+
+// 패닉 토글 (전역). pressed에서만 토글.
+static void sc_panic_hotkey_cb(void *, obs_hotkey_id, obs_hotkey_t *,
+                               bool pressed) {
   if (!pressed)
     return;
-  auto *filter = static_cast<SecureCastFilter *>(data);
-  if (filter->isDestroying.load(std::memory_order_acquire))
+  const bool next = !g_panicMode.load(std::memory_order_relaxed);
+  g_panicMode.store(next, std::memory_order_relaxed);
+  blog(LOG_INFO, "[SecureCast] Panic mode %s (전역).", next ? "ON" : "OFF");
+}
+
+// OCR PII 마스킹 토글 (전역). 끄면 모든 필터의 OCR 분석/트래커 제출 중단, OCR
+// 마스크 미표시, freeze 게이트 통과. ⚠ 끈 동안 PII는 마스킹되지 않는다.
+static void sc_ocr_toggle_hotkey_cb(void *, obs_hotkey_id, obs_hotkey_t *,
+                                    bool pressed) {
+  if (!pressed)
     return;
-  bool next = !filter->panicMode.load(std::memory_order_relaxed);
-  filter->panicMode.store(next, std::memory_order_relaxed);
-  blog(LOG_INFO, "[SecureCast] Panic mode %s.", next ? "ON" : "OFF");
+  const bool next = !g_ocrDisabled.load(std::memory_order_relaxed);
+  g_ocrDisabled.store(next, std::memory_order_release);
+  blog(LOG_WARNING, "[SecureCast] OCR PII 마스킹 %s (전역)%s",
+       next ? "OFF" : "ON", next ? " — PII가 마스킹되지 않습니다!" : "");
+}
+
+// 블랙리스트/화이트리스트 UI 열기 (전역, 대상 = 현재 활성 필터).
+static void sc_blacklist_ui_hotkey_cb(void *, obs_hotkey_id, obs_hotkey_t *,
+                                      bool pressed) {
+  if (!pressed)
+    return;
+  SecureCastFilter *target = g_lastActiveFilter.load(std::memory_order_acquire);
+  if (!target)
+    return;
+  // 생존 확인 하에 속성 창 열기 (destroy와의 UAF 방지 — 기존 헬퍼 재사용).
+  sc_with_live_filter(target, [target] {
+    obs_frontend_open_source_properties(target->context);
+  });
+}
+
+// 기본 키 바인딩(Ctrl+Shift+<key>) 로드 헬퍼.
+static void sc_load_hotkey_default(obs_hotkey_id id, const char *key) {
+  if (id == OBS_INVALID_HOTKEY_ID)
+    return;
+  obs_data_t *combo = obs_data_create();
+  obs_data_array_t *arr = obs_data_array_create();
+  obs_data_set_bool(combo, "control", true);
+  obs_data_set_bool(combo, "shift", true);
+  obs_data_set_bool(combo, "alt", false);
+  obs_data_set_string(combo, "key", key);
+  obs_data_array_push_back(arr, combo);
+  obs_hotkey_load(id, arr);
+  obs_data_array_release(arr);
+  obs_data_release(combo);
+}
+
+// 전역 단축키 1회 등록 (첫 필터). refcount는 unregister와 1:1 페어링이라 항상 +1
+// (롤백하면 언더플로 — Hook-fix와 동일 원칙).
+static void sc_register_global_hotkeys() {
+  if (g_scHotkeyRefCount.fetch_add(1, std::memory_order_acq_rel) != 0)
+    return; // 이미 등록됨
+
+  g_panicHotkeyId = obs_hotkey_register_frontend(
+      "securecast_panic_toggle", obs_module_text("PanicButton"),
+      sc_panic_hotkey_cb, nullptr);
+  sc_load_hotkey_default(g_panicHotkeyId, "OBS_KEY_F12");
+
+  g_ocrToggleHotkeyId = obs_hotkey_register_frontend(
+      "securecast_ocr_toggle", "SecureCast — OCR PII 마스킹 켜기/끄기",
+      sc_ocr_toggle_hotkey_cb, nullptr);
+  sc_load_hotkey_default(g_ocrToggleHotkeyId, "OBS_KEY_O");
+
+  g_blacklistUiHotkeyId = obs_hotkey_register_frontend(
+      "securecast_open_blacklist_ui",
+      "SecureCast — 블랙리스트/화이트리스트 UI 열기",
+      sc_blacklist_ui_hotkey_cb, nullptr);
+  sc_load_hotkey_default(g_blacklistUiHotkeyId, "OBS_KEY_L");
+
+  blog(LOG_INFO, "[SecureCast] 전역 단축키 등록 (Panic=Ctrl+Shift+F12, "
+                 "OCR=Ctrl+Shift+O, UI=Ctrl+Shift+L).");
+}
+
+// 전역 단축키 해제 (마지막 필터 파괴 시).
+static void sc_unregister_global_hotkeys() {
+  if (g_scHotkeyRefCount.fetch_sub(1, std::memory_order_acq_rel) != 1)
+    return; // 아직 다른 필터가 남아 있음
+  if (g_panicHotkeyId != OBS_INVALID_HOTKEY_ID) {
+    obs_hotkey_unregister(g_panicHotkeyId);
+    g_panicHotkeyId = OBS_INVALID_HOTKEY_ID;
+  }
+  if (g_ocrToggleHotkeyId != OBS_INVALID_HOTKEY_ID) {
+    obs_hotkey_unregister(g_ocrToggleHotkeyId);
+    g_ocrToggleHotkeyId = OBS_INVALID_HOTKEY_ID;
+  }
+  if (g_blacklistUiHotkeyId != OBS_INVALID_HOTKEY_ID) {
+    obs_hotkey_unregister(g_blacklistUiHotkeyId);
+    g_blacklistUiHotkeyId = OBS_INVALID_HOTKEY_ID;
+  }
+  g_lastActiveFilter.store(nullptr, std::memory_order_release);
+  blog(LOG_INFO, "[SecureCast] 전역 단축키 해제.");
 }
 
 // OBS가 필터 메뉴/관리 UI에 표시할 이름.
@@ -1838,119 +1940,8 @@ static void *securecast_create(obs_data_t *settings, obs_source_t *context) {
   sc_resize_tracker_init();
 #endif
 
-  // Panic 핫키 등록 (Ctrl+Shift+F12 기본 바인딩)
-  filter->panicHotkeyId = obs_hotkey_register_frontend(
-      "securecast_panic_toggle", obs_module_text("PanicButton"),
-      panic_hotkey_cb, filter);
-  if (filter->panicHotkeyId != OBS_INVALID_HOTKEY_ID) {
-    obs_data_t *combo = obs_data_create();
-    obs_data_array_t *arr = obs_data_array_create();
-    obs_data_set_bool(combo, "control", true);
-    obs_data_set_bool(combo, "shift", true);
-    obs_data_set_bool(combo, "alt", false);
-    obs_data_set_string(combo, "key", "OBS_KEY_F12");
-    obs_data_array_push_back(arr, combo);
-    obs_hotkey_load(filter->panicHotkeyId, arr);
-    obs_data_array_release(arr);
-    obs_data_release(combo);
-    blog(LOG_INFO, "[SecureCast] Panic hotkey registered (Ctrl+Shift+F12).");
-  }
-
-#ifdef _WIN32
-  // [Role D] 드래그 블러 선택 핫키 등록 (Ctrl+Shift+B)
-  filter->selectHotkeyId = obs_hotkey_register_frontend(
-      "securecast_select_blur", obs_module_text("SelectBlurRegion"),
-      [](void *data, obs_hotkey_id, obs_hotkey_t *, bool pressed) {
-        if (!pressed)
-          return;
-        auto *f = static_cast<SecureCastFilter *>(data);
-        if (f->isDestroying.load(std::memory_order_acquire))
-          return;
-        if (f->selectionOverlay.isActive()) {
-          f->selectionOverlay.cancel(); // 두 번 누르면 취소
-          return;
-        }
-        f->selectionOverlay.start([f](BlurRect rect) {
-          // 모니터 픽셀 좌표 → 소스 픽셀 좌표 변환
-          HMONITOR hmon = MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
-          MONITORINFO mi{};
-          mi.cbSize = sizeof(mi);
-          GetMonitorInfo(hmon, &mi);
-          int monW = mi.rcMonitor.right - mi.rcMonitor.left;
-          int monH = mi.rcMonitor.bottom - mi.rcMonitor.top;
-          int monL = mi.rcMonitor.left;
-          int monT = mi.rcMonitor.top;
-          uint32_t srcW = f->lastSourceW.load(std::memory_order_acquire);
-          uint32_t srcH = f->lastSourceH.load(std::memory_order_acquire);
-          if (monW > 0 && monH > 0 && srcW > 0 && srcH > 0) {
-            rect.x = (int)((float)(rect.x - monL) / monW * srcW);
-            rect.y = (int)((float)(rect.y - monT) / monH * srcH);
-            rect.width = (int)((float)rect.width / monW * srcW);
-            rect.height = (int)((float)rect.height / monH * srcH);
-            MaskPayload snapshot{};
-            {
-              std::lock_guard<std::mutex> lock(f->settingsMutex);
-              f->manualBlurMask.rectCount = 0;
-              f->manualBlurMask.rects[f->manualBlurMask.rectCount++] = rect;
-              snapshot = f->manualBlurMask;
-            }
-            save_manual_rects(f, snapshot);
-            blog(LOG_INFO,
-                 "[SecureCast][D] Manual rect replaced. scaled=(%d,%d %dx%d)",
-                 rect.x, rect.y, rect.width, rect.height);
-          } else {
-            blog(LOG_WARNING,
-                 "[SecureCast][D] Manual rect skipped: source dimensions "
-                 "unavailable (srcW=%u, srcH=%u)",
-                 srcW, srcH);
-          }
-        });
-      },
-      filter);
-  if (filter->selectHotkeyId != OBS_INVALID_HOTKEY_ID) {
-    obs_data_t *combo = obs_data_create();
-    obs_data_array_t *arr = obs_data_array_create();
-    obs_data_set_bool(combo, "control", true);
-    obs_data_set_bool(combo, "shift", true);
-    obs_data_set_bool(combo, "alt", false);
-    obs_data_set_string(combo, "key", "OBS_KEY_B");
-    obs_data_array_push_back(arr, combo);
-    obs_hotkey_load(filter->selectHotkeyId, arr);
-    obs_data_array_release(arr);
-    obs_data_release(combo);
-    blog(LOG_INFO, "[SecureCast] Select hotkey registered (Ctrl+Shift+B).");
-  }
-
-  // [T12] 블랙리스트/화이트리스트 UI 핫키 (Ctrl+Shift+L 기본).
-  // 게임 모드 중 사용자가 빠르게 차단/허용 앱 편집할 수 있게 OBS 필터
-  // Properties 다이얼로그를 즉시 띄운다.
-  filter->blacklistUiHotkeyId = obs_hotkey_register_frontend(
-      "securecast_open_blacklist_ui",
-      "SecureCast — 블랙리스트/화이트리스트 UI 열기",
-      [](void *data, obs_hotkey_id, obs_hotkey_t *, bool pressed) {
-        if (!pressed)
-          return;
-        auto *f = static_cast<SecureCastFilter *>(data);
-        if (f->isDestroying.load(std::memory_order_acquire))
-          return;
-        obs_frontend_open_source_properties(f->context);
-      },
-      filter);
-  if (filter->blacklistUiHotkeyId != OBS_INVALID_HOTKEY_ID) {
-    obs_data_t *combo = obs_data_create();
-    obs_data_array_t *arr = obs_data_array_create();
-    obs_data_set_bool(combo, "control", true);
-    obs_data_set_bool(combo, "shift", true);
-    obs_data_set_bool(combo, "alt", false);
-    obs_data_set_string(combo, "key", "OBS_KEY_L");
-    obs_data_array_push_back(arr, combo);
-    obs_hotkey_load(filter->blacklistUiHotkeyId, arr);
-    obs_data_array_release(arr);
-    obs_data_release(combo);
-    blog(LOG_INFO,
-         "[SecureCast] Blacklist UI hotkey registered (Ctrl+Shift+L).");
-  }
-#endif
+  // 전역 단축키 등록 (필터가 여러 개여도 OBS 목록엔 한 번만 — refcount).
+  sc_register_global_hotkeys();
 
   // HLSL 셰이더 컴파일 (그래픽스 컨텍스트 필요)
   obs_enter_graphics();
@@ -2021,21 +2012,11 @@ static void securecast_destroy(void *data) {
   }
 #endif
 
-  // 핫키 먼저 해제 — 콜백이 해제된 filter에 접근하지 못하도록
-  if (filter->panicHotkeyId != OBS_INVALID_HOTKEY_ID) {
-    obs_hotkey_unregister(filter->panicHotkeyId);
-    filter->panicHotkeyId = OBS_INVALID_HOTKEY_ID;
-  }
+  // 전역 단축키 해제 (refcount — 마지막 필터일 때만 실제 해제). 이 필터는 앞에서
+  // 이미 g_liveFilters에서 제거됐으므로, 남아있는 블랙리스트 UI 콜백이 이 필터를
+  // 건드리지 않는다(sc_with_live_filter가 차단).
+  sc_unregister_global_hotkeys();
 #ifdef _WIN32
-  if (filter->selectHotkeyId != OBS_INVALID_HOTKEY_ID) {
-    obs_hotkey_unregister(filter->selectHotkeyId);
-    filter->selectHotkeyId = OBS_INVALID_HOTKEY_ID;
-  }
-  // [T12] 블랙리스트 UI 핫키 해제 — 콜백이 freed filter에 접근 못 하도록.
-  if (filter->blacklistUiHotkeyId != OBS_INVALID_HOTKEY_ID) {
-    obs_hotkey_unregister(filter->blacklistUiHotkeyId);
-    filter->blacklistUiHotkeyId = OBS_INVALID_HOTKEY_ID;
-  }
   filter->selectionOverlay.cancel();
   filter->selectionOverlay.wait_and_join();
 #endif
@@ -2116,6 +2097,10 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
     }
   }
 
+  // [전역 단축키] 블랙리스트 UI 단축키가 "현재 화면에 보이는 필터"를 대상으로
+  // 삼도록, 실제 렌더되는 필터를 활성 필터로 기록한다(가장 최근 렌더 = 활성).
+  g_lastActiveFilter.store(filter, std::memory_order_release);
+
   // 상위 소스의 실제 해상도 가져오기
   obs_source_t *parent = obs_filter_get_parent(filter->context);
   if (!parent) {
@@ -2188,7 +2173,7 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
   // 패닉 중에는 링 버퍼를 파괴해 GPU 낭비를 막고,
   // 해제 직후 패닉 중 캡처된 프레임이 스트림에 유출되는 것을 방지한다.
   // ringBuffer.destroy()는 이미 파괴된 경우 no-op이라 매 프레임 호출해도 안전.
-  if (filter->panicMode.load(std::memory_order_relaxed)) {
+  if (g_panicMode.load(std::memory_order_relaxed)) {
     filter->ringBuffer.destroy();
     destroy_last_safe_render(filter);
     filter->lastCompletedOcrFrameId.store(0, std::memory_order_release);
@@ -2575,7 +2560,11 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
   ++filter->trackerFrameSkip_;
   gs_texture_t *analysisTex =
       analysisSlot ? analysisSlot->getTexture() : nullptr;
-  if (analysisTex && filter->trackerFrameSkip_ >= 2) {
+  // [OCR toggle] OCR 비활성 시 OCR 제출·gray readback·트래커 입력 공급을 전부
+  // 건너뛴다(CPU 절약). 기존 트래커는 입력이 없어 갱신되지 않지만, 아래에서
+  // OCR 마스크를 그리지 않으므로 무방하며 재활성 시 OCR이 새로 등록한다.
+  if (analysisTex && filter->trackerFrameSkip_ >= 2 &&
+      !g_ocrDisabled.load(std::memory_order_acquire)) {
     filter->trackerFrameSkip_ = 0;
 
     // ocrWorkerIdle: 단일 소비자(렌더 스레드)가 load→조건부 store(false),
@@ -2787,6 +2776,11 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
   bool isSafeToRender = (safeWatermarkId > 0) && delayedSlot &&
                         (delayedSlot->dependentOcrFrameId <=
                          safeWatermarkId + gateMargin);
+  // [OCR toggle] OCR 비활성 시 OCR 검증 워터마크가 전진하지 않으므로, 게이트를
+  // 강제로 통과시켜 freeze를 막는다(지연 슬롯을 그대로 송출). OCR 마스크는 아래
+  // 분기에서 그리지 않는다.
+  if (delayedSlot && g_ocrDisabled.load(std::memory_order_acquire))
+    isSafeToRender = true;
 
   // [Freeze T07] freeze 진단. obs 프레임 시계(ns)를 ms로. freeze 여부와 무관하게
   // 매 프레임 1분 통계 창을 점검해 요약을 주기 출력한다 (T01~T03 효과 측정용).
@@ -2938,7 +2932,9 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
   //   - 슬롯 박스는 캡처 시점에 작을 수 있음 (sticky 미활성)
   //   - 현재 시점 박스는 sticky 확장된 큰 박스
   //   - 두 시점 모두 마스킹 → 송출되는 과거 픽셀이 미래의 큰 박스로 보호됨
-  {
+  // [OCR toggle] OCR 비활성 시 OCR/트래커 마스크는 그리지 않는다. 창 블랙리스트·
+  // 수동 블러·알림 마스킹은 이 블록 밖이라 영향받지 않는다.
+  if (!g_ocrDisabled.load(std::memory_order_acquire)) {
     const float tScale = filter->trackerCoordScale_;
     auto push_tracker_box = [&](const VtOcrBox &tb) {
       if (all_count >= (int)(sizeof(all_rects) / sizeof(all_rects[0])))
@@ -5084,9 +5080,104 @@ add_to_whitelist_and_persist(SecureCastFilter *filter,
   return true;
 }
 
+// ============================================================================
+// [목록 전역 동기화] 차단/허용 목록(블랙리스트 일반·게임, 화이트리스트, 게임
+// 목록)을 한 필터에서 편집하면 즉시 다른 모든 live 필터의 설정에도 복사한다.
+// 단축키로 연 속성창에서 한 번 바꾸면 모든 SecureCast 필터에 같은 목록이 적용됨.
+//
+// 안전장치:
+//   - g_propagatingLists CAS: 전파가 부른 obs_source_update가 다시 전파하는
+//     재귀/캐스케이드를 차단.
+//   - 값 동일 시 obs_source_update 생략 → 비동기 업데이트여도 자연 종료.
+//   - 비어 있는 키는 전파 안 함 → 새로 추가된 필터의 빈 기본값이 기존 필터의
+//     목록을 지우지 않는다(대신 "목록을 완전히 비우기"는 전파되지 않음 — trade-off).
+//   - obs_source_get_ref로 대상 source 수명 고정 → 전파 도중 파괴(UAF) 방지.
+//   - g_liveFiltersMutex는 ref 확보 동안만 잡고 obs_source_update 중엔 놓음(데드락 방지).
+// ============================================================================
+static const char *const SC_SHARED_LIST_KEYS[] = {
+    SC_SETTING_BLACKLIST, SC_SETTING_BLACKLIST_GM, SC_SETTING_GM_WHITELIST,
+    SC_SETTING_USER_GAMES};
+
+// 두 settings의 한 array 키가 같은지 (count + 각 item "value" 순서까지).
+static bool sc_array_equal(obs_data_t *a, obs_data_t *b, const char *key) {
+  obs_data_array_t *aa = obs_data_get_array(a, key);
+  obs_data_array_t *ba = obs_data_get_array(b, key);
+  size_t an = aa ? obs_data_array_count(aa) : 0;
+  size_t bn = ba ? obs_data_array_count(ba) : 0;
+  bool eq = (an == bn);
+  for (size_t i = 0; eq && i < an; ++i) {
+    obs_data_t *ai = obs_data_array_item(aa, i);
+    obs_data_t *bi = obs_data_array_item(ba, i);
+    const char *av = ai ? obs_data_get_string(ai, "value") : "";
+    const char *bv = bi ? obs_data_get_string(bi, "value") : "";
+    if (strcmp(av ? av : "", bv ? bv : "") != 0)
+      eq = false;
+    if (ai)
+      obs_data_release(ai);
+    if (bi)
+      obs_data_release(bi);
+  }
+  if (aa)
+    obs_data_array_release(aa);
+  if (ba)
+    obs_data_array_release(ba);
+  return eq;
+}
+
+// src의 "비어있지 않은" 공유 키를 dst로 복사. 변경이 있었으면 true.
+static bool sc_sync_shared_lists_into(obs_data_t *src, obs_data_t *dst) {
+  bool changed = false;
+  for (const char *key : SC_SHARED_LIST_KEYS) {
+    obs_data_array_t *sa = obs_data_get_array(src, key);
+    const size_t sn = sa ? obs_data_array_count(sa) : 0;
+    if (sn > 0 && !sc_array_equal(src, dst, key)) {
+      obs_data_set_array(dst, key, sa);
+      changed = true;
+    }
+    if (sa)
+      obs_data_array_release(sa);
+  }
+  return changed;
+}
+
+static std::atomic<bool> g_propagatingLists{false};
+
+static void sc_propagate_shared_lists(SecureCastFilter *source,
+                                      obs_data_t *srcSettings) {
+  bool expected = false;
+  if (!g_propagatingLists.compare_exchange_strong(expected, true,
+                                                  std::memory_order_acq_rel))
+    return; // 이미 전파 중 — 재귀/캐스케이드 차단
+
+  // 다른 live 필터들의 source ref를 한 번에 확보(락 짧게). 이후 obs_source_update
+  // 중에는 g_liveFiltersMutex를 잡지 않는다.
+  std::vector<obs_source_t *> targets;
+  {
+    std::lock_guard<std::mutex> lk(g_liveFiltersMutex);
+    for (auto *f : g_liveFilters) {
+      if (f == source)
+        continue;
+      obs_source_t *ref = obs_source_get_ref(f->context); // 파괴 중이면 nullptr
+      if (ref)
+        targets.push_back(ref);
+    }
+  }
+  for (obs_source_t *ctx : targets) {
+    obs_data_t *os = obs_source_get_settings(ctx);
+    if (os) {
+      if (sc_sync_shared_lists_into(srcSettings, os))
+        obs_source_update(ctx, os);
+      obs_data_release(os);
+    }
+    obs_source_release(ctx);
+  }
+  g_propagatingLists.store(false, std::memory_order_release);
+}
+
 static void securecast_update(void *data, obs_data_t *settings) {
   SecureCastFilter *filter = static_cast<SecureCastFilter *>(data);
-  std::lock_guard<std::mutex> lock(filter->settingsMutex);
+  // 전파 단계 직전에 명시적으로 풀기 위해 unique_lock 사용(아래 lock.unlock()).
+  std::unique_lock<std::mutex> lock(filter->settingsMutex);
 
   // 동적 블랙리스트(일반 + 게임 모드) 글로벌에 반영. editable_list는
   // obs_data_array_t로 직렬화됨 — 각 item의 "value"에 파일 path.
@@ -5271,6 +5362,13 @@ static void securecast_update(void *data, obs_data_t *settings) {
       filter, (int)obs_data_get_int(settings, SC_SETTING_OVERLAY_X),
       (int)obs_data_get_int(settings, SC_SETTING_OVERLAY_Y));
 #endif
+
+  // [목록 전역 동기화] 이 필터의 차단/허용 목록을 다른 모든 live 필터로 전파한다.
+  // (한 곳에서 편집 → 모든 필터에 즉시 적용. 위 함수 주석의 안전장치 참조.)
+  // 전파는 settings(obs_data)만 사용하고 filter의 보호 멤버는 건드리지 않으므로,
+  // 두 필터 간 settingsMutex AB-BA 데드락을 피하려 여기서 락을 먼저 푼다.
+  lock.unlock();
+  sc_propagate_shared_lists(filter, settings);
 }
 
 // ================================================================
