@@ -1092,7 +1092,7 @@ void securecast_mouse_click(void *data, const struct obs_mouse_event *event,
 ```
 
 ### 4.2 ⚠️ 주의사항
-- OBS의 Interaction API는 **프리뷰 창에서만** 동작하므로, 방송 중에는 핫키 기반으로 전환하거나 별도 제어판에서 조작하도록 안내
+- OBS의 Interaction API는 **프리뷰 창에서만** 동작하므로, 수동 블러 지정은 프리뷰 기준으로만 제공한다. (전체화면 오버레이/전용 핫키 방식은 좌표계 불일치 문제로 폐기됨 — 좌클릭 드래그=영역 추가, 우클릭=전체 초기화)
 - 수동 블러 영역은 반드시 설정 파일에 저장하여 OBS 재시작 시에도 유지
 
 ## 5. 다중 모니터 QA 체크리스트

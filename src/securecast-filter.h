@@ -32,7 +32,6 @@
 
 #ifdef _WIN32
 #include "overlay-window.h"
-#include "selection-overlay.h"
 #endif
 #include "securecast-types.h"
 #include "visual-tracker.h"
@@ -376,12 +375,6 @@ struct SecureCastFilter {
   // 단축키 목록에 한 번만 보이고, 토글은 모든 필터에 동시 적용된다. 드래그 블러
   // 선택 단축키는 제거됨. 그래서 여기엔 per-instance 핫키/토글 멤버가 없다.
 
-#ifdef _WIN32
-  // ----- [Role D] 수동 드래그 블러 선택 오버레이 -----
-  // (전용 단축키는 제거됐지만 오버레이 인프라는 향후 재사용 대비 유지)
-  SelectionOverlay selectionOverlay;
-#endif
-
   // ----- [Role D] 알림 영역 자동 블러 -----
   // 매 스캔 "현재 보이는" 토스트들의 union을 notifBlurRect에 반영한다.
   // 토스트가 사라지면 union이 즉시 줄어든다. 송출 동기화·지연 노출 방지는
@@ -394,20 +387,6 @@ struct SecureCastFilter {
   static constexpr int SC_NOTIF_LINGER_SCANS = 3; // 0.1초 스캔 × 3 ≈ 0.3초
   BlurRect notifScanHist[SC_NOTIF_LINGER_SCANS]{};
   float notifScanAccumulator = 0.0f; // 토스트 탐지 throttle 누산기
-
-  // ----- [Role D] 수동 드래그 블러 -----
-  // OBS 소스 프리뷰에서 좌클릭 드래그로 영역 지정 → 영구 블러.
-  // 우클릭 또는 Properties의 "Clear" 버튼으로 전체 초기화.
-  // settingsMutex로 UI 스레드(mouse 콜백) ↔ Render 스레드(video_render) 보호.
-  // sc_manual_rects 키로 OBS 씬 컬렉션에 자동 저장/로드됨.
-  static constexpr int SC_MAX_MANUAL_RECTS = 8;
-  MaskPayload manualBlurMask{};
-
-  bool dragActive = false; // 드래그 진행 중
-  int32_t dragStartX = 0;
-  int32_t dragStartY = 0;
-  int32_t dragCurX = 0;
-  int32_t dragCurY = 0;
 
   // 모니터→소스 좌표 변환용 캐시 (video_render에서 갱신, 원자적 접근)
   std::atomic<uint32_t> lastSourceW{0};
