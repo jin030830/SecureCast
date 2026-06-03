@@ -79,7 +79,9 @@ public:
     void destroy();
 
     // 보안 상태 갱신 — 임의 스레드에서 호출 가능.
-    void setState(SecurityState state, bool gameMode);
+    // ocrDisabled: OCR PII 마스킹 토글이 꺼진 상태(=보호 안 함). true면 경광등을
+    // 회색으로 표시해 "OCR OFF"를 한눈에 보여준다.
+    void setState(SecurityState state, bool gameMode, bool ocrDisabled = false);
 
     // 표시/숨김 토글 — 임의 스레드에서 호출 가능 (설정 체크박스에서 사용).
     void setVisible(bool visible);
@@ -131,6 +133,10 @@ private:
 
     // [T11] 게임 모드 활성 여부. WM_SC_STATE 메시지의 lParam으로 전달됨.
     std::atomic<bool>  m_gameMode{false};
+
+    // [OCR 표시] OCR PII 마스킹 토글 꺼짐 여부. WM_SC_STATE lParam 비트1로 전달.
+    // true면 경광등을 회색(=보호 안 함)으로 렌더해 OCR OFF를 시각화.
+    std::atomic<bool>  m_ocrDisabled{false};
 
     // [UI] RISK로 진입한 시각(GetTickCount64 ms). RISK 진입 시 갱신, 맥동/솔리드
     // 판정에 사용. RISK가 아니면 의미 없음(초록 경광등).
@@ -229,7 +235,9 @@ public:
     void release(const void *id);
 
     // 이 필터의 보안 상태 보고. 전체 필터 중 최고 위험 등급으로 경광등을 갱신.
-    void reportState(const void *id, SecurityState state, bool gameMode);
+    // ocrDisabled: 전역 OCR 토글 꺼짐 상태(모든 필터 공통). 켜지면 경광등 회색.
+    void reportState(const void *id, SecurityState state, bool gameMode,
+                     bool ocrDisabled = false);
 
     // 표시/숨김 토글 (설정 체크박스). 어느 필터에서든 단일 경광등에 반영.
     void setVisible(const void *id, bool visible);
@@ -256,9 +264,13 @@ private:
     const void *m_owner = nullptr;  // 드래그/숨김 콜백을 위임받는 현재 소유 필터
     bool m_created = false;
 
+    // 전역 OCR 토글 꺼짐 상태(필터 공통, 마지막 reportState 값).
+    bool m_ocrDisabled = false;
+
     // 마지막으로 경광등에 전달한 상태(불필요한 반복 PostMessage 방지).
     SecurityState m_lastState = SecurityState::SAFE;
     bool m_lastGame = false;
+    bool m_lastOcr = false;
     bool m_haveLast = false;
 };
 

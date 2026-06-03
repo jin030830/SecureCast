@@ -368,8 +368,16 @@ void OverlayWindow::renderBeacon()
     //   🔴 RISK    : 빨강 — 하나라도 놓칠 위험
     //   🟡 PARTIAL : 노랑 — 민감정보 감지·가리는 중
     //   🟢 SAFE    : 초록 — 안전
+    // [OCR 표시] OCR PII 마스킹 토글이 꺼져 있으면(보호 안 함) 보안 상태 색 대신
+    // 회색으로 렌더한다 → 색이 있으면 "OCR ON(보호 중)", 회색이면 "OCR OFF"를
+    // 한눈에 구분. OCR OFF는 PII가 안 가려지는 위험 상태라 평소보다 또렷한 톤.
+    const bool ocrOff = m_ocrDisabled.load();
     float bodyR, bodyG, bodyB, glowR, glowG, glowB, edgeR, edgeG, edgeB;
-    if (state == SecurityState::RISK) {
+    if (ocrOff) {
+        bodyR = 150; bodyG = 150; bodyB = 155;  // 회색 본체 = OCR OFF
+        glowR = 190; glowG = 190; glowB = 195;
+        edgeR = 90;  edgeG = 90;  edgeB = 95;
+    } else if (state == SecurityState::RISK) {
         bodyR = 255; bodyG = 60;  bodyB = 60;   // 밝은 빨강
         glowR = 255; glowG = 90;  glowB = 90;
         edgeR = 200; edgeG = 20;  edgeB = 20;
@@ -585,12 +593,13 @@ LRESULT CALLBACK OverlayWindow::WndProc(HWND hwnd, UINT msg,
 
     // ------------------------------------------------------------------
     // WM_SC_STATE: setState() 가 전달하는 상태 변경 메시지
-    //   wParam = SecurityState as int, lParam = gameMode as bool (0/1)
+    //   wParam = SecurityState as int, lParam 비트0 = gameMode, 비트1 = ocrDisabled
     // ------------------------------------------------------------------
     case WM_SC_STATE: {
         const int newSt = static_cast<int>(wParam);
         const int oldSt = self->m_state.exchange(newSt);
-        self->m_gameMode.store(lParam != 0);
+        self->m_gameMode.store((lParam & 1) != 0);
+        self->m_ocrDisabled.store((lParam & 2) != 0);
         // SAFE/CAUTION → RISK 전환 시에만 RISK 시작 시각 기록(맥동 타이밍 기준).
         const int risk = static_cast<int>(SecurityState::RISK);
         if (newSt == risk && oldSt != risk)
@@ -800,13 +809,15 @@ void OverlayWindow::destroy()
 // =============================================================================
 // setState — 임의 스레드에서 상태 갱신 (PostMessage로 UI 스레드에 전달)
 // =============================================================================
-void OverlayWindow::setState(SecurityState state, bool gameMode)
+void OverlayWindow::setState(SecurityState state, bool gameMode,
+                             bool ocrDisabled)
 {
     if (!m_hwnd)
         return;
 
-    PostMessage(m_hwnd, WM_SC_STATE, static_cast<WPARAM>(state),
-                static_cast<LPARAM>(gameMode ? 1 : 0));
+    // lParam: 비트0 = gameMode, 비트1 = ocrDisabled.
+    const LPARAM packed = (gameMode ? 1 : 0) | (ocrDisabled ? 2 : 0);
+    PostMessage(m_hwnd, WM_SC_STATE, static_cast<WPARAM>(state), packed);
 }
 
 // =============================================================================
@@ -852,11 +863,13 @@ void BeaconManager::recomputeStateLocked()
         anyGame = anyGame || kv.second.gameMode;
     }
     // 변경이 있을 때만 경광등에 전달 (매 프레임 reportState 호출 대비).
-    if (!m_haveLast || maxSt != m_lastState || anyGame != m_lastGame) {
+    if (!m_haveLast || maxSt != m_lastState || anyGame != m_lastGame ||
+        m_ocrDisabled != m_lastOcr) {
         m_lastState = maxSt;
         m_lastGame  = anyGame;
+        m_lastOcr   = m_ocrDisabled;
         m_haveLast  = true;
-        m_overlay.setState(maxSt, anyGame);
+        m_overlay.setState(maxSt, anyGame, m_ocrDisabled);
     }
 }
 
@@ -938,7 +951,7 @@ void BeaconManager::release(const void *id)
 }
 
 void BeaconManager::reportState(const void *id, SecurityState state,
-                                bool gameMode)
+                                bool gameMode, bool ocrDisabled)
 {
     std::lock_guard<std::mutex> lk(m_);
     auto it = m_entries.find(id);
@@ -946,6 +959,7 @@ void BeaconManager::reportState(const void *id, SecurityState state,
         return;
     it->second.state = state;
     it->second.gameMode = gameMode;
+    m_ocrDisabled = ocrDisabled; // 전역 토글 — 모든 필터 공통
     recomputeStateLocked();
 }
 

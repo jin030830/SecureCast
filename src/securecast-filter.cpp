@@ -2535,7 +2535,8 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
   // [Role D] 공유 경광등에 이 필터의 상태 보고 (전체 필터 중 최고 위험 등급으로
   // 표시됨). PostMessage 기반 → thread-safe, non-blocking.
   BeaconManager::instance().reportState(
-      filter, newState, filter->isGameMode.load(std::memory_order_acquire));
+      filter, newState, filter->isGameMode.load(std::memory_order_acquire),
+      g_ocrDisabled.load(std::memory_order_acquire));
 #endif
 
   // --- Step 4~5: N프레임 지연된 슬롯 꺼내기 ---
