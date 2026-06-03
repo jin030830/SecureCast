@@ -1266,6 +1266,11 @@ std::vector<VtOcrBox> VisualTrackerManager::active_boxes() const {
   return result;
 }
 
+bool VisualTrackerManager::hasActiveBoxes() const {
+  std::shared_lock<std::shared_mutex> lock(stateMtx_);
+  return !trackers_.empty();
+}
+
 void VisualTrackerManager::clear() {
   std::unique_lock<std::shared_mutex> lock(stateMtx_);
   trackers_.clear();

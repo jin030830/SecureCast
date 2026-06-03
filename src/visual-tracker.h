@@ -111,6 +111,12 @@ public:
   // 렌더 스레드에서 현재 블러 좌표 조회 (복사 반환)
   std::vector<VtOcrBox> active_boxes() const;
 
+  // 추적 중인 트래커가 하나라도 있는지(경량 — 벡터 복사 없이 락+empty만).
+  // 0개면 NCC 비교 대상이 없어 30Hz 그레이 readback을 생략하는 최적화에 사용.
+  // ghost-kill 게이트와 무관하게 트래커 존재 여부만 본다(ghost 박스의 NCC 회복을
+  // 막지 않기 위함).
+  bool hasActiveBoxes() const;
+
   // 현재 활성 트래커들이 가지고 있는 owner HWND들의 unique 셋(void* 형태).
   // 최소화 가드에서 비-블랙리스트 owner 창도 lingering 등록 대상에 포함시키기
   // 위해 사용. 트래커가 없거나 모두 owner=nullptr면 빈 벡터 반환.

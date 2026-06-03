@@ -2626,22 +2626,9 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
     std::vector<uint8_t> bgraPixels;
     int stride = 0;
 
-    // Tier 1: GPU gray readback (30Hz, 2MB) — 기존 8MB BGRA readback 대체
-    // GS_R8 미지원 시 false 반환 → CPU bgra_to_gray 폴백 경로 사용.
-    std::vector<uint8_t> grayPixels;
-    bool grayOk = read_tracker_gray_gpu(filter, analysisTex, w, h, grayPixels);
-    if (!grayOk) {
-      // 폴백: 전체 BGRA readback → CPU gray 변환
-      if (read_texture_bgra_to_cpu(filter, analysisTex, w, h, bgraPixels,
-                                   stride)) {
-        VisualTrackerManager::bgra_to_gray(bgraPixels.data(), (int)w, (int)h,
-                                           stride, grayPixels);
-        grayOk = true;
-      }
-    }
-
     // --- [좌표계 동기화] use1GPath 활성 여부 사전 판별 ---
     // 트래커 gray 제출 전에 결정해야 트래커와 OCR이 동일 해상도 공간을 공유함.
+    // (아래 트래커 피드와 OCR 제출 양쪽에서 쓰므로 게이팅 블록 바깥에 둔다.)
     // ⚠️ 1080p(1920px)에서는 절반(960×540)이 OCR 인식 한계 이하이므로
     //    2K(2560×1440) 이상에서만 활성화. 1080p는 full-res OCR 사용.
 #ifdef _WIN32
@@ -2651,31 +2638,55 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
     constexpr bool use1GPath = false;
 #endif
 
-    if (grayOk) {
-      // [좌표계 동기화] use1GPath 시: 트래커도 half-res 공간에서 추적해야
-      // OCR이 넘겨준 박스 좌표(half-res)와 공간이 일치한다.
-      // trackerCoordScale_=2.0f로 저장해두어 렌더 시 원본 해상도로 복원.
-      if (use1GPath) {
-        std::vector<uint8_t> halfGray;
-        int hw = 0, hh = 0;
-        VisualTrackerManager::downsample_2x_into(grayPixels.data(), (int)w,
-                                                 (int)h, halfGray, hw, hh);
-        filter->trackerCoordScale_ = 2.0f;
-        std::lock_guard<std::mutex> lock(filter->trackerInputMutex_);
-        filter->trackerInputGray_.swap(halfGray);
-        filter->trackerInputW_ = hw;
-        filter->trackerInputH_ = hh;
-        filter->trackerInputReady_ = true;
-      } else {
-        // full-res 모드: 스케일 복원 불필요
-        filter->trackerCoordScale_ = 1.0f;
-        std::lock_guard<std::mutex> lock(filter->trackerInputMutex_);
-        filter->trackerInputGray_.swap(grayPixels);
-        filter->trackerInputW_ = (int)w;
-        filter->trackerInputH_ = (int)h;
-        filter->trackerInputReady_ = true;
+    // [최적화] 추적 중인 트래커가 0개면 NCC가 비교할 대상이 없으므로 30Hz 그레이
+    // GPU readback + 트래커 입력 공급을 통째로 생략한다(민감정보 없는 클린 화면
+    // CPU 절감, 약 1%p). 아래 OCR 제출(~4fps)은 박스 수와 무관하게 진행하고, 새
+    // PII 등록(register_or_update_gray)은 OCR 워커가 "자기 그레이"로 템플릿을
+    // 시드하므로(이 피드와 독립) "탐지→첫 가림"에 공백이 없다. 0개 판정은
+    // ghost-kill을 무시한 hasActiveBoxes(트래커 존재 여부)라, ghost 박스의 NCC
+    // 회복도 막지 않는다. grayOk는 아래 OCR 분기(`!grayOk`)에서 참조하므로 바깥에
+    // 선언하고, 트래커가 없을 땐 false로 둔다.
+    bool grayOk = false;
+    if (filter->trackerMgr.hasActiveBoxes()) {
+      // Tier 1: GPU gray readback (30Hz, 2MB). GS_R8 미지원 시 BGRA 폴백.
+      std::vector<uint8_t> grayPixels;
+      grayOk = read_tracker_gray_gpu(filter, analysisTex, w, h, grayPixels);
+      if (!grayOk) {
+        // 폴백: 전체 BGRA readback → CPU gray 변환
+        if (read_texture_bgra_to_cpu(filter, analysisTex, w, h, bgraPixels,
+                                     stride)) {
+          VisualTrackerManager::bgra_to_gray(bgraPixels.data(), (int)w, (int)h,
+                                             stride, grayPixels);
+          grayOk = true;
+        }
       }
-      filter->trackerInputCv_.notify_one();
+
+      if (grayOk) {
+        // [좌표계 동기화] use1GPath 시: 트래커도 half-res 공간에서 추적해야
+        // OCR이 넘겨준 박스 좌표(half-res)와 공간이 일치한다.
+        // trackerCoordScale_=2.0f로 저장해두어 렌더 시 원본 해상도로 복원.
+        if (use1GPath) {
+          std::vector<uint8_t> halfGray;
+          int hw = 0, hh = 0;
+          VisualTrackerManager::downsample_2x_into(grayPixels.data(), (int)w,
+                                                   (int)h, halfGray, hw, hh);
+          filter->trackerCoordScale_ = 2.0f;
+          std::lock_guard<std::mutex> lock(filter->trackerInputMutex_);
+          filter->trackerInputGray_.swap(halfGray);
+          filter->trackerInputW_ = hw;
+          filter->trackerInputH_ = hh;
+          filter->trackerInputReady_ = true;
+        } else {
+          // full-res 모드: 스케일 복원 불필요
+          filter->trackerCoordScale_ = 1.0f;
+          std::lock_guard<std::mutex> lock(filter->trackerInputMutex_);
+          filter->trackerInputGray_.swap(grayPixels);
+          filter->trackerInputW_ = (int)w;
+          filter->trackerInputH_ = (int)h;
+          filter->trackerInputReady_ = true;
+        }
+        filter->trackerInputCv_.notify_one();
+      }
     }
 
     // OCR 제출: ocrIdle일 때만 (~4fps)
