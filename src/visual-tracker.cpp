@@ -1474,6 +1474,37 @@ VisualTrackerManager::snapshot_for_push(uint32_t src_w, uint32_t src_h) const {
               boxScreen.bottom = mi.rcMonitor.top +
                                  static_cast<LONG>((outY + tr.bh) / sy);
 
+              // [드래그 노출 보강 — 방향성 확장] 출력은 ~1초 지연되는데 박스는 owner
+              // DWM bounds를 따라가므로, 이동 중에는 박스가 콘텐츠보다 살짝 앞서
+              // 콘텐츠가 "온 쪽"(trailing = 이동 반대 방향) 가장자리가 노출된다. 이동
+              // 방향을 cur vs refWindow delta의 부호로 판정해 trailing 쪽을 이동량
+              // 비례(상한 kTrailMax)로 더 확장한다. 기본은 사방 살짝(kBasePad), 대각선
+              // 이동도 X/Y 각각 처리. 이동 활동 중(stickyActive)에만 적용, 정지 시
+              // stickyMs 후 자동 해제 → 정적 화면 영향 없음. (리사이즈 큰 확장 경로는
+              // 위에서 이미 continue.)
+              if (stickyActive) {
+                const int moveX = cur.left - tr.refWindowL; // +오른쪽 / -왼쪽 이동
+                const int moveY = cur.top - tr.refWindowT;  // +아래 / -위 이동
+                constexpr LONG kBasePad = 12;  // 사방 기본(아주 살짝)
+                constexpr LONG kTrailMax = 50; // trailing 추가 상한
+                const LONG trailX =
+                    std::min<LONG>(std::abs(moveX), kTrailMax);
+                const LONG trailY =
+                    std::min<LONG>(std::abs(moveY), kTrailMax);
+                boxScreen.left -= kBasePad;
+                boxScreen.top -= kBasePad;
+                boxScreen.right += kBasePad;
+                boxScreen.bottom += kBasePad;
+                if (moveX < 0)
+                  boxScreen.right += trailX; // 왼쪽 이동 → 오른쪽 더
+                else if (moveX > 0)
+                  boxScreen.left -= trailX; // 오른쪽 이동 → 왼쪽 더
+                if (moveY < 0)
+                  boxScreen.bottom += trailY; // 위로 이동 → 아래 더
+                else if (moveY > 0)
+                  boxScreen.top -= trailY; // 아래로 이동 → 위 더
+              }
+
               // [스크롤 밴드 #6 C2] 창은 안 움직이지만 콘텐츠가 스크롤되는 케이스.
               // 스크롤 중에는 PII가 창 안 어디로 이동/새로 진입할지 불확실하므로
               // boxScreen을 owner 창 전체(cur)로 확장한다("창 전체 블러"). 세로 띠만

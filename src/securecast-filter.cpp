@@ -3020,7 +3020,11 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
     for (const auto &tb : outputSlot->trackerSnapshot)
       push_tracker_box(tb);
 
-    // 2) 현재 시점 박스 (sticky 확장 적용된 큰 박스 — lookahead)
+    // 2) 현재 시점 박스 (방향성 확장 적용된 박스 — lookahead).
+    //    OCR이 PII를 탐지하는 즉시 다음 출력 프레임이 이 박스를 그려 바로 가린다
+    //    (지연 슬롯 저장 스냅샷은 PII가 막 떴을 땐 트래커가 없어 비어 있으므로 첫
+    //    탐지가 ~1초 늦어진다 — 그래서 현재 시점 스냅샷 사용). 드래그 뒷부분 노출은
+    //    box #1(지연 슬롯)에 적용된 방향성 확장이 덮으므로 lookahead는 즉시성 우선.
     const uint32_t srcWNow =
         (tScale > 0.0f)
             ? static_cast<uint32_t>(static_cast<float>(w) / tScale)
