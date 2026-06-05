@@ -869,7 +869,10 @@ void BeaconManager::recomputeStateLocked()
         m_lastGame  = anyGame;
         m_lastOcr   = m_ocrDisabled;
         m_haveLast  = true;
-        m_overlay.setState(maxSt, anyGame, m_ocrDisabled);
+        // 경광등 회색(=OCR 꺼짐)은 수동 토글뿐 아니라 게임모드에서도 켜져야 한다.
+        // 게임모드에선 OCR 인식을 통째로 skip하므로 사실상 OCR OFF 상태다.
+        // (게임모드 변화는 위 조건의 anyGame!=m_lastGame로 이미 갱신 트리거됨.)
+        m_overlay.setState(maxSt, anyGame, m_ocrDisabled || anyGame);
     }
 }
 
