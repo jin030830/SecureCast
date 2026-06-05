@@ -123,11 +123,18 @@ private:
   };
   std::vector<LineDHashCache> lastLineDhashes_;
   int consecutiveSkips_ = 0;
+  // [메모장 타이핑 고착 방지] 연속 L2 partial 횟수. L2 partial은 캐시된 라인 위치만
+  // 재검사하므로, 캐시 밖(새로 입력한 줄)에 나타난 PII는 못 보고, 타이핑으로 기존
+  // 라인이 계속 바뀌면 anyChanged가 지속돼 full OCR이 영영 안 돌아 탐지가 고착된다.
+  // N회 연속 partial 후 full OCR을 강제해 전체 프레임을 재스캔(multipass 포함)한다.
+  int consecutiveL2Partials_ = 0;
   // 2-C: 직전 full OCR 사이클의 라인 평균 높이. 적응형 스케일 계산에 사용.
   float avgLineHeight_ = 0.0f;
   // 연속 L1 히트 허용 횟수: 2 = 실제 1회 스킵(++후 1<2=true, 이후 full OCR).
   // OCR 워커 주기 포함 시 최대 ~250ms stale.
   static constexpr int kMaxConsecutiveSkips = 2;
+  // 연속 L2 부분 OCR 허용 횟수: 3 = 최대 2회 연속 partial 후 full OCR 강제.
+  static constexpr int kMaxConsecutiveL2Partials = 3;
 
   // dHash: 9×8 샘플 격자 → 행별 인접 밝기 비교(8비트 × 8행) → 64비트
   uint64_t compute_dhash_region(const uint8_t *px, int stride, int x, int y,

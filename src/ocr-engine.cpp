@@ -140,6 +140,7 @@ void SecureCastOcrEngine::clearDHashCache() {
   lastRoiDhash_ = 0;
   lastLineDhashes_.clear();
   consecutiveSkips_ = 0;
+  consecutiveL2Partials_ = 0;
 }
 
 SecureCastOcrEngine::~SecureCastOcrEngine() = default;
@@ -149,6 +150,7 @@ bool SecureCastOcrEngine::init() {
   try {
     hasLastRoiDhash_ = false;
     consecutiveSkips_ = 0;
+    consecutiveL2Partials_ = 0;
     avgLineHeight_ = 0.0f;
     lastBoxes_.clear();
     lastLineDhashes_.clear();
@@ -207,6 +209,7 @@ SecureCastOcrEngine::analyze_bgra_frame(const uint8_t *pixels, int width,
     lastLineDhashes_.clear();
     hasLastRoiDhash_ = false;
     consecutiveSkips_ = 0;
+    consecutiveL2Partials_ = 0;
   }
 
   // ── L1: ROI dHash ─────────────────────────────────────────────
@@ -292,7 +295,12 @@ SecureCastOcrEngine::analyze_bgra_frame(const uint8_t *pixels, int width,
       lastBoxes_ = merged;
       // L2 hit이지만 부분 OCR을 실제로 실행했으므로 L1 skip 카운터는 리셋한다.
       consecutiveSkips_ = 0;
-      return merged; // L2 hit (partial)
+      // [메모장 타이핑 고착 방지] N회 연속 L2 partial 후엔 아래 full OCR로 강제
+      // 진행해 전체 프레임을 재스캔(새 입력 줄 발견 + 기존 PII를 multipass로 정확히
+      // 재검출). 카운터는 full OCR 경로에서 리셋.
+      if (++consecutiveL2Partials_ < kMaxConsecutiveL2Partials)
+        return merged; // L2 hit (partial)
+      // 도달 → full OCR로 fall through (전체 재스캔)
     }
     // 모든 라인 불변이지만 L1 실패 → ROI 외부에 새 텍스트 가능 → full OCR
   }
@@ -341,6 +349,8 @@ SecureCastOcrEngine::analyze_bgra_frame(const uint8_t *pixels, int width,
   impl_->lastFrameWidth = width;
   impl_->lastFrameHeight = height;
   lastBoxes_ = boxes;
+  // 전체 프레임을 재스캔했으므로 L2 강제 full OCR 카운터 리셋.
+  consecutiveL2Partials_ = 0;
 
   // L2 라인 캐시 재구성 (multipass 보정된 lines 사용)
   lastLineDhashes_.clear();
@@ -1658,6 +1668,66 @@ std::vector<SecureCastOcrLine> SecureCastOcrEngine::multipass_small_text(
     if (result[i].h < SMALL_H) {
       small.push_back(i);
     }
+  }
+
+  if (small.empty())
+    return result;
+
+  // [메모장 PII 회귀 수정 — 0da5b0c 동작 복원]
+  //   작은 라인 앞 MAX_INDIVIDUAL개는 "개별 crop + 2× 업스케일 재OCR + 무조건 교체"로
+  //   처리한다. 0445836 이후 모든 작은 라인을 Union batch로 묶어 IoU≥threshold일 때만
+  //   교체하도록 바뀌었는데, 메모장 주소 한 줄 같은 단일/소수 라인은 batch 재OCR이
+  //   라인을 다르게 분할해 IoU 미달 → 교체 누락 → 작은 글씨를 못 읽은 원본이 그대로
+  //   남아 detect_pii가 ADDRESS로 분류 못 하는 회귀가 있었다. 개별 무조건 교체는 그
+  //   줄을 통째로 재OCR한 결과로 항상 갈아끼워 신뢰도가 높다. 업스케일은 2×(3× nearest
+  //   는 메모장의 sharp/하드엣지 글리프에 계단현상이 심해 불리). 초과분(>6)만 아래
+  //   기존 batch/split 경로로 넘긴다(다수 라인 표 케이스 성능/정확도 유지).
+  {
+    static constexpr int MAX_INDIVIDUAL = 6;
+    static constexpr int IND_UP = 2;
+    static constexpr float IND_INV = 0.5f;
+    std::vector<int> overflow;
+    int passes = 0;
+    for (int idx : small) {
+      if (passes >= MAX_INDIVIDUAL) {
+        overflow.push_back(idx);
+        continue;
+      }
+      const auto &l = result[idx];
+      const int cx = std::max(0, static_cast<int>(l.x) - PAD);
+      const int cy = std::max(0, static_cast<int>(l.y) - PAD);
+      const int cr = std::min(static_cast<int>(l.x + l.w) + PAD, width);
+      const int cb = std::min(static_cast<int>(l.y + l.h) + PAD, height);
+      const int cw = cr - cx, ch = cb - cy;
+      if (cw <= 0 || ch <= 0)
+        continue;
+      const int upW = cw * IND_UP, upH = ch * IND_UP;
+      std::vector<uint8_t> up(static_cast<size_t>(upW) * upH * 4);
+      for (int uy = 0; uy < upH; ++uy) {
+        for (int ux = 0; ux < upW; ++ux) {
+          const uint8_t *s = pixels +
+                             (ptrdiff_t)(cy + uy / IND_UP) * stride +
+                             (cx + ux / IND_UP) * 4;
+          uint8_t *d = up.data() + (ptrdiff_t)uy * upW * 4 + ux * 4;
+          d[0] = s[0];
+          d[1] = s[1];
+          d[2] = s[2];
+          d[3] = s[3];
+        }
+      }
+      auto reLines = recognize_text(up.data(), upW, upH, upW * 4);
+      ++passes;
+      if (reLines.empty())
+        continue;
+      for (auto &rl : reLines) {
+        rl.x = cx + rl.x * IND_INV;
+        rl.y = cy + rl.y * IND_INV;
+        rl.w *= IND_INV;
+        rl.h *= IND_INV;
+      }
+      result[idx] = reLines[0]; // 무조건 교체
+    }
+    small.swap(overflow); // 초과분만 아래 batch 경로로
   }
 
   if (small.empty())
