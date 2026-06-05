@@ -732,9 +732,11 @@ void VisualTrackerManager::update_all_gray(const uint8_t *gray, int gw,
     // dead tracker 제거 (역순: erase 시 인덱스 shift 방지)
     // [Window anchor v4] owner 창이 살아있는 트래커는 NCC 실패해도 보존.
     // 빠른 드래그 시 NCC가 못 따라가도 owner 창의 DWM bounds로 좌표 계산이
-    // 가능. 5초간 OCR 갱신이 없으면 텍스트 소멸로 보고 제거 (드래그 중에는
-    // OCR이 motion blur로 자주 실패 → 더 긴 유예 필요).
-    constexpr int kOwnerBoundExpiry = HARD_EXPIRY * 5; // ~5초 @ 30Hz
+    // 가능. 이 시간 동안 OCR 갱신이 없으면 텍스트 소멸로 보고 제거 (드래그 중에는
+    // OCR이 motion blur로 자주 실패 → 어느 정도 유예 필요).
+    // [잔상 단축] 5초→3초: 다른 창으로 전환 시 이전 위치에 블러가 남는 시간을
+    // 줄인다. 3초도 일반 드래그 관용엔 충분(드래그가 3초 내내 OCR 실패할 일은 드묾).
+    constexpr int kOwnerBoundExpiry = HARD_EXPIRY * 3; // ~3초 @ 30Hz
     for (int i = (int)trackers_.size() - 1; i >= 0; --i) {
       const auto &tr = trackers_[i];
       bool ownerAlive = false;
