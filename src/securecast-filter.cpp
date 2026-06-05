@@ -1339,6 +1339,17 @@ static void ocr_worker_loop(SecureCastFilter *filter) {
     if (adaptScale < 1.0f)
       adaptScale = 0.5f;
 
+    // [Perf — 첫 블러 지연 단축] 미세 업스케일(1.0×<s≤1.25×) 제거.
+    //   실측(ocr-timing): 1080p 소스 + avgLineH≈14px → adaptScale≈1.14× 였고,
+    //   1.14× 같은 비-2.0× 배율은 느린 스칼라 bilinear 리샘플(아래 else 분기)을
+    //   타고 입력 픽셀도 ~25% 늘려 OCR 1회를 ~20% 느리게 한다(640→~505ms).
+    //   ~13px+ 텍스트는 Windows.Media.Ocr가 네이티브로도 안정 인식하므로, 이
+    //   구간은 정확도 손실 없이 네이티브(1.0×)로 스냅해 OCR이 1초 예산 안에 더
+    //   여유 있게 들어오도록 한다 → 1초 초과 시 발생하던 늦은 블러·freeze 감소.
+    //   1.25× 초과(텍스트 <13px)는 정확도를 위해 기존 업스케일을 그대로 둔다.
+    if (adaptScale > 1.0f && adaptScale <= 1.25f)
+      adaptScale = 1.0f;
+
     // 스케일 적용 (0.5× 다운 or 2× 업만 SIMD; 그 외 스칼라 bilinear)
     std::vector<uint8_t> scaledBuf;
     float coordScale = 1.0f;
