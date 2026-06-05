@@ -4192,7 +4192,7 @@ static void securecast_get_defaults(obs_data_t *settings) {
   // [Game mode v2 — T07] 사용자 조정 가능한 trigger 파라미터 기본값.
   obs_data_set_default_bool(settings, SC_SETTING_GM_AUTO_ENTER, true);
   obs_data_set_default_int(settings, SC_SETTING_GM_CPU_THRESHOLD, 40);
-  obs_data_set_default_int(settings, SC_SETTING_GM_ENTER_SECONDS, 3);
+  obs_data_set_default_int(settings, SC_SETTING_GM_ENTER_SECONDS, 5);
   obs_data_set_default_int(settings, SC_SETTING_GM_EXIT_SECONDS, 8);
 
   obs_data_array_t *emptyGames = obs_data_array_create();
