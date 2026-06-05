@@ -730,28 +730,66 @@ void VisualTrackerManager::update_all_gray(const uint8_t *gray, int gw,
     }
 
     // dead tracker 제거 (역순: erase 시 인덱스 shift 방지)
-    // [Window anchor v4] owner 창이 살아있는 트래커는 NCC 실패해도 보존.
-    // 빠른 드래그 시 NCC가 못 따라가도 owner 창의 DWM bounds로 좌표 계산이
-    // 가능. 5초간 OCR 갱신이 없으면 텍스트 소멸로 보고 제거 (드래그 중에는
-    // OCR이 motion blur로 자주 실패 → 더 긴 유예 필요).
-    constexpr int kOwnerBoundExpiry = HARD_EXPIRY * 5; // ~5초 @ 30Hz
+    // [Window anchor v4 / Ghost-kill v5] owner 창이 살아있는 트래커는 NCC 실패해도
+    // 보존(빠른 드래그 시 NCC가 못 따라가도 owner DWM bounds로 좌표 계산 가능).
+    // 단, owner-alive 유예를 창 이동 여부로 분기한다:
+    //   · 이동 중(드래그/리사이즈): OCR이 motion blur로 자주 실패하므로 긴 유예(5초).
+    //   · 정지: 모션블러 사유 없음 → OCR이 권위. 텍스트가 제자리에서 사라지면
+    //     (스크롤·창전환·내용변경) 2초 안에 제거 → 잔상 단축.
+    // 두 경로 모두 NCC가 아니라 OCR(framesSinceOcrValidate)로만 게이트하므로,
+    // 텍스트가 실제로 남아 있으면 OCR이 계속 매칭해(register_or_update_gray에서
+    // framesSinceOcrValidate=0) 절대 오삭제되지 않는다.
+    constexpr int kOwnerBoundExpiry = HARD_EXPIRY * 5;  // ~5초 @ 30Hz (이동 중)
+    constexpr int kOwnerStaticExpiry = HARD_EXPIRY * 2; // ~2초 @ 30Hz (정지 창)
+    constexpr int kOwnerStaticThreshold = 15; // 이 사이클 이상 정지면 "정지" (~0.5s)
+    constexpr int32_t kOwnerMoveEps = 2;      // bounds 변화 px 임계(노이즈 무시)
     for (int i = (int)trackers_.size() - 1; i >= 0; --i) {
-      const auto &tr = trackers_[i];
+      auto &tr = trackers_[i];
       bool ownerAlive = false;
+      bool ownerMoving = false;
 #ifdef _WIN32
       if (tr.ownerWin) {
         HWND h = reinterpret_cast<HWND>(tr.ownerWin);
         ownerAlive = IsWindow(h);
+        if (ownerAlive) {
+          RECT cur{};
+          if (SUCCEEDED(DwmGetWindowAttribute(
+                  h, DWMWA_EXTENDED_FRAME_BOUNDS, &cur, sizeof(cur)))) {
+            if (!tr.ownerBoundsValid) {
+              // 첫 관측: 기준만 저장. 판정 보류 → 보수적으로 이동 중 취급.
+              tr.ownerBoundsValid = true;
+              tr.ownerStaticCycles = 0;
+            } else {
+              auto iabs = [](int32_t v) { return v < 0 ? -v : v; };
+              const bool moved = iabs(cur.left - tr.lastOwnerL) > kOwnerMoveEps ||
+                                 iabs(cur.top - tr.lastOwnerT) > kOwnerMoveEps ||
+                                 iabs(cur.right - tr.lastOwnerR) > kOwnerMoveEps ||
+                                 iabs(cur.bottom - tr.lastOwnerB) > kOwnerMoveEps;
+              if (moved)
+                tr.ownerStaticCycles = 0; // 이동 감지 → 리셋
+              else
+                ++tr.ownerStaticCycles; // 정지 지속
+            }
+            tr.lastOwnerL = cur.left;
+            tr.lastOwnerT = cur.top;
+            tr.lastOwnerR = cur.right;
+            tr.lastOwnerB = cur.bottom;
+            ownerMoving = tr.ownerStaticCycles < kOwnerStaticThreshold;
+          } else {
+            // DWM 조회 실패 → 보수적으로 이동 중 취급(긴 유예).
+            ownerMoving = true;
+          }
+        }
       }
 #endif
       const bool nccLost = tr.framesSinceMatch >= FRAMES_LOST;
       const bool ocrExpired = tr.framesSinceOcrValidate >= HARD_EXPIRY;
-      const bool ocrExpiredLong =
-          tr.framesSinceOcrValidate >= kOwnerBoundExpiry;
-      // owner alive: 오직 ocrExpiredLong(5초) 일 때만 제거. NCC 실패는 무시.
-      // owner 없음: 기존 조건 (NCC 실패 OR OCR 만료 1초).
+      // owner alive: OCR 미검출 유예 도달 시에만 제거(NCC 실패는 무시).
+      //   이동 중 5초 / 정지 2초. owner 없음: 기존 조건(NCC 실패 OR OCR 만료 1초).
+      const int ownerGrace = ownerMoving ? kOwnerBoundExpiry : kOwnerStaticExpiry;
+      const bool ownerOcrExpired = tr.framesSinceOcrValidate >= ownerGrace;
       const bool shouldErase =
-          ownerAlive ? ocrExpiredLong : (nccLost || ocrExpired);
+          ownerAlive ? ownerOcrExpired : (nccLost || ocrExpired);
       if (shouldErase)
         trackers_.erase(trackers_.begin() + i);
     }

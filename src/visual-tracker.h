@@ -194,6 +194,16 @@ private:
     // 사이에 OCR이 리셋한 것이므로 framesSinceMatch 등 카운터를 보존.
     uint32_t ocrRevision = 0;
 
+    // [Ghost-kill v5] owner-anchored 잔상 빠른 제거용. Phase C에서 직전 사이클의
+    // owner DWM bounds를 보관해 창이 "이동 중"인지 "정지"인지 판정한다. 정지 창은
+    // 드래그 모션블러 관용이 불필요하므로 OCR 유예를 짧게(2s) 적용 → 텍스트가
+    // 제자리에서 사라지면(스크롤·창전환·내용변경) 5초 대신 2초 안에 제거.
+    // 두 분기 모두 OCR(framesSinceOcrValidate)로만 게이트하므로, 텍스트가 실제로
+    // 남아 있으면 OCR이 계속 매칭해 카운터를 0으로 리셋 → 절대 오삭제되지 않는다.
+    bool ownerBoundsValid = false;
+    int32_t lastOwnerL = 0, lastOwnerT = 0, lastOwnerR = 0, lastOwnerB = 0;
+    int ownerStaticCycles = 0; // owner bounds가 안 변한 연속 Phase C 사이클 수
+
     // Tier 3: AVX2 NCC 용 사전 계산 float 템플릿
     // tmpl_float[i] = (float)tmpl[i] - tmean  (centered)
     // tmpl_dT = Σ tmpl_float[i]²  (template variance × N)
