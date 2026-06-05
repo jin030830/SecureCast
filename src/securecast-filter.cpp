@@ -2603,6 +2603,21 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
       g_ocrDisabled.load(std::memory_order_acquire));
 #endif
 
+  // [OCR off 통합] OCR을 "꺼진 것으로 취급"하는 두 경로를 하나로 묶는다.
+  //   (1) g_ocrDisabled : 사용자 수동 토글
+  //   (2) 게임모드       : OCR 워커가 sc_any_filter_in_game_mode()로 인식 작업을
+  //                        전부 skip → 안전 워터마크(lastCompletedOcrFrameId)가
+  //                        정지한다.
+  // 워커가 글로벌(any-filter) 기준으로 멈추므로, 다른 필터가 게임모드면 이 필터의
+  // 워터마크도 같이 멈춘다 → 게이트 해제도 반드시 같은 글로벌 기준이어야 한다.
+  // 이 플래그를 안 보고 게임모드에서 워커만 끄면, 게이트가 멈춘 워터마크를 영원히
+  // 기다려 송출이 영구 freeze 된다. 아래 세 곳(제출/게이트/마스크)에서 일관 사용.
+  bool ocrEffectivelyOff = g_ocrDisabled.load(std::memory_order_acquire);
+#ifdef _WIN32
+  if (sc_any_filter_in_game_mode())
+    ocrEffectivelyOff = true;
+#endif
+
   // --- Step 4~5: N프레임 지연된 슬롯 꺼내기 ---
   const FrameRingBuffer::Slot *delayedSlot =
       filter->ringBuffer.peekDelayedSlot();
@@ -2619,8 +2634,7 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
   // [OCR toggle] OCR 비활성 시 OCR 제출·gray readback·트래커 입력 공급을 전부
   // 건너뛴다(CPU 절약). 기존 트래커는 입력이 없어 갱신되지 않지만, 아래에서
   // OCR 마스크를 그리지 않으므로 무방하며 재활성 시 OCR이 새로 등록한다.
-  if (analysisTex && filter->trackerFrameSkip_ >= 2 &&
-      !g_ocrDisabled.load(std::memory_order_acquire)) {
+  if (analysisTex && filter->trackerFrameSkip_ >= 2 && !ocrEffectivelyOff) {
     filter->trackerFrameSkip_ = 0;
 
     // ocrWorkerIdle: 단일 소비자(렌더 스레드)가 load→조건부 store(false),
@@ -2843,10 +2857,10 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
   bool isSafeToRender = (safeWatermarkId > 0) && delayedSlot &&
                         (delayedSlot->dependentOcrFrameId <=
                          safeWatermarkId + gateMargin);
-  // [OCR toggle] OCR 비활성 시 OCR 검증 워터마크가 전진하지 않으므로, 게이트를
-  // 강제로 통과시켜 freeze를 막는다(지연 슬롯을 그대로 송출). OCR 마스크는 아래
-  // 분기에서 그리지 않는다.
-  if (delayedSlot && g_ocrDisabled.load(std::memory_order_acquire))
+  // [OCR toggle] OCR 비활성(수동 토글 또는 게임모드) 시 OCR 검증 워터마크가
+  // 전진하지 않으므로, 게이트를 강제로 통과시켜 freeze를 막는다(지연 슬롯을 그대로
+  // 송출). OCR 마스크는 아래 분기에서 그리지 않는다.
+  if (delayedSlot && ocrEffectivelyOff)
     isSafeToRender = true;
 
   // [Freeze T07] freeze 진단. obs 프레임 시계(ns)를 ms로. freeze 여부와 무관하게
@@ -2999,9 +3013,9 @@ static void securecast_video_render(void *data, gs_effect_t *effect) {
   //   - 슬롯 박스는 캡처 시점에 작을 수 있음 (sticky 미활성)
   //   - 현재 시점 박스는 sticky 확장된 큰 박스
   //   - 두 시점 모두 마스킹 → 송출되는 과거 픽셀이 미래의 큰 박스로 보호됨
-  // [OCR toggle] OCR 비활성 시 OCR/트래커 마스크는 그리지 않는다. 창 블랙리스트·
-  // 수동 블러·알림 마스킹은 이 블록 밖이라 영향받지 않는다.
-  if (!g_ocrDisabled.load(std::memory_order_acquire)) {
+  // [OCR toggle] OCR 비활성(수동 토글 또는 게임모드) 시 OCR/트래커 마스크는 그리지
+  // 않는다. 창 블랙리스트·수동 블러·알림 마스킹은 이 블록 밖이라 영향받지 않는다.
+  if (!ocrEffectivelyOff) {
     const float tScale = filter->trackerCoordScale_;
     auto push_tracker_box = [&](const VtOcrBox &tb) {
       if (all_count >= (int)(sizeof(all_rects) / sizeof(all_rects[0])))
