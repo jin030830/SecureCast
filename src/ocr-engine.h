@@ -86,8 +86,19 @@ public:
   // video_render thread에서 직접 동기 호출하면 프레임 드랍이 발생할 수 있다.
   // render thread가 아니라 별도 OCR worker thread에서 호출해야 한다.
   // ========================================================
+  // inputScale: 호출부가 적용한 업/다운스케일 배율(scaled/native). avgLineHeight_를
+  // 네이티브 공간으로 정규화하는 데 쓴다(스케일 피드백 진동 방지).
   std::vector<SecureCastOcrBox>
-  analyze_bgra_frame(const uint8_t *pixels, int width, int height, int stride);
+  analyze_bgra_frame(const uint8_t *pixels, int width, int height, int stride,
+                     float inputScale = 1.0f);
+
+  // 화면 일부(창 영역)만 따로 OCR+PII 탐지. busy 전체 프레임에서 Windows OCR이
+  // 작은 창 텍스트를 통째로 누락하는 문제를 보완 — 그 창 영역만 떼어 주면 엔진이
+  // full 주의로 읽는다(창 캡처와 같은 효과). dHash 캐시는 안 거치며(매번 직접 OCR),
+  // 반환 좌표는 입력 px 공간(rx/ry/rw/rh와 동일 좌표계) 기준이다.
+  std::vector<SecureCastOcrBox>
+  detect_pii_in_region(const uint8_t *px, int width, int height, int stride,
+                       int rx, int ry, int rw, int rh);
 
 private:
   struct Impl;

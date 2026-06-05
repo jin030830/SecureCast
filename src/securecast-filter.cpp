@@ -1429,8 +1429,13 @@ static void ocr_worker_loop(SecureCastFilter *filter) {
     // avg/max(ms)를 찍어 느린 PC·멀티모니터(큰 입력)에서 얼마나 느려지는지
     // 수치로 확인한다. os_gettime_ns()는 단조 시계(util/platform.h).
     const uint64_t scOcrT0Ns = os_gettime_ns();
-    auto ocrBoxes =
-        filter->ocrEngine->analyze_bgra_frame(ocrPx, ocrW2, ocrH2, ocrStride2);
+    // 실제 적용된 스케일(scaled/native). 엔진이 avgLineHeight_를 네이티브 공간으로
+    // 정규화해 스케일 진동을 막는 데 쓴다. 캡/스냅 후의 실제 배율을 ocrW2/width로 전달.
+    const float scAppliedScale =
+        (width > 0) ? static_cast<float>(ocrW2) / static_cast<float>(width)
+                    : 1.0f;
+    auto ocrBoxes = filter->ocrEngine->analyze_bgra_frame(
+        ocrPx, ocrW2, ocrH2, ocrStride2, scAppliedScale);
     {
       const uint64_t scOcrDurMs = (os_gettime_ns() - scOcrT0Ns) / 1000000ULL;
       static thread_local uint64_t scOcrN = 0, scOcrSumMs = 0, scOcrMaxMs = 0;
@@ -1447,6 +1452,65 @@ static void ocr_worker_loop(SecureCastFilter *filter) {
              (unsigned long long)scOcrMaxMs, ocrW2, ocrH2, ocrBoxes.size(),
              (unsigned long long)scOcrN);
     }
+
+#ifdef _WIN32
+    // [메모장 영역 보강 OCR] busy 전체 프레임에서 Windows OCR이 메모장(작은 창)
+    // 텍스트를 통째로 누락하는 문제 보완. allWindows에서 메모장 창을 찾아, full
+    // OCR이 그 영역에서 PII를 못 잡았으면 그 영역만 따로 OCR해 합친다. "메모장이
+    // 화면에 있으면 비중·크기 무관 잡힘"(창 캡처와 같은 효과를 디스플레이 캡처
+    // 안에서). 좌표는 ocrW2 공간으로 만들어 아래 coordScale 복원이 함께 처리.
+    // 추가 OCR은 "full이 놓친 메모장"에만 들어가므로 비용이 제한적이다.
+    for (int wi = 0; wi < allWindows.count; ++wi) {
+      const TrackedWindow &w = allWindows.items[wi];
+      if (_wcsicmp(w.exe_name, L"notepad.exe") != 0)
+        continue;
+      HMONITOR hmon = MonitorFromRect(&w.bounds, MONITOR_DEFAULTTONEAREST);
+      MONITORINFO mi{};
+      mi.cbSize = sizeof(mi);
+      if (!hmon || !GetMonitorInfo(hmon, &mi))
+        continue;
+      const int monW = mi.rcMonitor.right - mi.rcMonitor.left;
+      const int monH = mi.rcMonitor.bottom - mi.rcMonitor.top;
+      if (monW <= 0 || monH <= 0)
+        continue;
+      const float sxw = static_cast<float>(ocrW2) / monW;
+      const float syw = static_cast<float>(ocrH2) / monH;
+      int rx = static_cast<int>((w.bounds.left - mi.rcMonitor.left) * sxw);
+      int ry = static_cast<int>((w.bounds.top - mi.rcMonitor.top) * syw);
+      int rw = static_cast<int>((w.bounds.right - w.bounds.left) * sxw);
+      int rh = static_cast<int>((w.bounds.bottom - w.bounds.top) * syw);
+      if (rx < 0) {
+        rw += rx;
+        rx = 0;
+      }
+      if (ry < 0) {
+        rh += ry;
+        ry = 0;
+      }
+      if (rx + rw > ocrW2)
+        rw = ocrW2 - rx;
+      if (ry + rh > ocrH2)
+        rh = ocrH2 - ry;
+      if (rw <= 0 || rh <= 0)
+        continue;
+      // full OCR이 이미 이 영역에서 PII를 잡았으면(메모장이 커서 안 누락됨) 추가
+      // OCR 생략. 못 잡았을 때만(작은 메모장) 영역 OCR.
+      bool already = false;
+      for (const auto &b : ocrBoxes) {
+        const float bcx = b.x + b.w * 0.5f, bcy = b.y + b.h * 0.5f;
+        if (bcx >= rx && bcx < rx + rw && bcy >= ry && bcy < ry + rh) {
+          already = true;
+          break;
+        }
+      }
+      if (already)
+        continue;
+      auto npBoxes = filter->ocrEngine->detect_pii_in_region(
+          ocrPx, ocrW2, ocrH2, ocrStride2, rx, ry, rw, rh);
+      for (const auto &b : npBoxes)
+        ocrBoxes.push_back(b);
+    }
+#endif
 
     // 좌표를 원본 해상도로 복원 (coordScale = 1/adaptScale)
     if (coordScale != 1.0f) {

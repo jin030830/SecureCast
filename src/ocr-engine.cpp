@@ -192,7 +192,8 @@ bool SecureCastOcrEngine::available() const { return available_; }
 
 std::vector<SecureCastOcrBox>
 SecureCastOcrEngine::analyze_bgra_frame(const uint8_t *pixels, int width,
-                                        int height, int stride) {
+                                        int height, int stride,
+                                        float inputScale) {
   FrameTimer frame_timer(&profile_);
 
   if (!available_ || pixels == nullptr || width <= 0 || height <= 0 ||
@@ -314,13 +315,31 @@ SecureCastOcrEngine::analyze_bgra_frame(const uint8_t *pixels, int width,
   // 다음 사이클의 adaptScale = kOcrTargetH / avgLineHeight_가 역방향 스케일
   // 을 적용해 2-사이클 진동이 발생할 수 있다(#TODO: coordScale로 정규화 필요).
   if (!lines.empty()) {
-    float sumH = 0.0f;
-    for (const auto &l : lines)
-      sumH += l.h;
-    const float current = sumH / static_cast<float>(lines.size());
-    // EMA smoothing: 갑작스러운 평균 변동을 완화. 큰 헤더만 잡힌 사이클에서
-    // avg가 폭증해 다음 사이클이 과도하게 downscale되어 작은 글자 누락이
-    // 영구화되는 진동 차단. 0.7×prev + 0.3×current로 부드럽게.
+    // [작은 글씨 우선] adaptScale 기준을 "평균"이 아니라 "가장 작은 실제 텍스트 줄
+    // 높이"로 삼는다. 한 화면에 큰 글씨가 많아도(OBS UI 등 비중 큰 앱) 평균에
+    // 끌려가지 않고, 작은 비중 앱(메모장)의 작은 글씨까지 충분히 업스케일돼 OCR에
+    // 읽히게 한다. 노이즈/파편(h<8 또는 w<30)은 제외해 한두 점 outlier로 과도 확대
+    // 되는 것을 막는다. 상한은 caller의 kScaleMax(2.5)가 건다.
+    float minH = 0.0f;
+    for (const auto &l : lines) {
+      if (l.h < 8.0f || l.w < 30.0f)
+        continue; // 노이즈/파편 제외
+      if (minH <= 0.0f || l.h < minH)
+        minH = l.h;
+    }
+    if (minH <= 0.0f) { // 전부 제외되면 평균으로 폴백
+      float sumH = 0.0f;
+      for (const auto &l : lines)
+        sumH += l.h;
+      minH = sumH / static_cast<float>(lines.size());
+    }
+    float current = minH;
+    // [진동 방지] 측정값은 inputScale이 적용된 스케일 공간 값이다. 네이티브 공간으로
+    // 정규화(÷inputScale)해야 다음 사이클 adaptScale=kTarget/avgLineHeight_가 한
+    // 값으로 수렴한다.
+    if (inputScale > 0.0f)
+      current /= inputScale;
+    // EMA smoothing: 갑작스러운 변동을 완화. 0.7×prev + 0.3×current로 부드럽게.
     avgLineHeight_ = (avgLineHeight_ > 0.0f)
                          ? avgLineHeight_ * 0.7f + current * 0.3f
                          : current;
@@ -424,8 +443,33 @@ int SecureCastOcrEngine::hamming_distance(uint64_t a, uint64_t b) {
   return static_cast<int>(__popcnt64(a ^ b));
 }
 
-// L2 crop OCR: 원본 프레임 (cx,cy,cw,ch) 영역을 복사 후 OCR 실행.
-// 반환 라인 좌표에 (cx, cy) 오프셋 적용.
+// [영역 OCR] 창 영역만 떼어 OCR + PII 탐지 (busy 전체 프레임에서 작은 창 텍스트
+// 누락 보완). recognize_text_crop + multipass + detect_pii 조합.
+std::vector<SecureCastOcrBox>
+SecureCastOcrEngine::detect_pii_in_region(const uint8_t *px, int width,
+                                          int height, int stride, int rx, int ry,
+                                          int rw, int rh) {
+  if (!available_ || !px)
+    return {};
+  // 1) 영역만 crop OCR (좌표는 입력 px 공간으로 복원돼 반환됨)
+  auto lines = recognize_text_crop(px, width, height, stride, rx, ry, rw, rh);
+  if (lines.empty())
+    return {};
+  // 2) 작은 글씨 보강(multipass) 후 PII 탐지
+  auto updated = multipass_small_text(lines, px, width, height, stride);
+  auto boxes = detect_pii(updated);
+  // 3) 좌표 sanity (frame 경계 밖/너무 작은 박스 제거)
+  boxes.erase(std::remove_if(boxes.begin(), boxes.end(),
+                             [width, height](const SecureCastOcrBox &b) {
+                               return b.x < 0.0f || b.y < 0.0f ||
+                                      b.x + b.w > static_cast<float>(width) ||
+                                      b.y + b.h > static_cast<float>(height) ||
+                                      b.w < 2.0f || b.h < 2.0f;
+                             }),
+              boxes.end());
+  return boxes;
+}
+
 std::vector<SecureCastOcrLine>
 SecureCastOcrEngine::recognize_text_crop(const uint8_t *px, int width,
                                          int height, int stride, int cx, int cy,
