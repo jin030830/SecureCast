@@ -167,7 +167,9 @@ static bool sc_with_live_filter(SecureCastFilter *filter, Fn &&fn) {
 
 // SecureCast/OBS 자기 자신 등 절대 블러 대상이 아닌 exe 목록.
 // OBS는 스트리밍 도구라 화면에 보여도 안전 — game mode 자동 블러에서 제외.
-static bool is_gm_excluded_exe(const std::wstring &exe) {
+// [정책 변경] 게임 모드 포그라운드 자동 블러 제거로 현재 호출처는 없으나,
+// 향후 재도입 가능성이 있어 유지한다([[maybe_unused]]).
+[[maybe_unused]] static bool is_gm_excluded_exe(const std::wstring &exe) {
   static const wchar_t *const kExcluded[] = {
       L"obs64.exe", L"obs32.exe", L"obs.exe",
       L"obs-studio.exe", L"explorer.exe", // explorer = 작업표시줄/바탕화면
@@ -182,7 +184,10 @@ static bool is_gm_excluded_exe(const std::wstring &exe) {
 // [T13] 자동 블러된 fg를 ring buffer에 기록. 같은 exe가 다시 가려지면
 // 기존 entry 제거 후 새 entry를 front에 push (LRU). 크기 cap 초과 시 oldest pop.
 // 호출은 render 스레드 — recentBlurredMutex로 GUI 스레드 read와 직렬화.
-static void record_recent_blurred(SecureCastFilter *filter,
+// [정책 변경] 게임 모드 포그라운드 자동 블러 제거로 현재 호출처는 없다
+// (자동 블러된 앱 목록 UI는 데이터 공급원이 사라져 빈 상태로 표시됨).
+// 향후 재도입 대비해 유지한다([[maybe_unused]]).
+[[maybe_unused]] static void record_recent_blurred(SecureCastFilter *filter,
                                   const std::wstring &exe, HWND fg) {
   wchar_t title[256] = {};
   if (fg)
@@ -3480,57 +3485,16 @@ static void securecast_video_tick(void *data, float seconds) {
       }
     }
 
-#ifdef _WIN32
-    // [Game mode v2 — T02] 게임 모드 자동 블러 (silent).
-    // 게임 모드 진입 시 캡처된 gameModeGameExe로 fg를 식별: fg가 그 게임이면
-    // 송출, 아니면 silent blur. OBS/explorer 같은 제외 리스트 exe는 skip.
-    //
-    // [T02-2 empty 가드] gameModeGameExe가 비어있다는 것은 진입 시 게임을
-    // 잡지 못했다는 뜻 (예: CPU 트리거 진입 시 fg가 OBS 같은 제외 앱이었음).
-    // 이 상태에서 자동 블러를 켜면 사용자가 alt+tab으로 진짜 게임 화면에
-    // 들어왔을 때 게임 자체가 가려지는 회귀가 발생한다. 빈 상태면 자동 블러
-    // 비활성 — 일반 블랙리스트(위 outer 블록)는 그대로 작동하므로 보호 누락 없음.
-    if (filter->isGameMode.load(std::memory_order_acquire) &&
-        outCount < SC_MAX_BLUR_RECTS) {
-      std::wstring gameExe;
-      {
-        std::lock_guard<std::mutex> lock(filter->gameModeMutex);
-        gameExe = filter->gameModeGameExe;
-      }
-      if (!gameExe.empty()) {
-        HWND fg = GetForegroundWindow();
-        if (fg) {
-          wchar_t fgExe[64] = {};
-          if (sc_get_hwnd_exe_name(fg, fgExe, 64)) {
-            std::wstring fgExeStr(fgExe);
-            bool block = false;
-            if (!is_gm_excluded_exe(fgExeStr)) {
-              const bool isGame = (fgExeStr == gameExe);
-              bool inWhitelist = false;
-              {
-                std::lock_guard<std::mutex> glock(g_gmGlobalMutex);
-                inWhitelist = g_gmWhitelist.count(fgExeStr) > 0;
-              }
-              block = !isGame && !inWhitelist;
-            }
-            if (block) {
-              RECT fgRect{};
-              if (SUCCEEDED(DwmGetWindowAttribute(
-                      fg, DWMWA_EXTENDED_FRAME_BOUNDS, &fgRect,
-                      sizeof(fgRect)))) {
-                filter->blacklistMask.rects[outCount++] = {
-                    (int)fgRect.left, (int)fgRect.top,
-                    (int)(fgRect.right - fgRect.left),
-                    (int)(fgRect.bottom - fgRect.top), 0};
-                // [T13] 가린 사실을 ring buffer에 기록 — UI에서 사용자가 확인.
-                record_recent_blurred(filter, fgExeStr, fg);
-              }
-            }
-          }
-        }
-      }
-    }
-#endif
+    // [정책] 게임 모드 블러 대상 = 블랙리스트 창만.
+    //   과거에는 게임 모드에서 포그라운드 창을 "게임 본체/화이트리스트/시스템
+    //   제외 앱이 아니면 무조건 가리는"(deny-by-default) 자동 블러가 있었으나,
+    //   "게임 모드에서는 블랙리스트에 등록된 앱만 가린다"는 정책으로 변경하여
+    //   제거했다. 따라서 게임 모드에서도 가려지는 창은 위 outer 블록이 만든
+    //   blacklistMask(일반 블랙리스트 + 게임 모드 블랙리스트 + 내장
+    //   game-mode-extra 목록)뿐이며, 화이트리스트 앱은 블랙리스트가 아니므로
+    //   자연히 가려지지 않는다(별도 검사 불필요).
+    //   ⚠️ 트레이드오프: 게임 중 alt+tab으로 띄운 비-블랙리스트 앱(디스코드 등)은
+    //      이제 자동으로 가려지지 않으므로, 가리려면 블랙리스트에 등록해야 한다.
 
     filter->blacklistMask.rectCount = outCount;
     if (filter->windowList.count > 0 && filter->logScanThrottle++ % 10 == 0)
@@ -4018,8 +3982,11 @@ static void populate_user_game_picker(SecureCastFilter *filter,
 
 // 콤보박스 선택값 → editable_list 추가 (중복 체크).
 // pickerKey: 어떤 picker의 selection을 읽을지 (기본 "sc_app_picker").
+// conflictKey: 지정 시, 추가하려는 앱이 그 목록에 이미 있으면 추가를 거부한다
+// (게임 모드 블랙리스트 ↔ 화이트리스트 동시 등록 방지). nullptr이면 검사 안 함.
 static bool add_picker_to_list(void *data, const char *listKey,
-                               const char *pickerKey = "sc_app_picker") {
+                               const char *pickerKey = "sc_app_picker",
+                               const char *conflictKey = nullptr) {
   auto *filter = static_cast<SecureCastFilter *>(data);
   if (!filter || !filter->context)
     return false;
@@ -4030,6 +3997,32 @@ static bool add_picker_to_list(void *data, const char *listKey,
   if (!sel || !*sel) {
     obs_data_release(settings);
     return false;
+  }
+  // [상호 배제] 한 앱은 게임 모드 블랙리스트(가림)와 화이트리스트(노출)에 동시에
+  // 들어갈 수 없다 — 의미가 정면 충돌하기 때문. 반대편 목록에 이미 있으면 추가를
+  // 거부하고 경고만 남긴다(기존 등록은 그대로 유지).
+  if (conflictKey) {
+    obs_data_array_t *other = obs_data_get_array(settings, conflictKey);
+    bool conflict = false;
+    if (other) {
+      size_t cn = obs_data_array_count(other);
+      for (size_t i = 0; i < cn && !conflict; ++i) {
+        obs_data_t *it = obs_data_array_item(other, i);
+        const char *v = obs_data_get_string(it, "value");
+        if (v && _stricmp(v, sel) == 0)
+          conflict = true;
+        obs_data_release(it);
+      }
+      obs_data_array_release(other);
+    }
+    if (conflict) {
+      blog(LOG_WARNING,
+           "[SecureCast] '%s' 은(는) 이미 '%s' 목록에 있어 '%s'에 추가하지 "
+           "않음 (블랙리스트 ↔ 화이트리스트 동시 등록 불가).",
+           sel, conflictKey, listKey);
+      obs_data_release(settings);
+      return false;
+    }
   }
   obs_data_array_t *arr = obs_data_get_array(settings, listKey);
   if (!arr)
@@ -4064,13 +4057,17 @@ static bool sc_add_to_normal_cb(obs_properties_t *, obs_property_t *,
 }
 static bool sc_add_to_game_cb(obs_properties_t *, obs_property_t *,
                               void *data) {
-  return add_picker_to_list(data, SC_SETTING_BLACKLIST_GM);
+  // 게임 모드 블랙리스트에 추가 — 단, 화이트리스트에 이미 있으면 거부.
+  return add_picker_to_list(data, SC_SETTING_BLACKLIST_GM, "sc_app_picker",
+                            SC_SETTING_GM_WHITELIST);
 }
 // 상단 앱 picker(sc_app_picker)에서 선택한 앱 → 게임 모드 노출 허용 앱
 // (화이트리스트, sc_gm_whitelist)에 추가. 블랙리스트 Add 버튼과 동일 패턴.
 static bool sc_add_to_whitelist_cb(obs_properties_t *, obs_property_t *,
                                    void *data) {
-  return add_picker_to_list(data, SC_SETTING_GM_WHITELIST);
+  // 화이트리스트에 추가 — 단, 게임 모드 블랙리스트에 이미 있으면 거부.
+  return add_picker_to_list(data, SC_SETTING_GM_WHITELIST, "sc_app_picker",
+                            SC_SETTING_BLACKLIST_GM);
 }
 
 // [게임 제외 목록] "게임 선택" picker(sc_user_game_picker)에서 선택한 항목을
