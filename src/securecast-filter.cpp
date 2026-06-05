@@ -3982,11 +3982,13 @@ static void populate_user_game_picker(SecureCastFilter *filter,
 
 // 콤보박스 선택값 → editable_list 추가 (중복 체크).
 // pickerKey: 어떤 picker의 selection을 읽을지 (기본 "sc_app_picker").
-// conflictKey: 지정 시, 추가하려는 앱이 그 목록에 이미 있으면 추가를 거부한다
-// (게임 모드 블랙리스트 ↔ 화이트리스트 동시 등록 방지). nullptr이면 검사 안 함.
+// conflictKey/conflictKey2: 지정 시, 추가하려는 앱이 그 목록에 이미 있으면 추가를
+// 거부한다(블랙리스트 ↔ 화이트리스트 동시 등록 방지). 화이트리스트 추가처럼 반대편
+// 목록이 둘(일반·게임 블랙리스트)인 경우를 위해 키 2개까지 받는다. nullptr이면 무시.
 static bool add_picker_to_list(void *data, const char *listKey,
                                const char *pickerKey = "sc_app_picker",
-                               const char *conflictKey = nullptr) {
+                               const char *conflictKey = nullptr,
+                               const char *conflictKey2 = nullptr) {
   auto *filter = static_cast<SecureCastFilter *>(data);
   if (!filter || !filter->context)
     return false;
@@ -3998,31 +4000,37 @@ static bool add_picker_to_list(void *data, const char *listKey,
     obs_data_release(settings);
     return false;
   }
-  // [상호 배제] 한 앱은 게임 모드 블랙리스트(가림)와 화이트리스트(노출)에 동시에
-  // 들어갈 수 없다 — 의미가 정면 충돌하기 때문. 반대편 목록에 이미 있으면 추가를
-  // 거부하고 경고만 남긴다(기존 등록은 그대로 유지).
-  if (conflictKey) {
-    obs_data_array_t *other = obs_data_get_array(settings, conflictKey);
-    bool conflict = false;
+  // [상호 배제] 한 앱은 블랙리스트(가림)와 화이트리스트(노출)에 동시에 들어갈 수
+  // 없다 — 의미가 정면 충돌하기 때문. 지정된 반대편 목록(들)에 이미 있으면 추가를
+  // 거부하고 경고만 남긴다(기존 등록은 그대로 유지). 매칭은 case-insensitive.
+  auto in_list = [&](const char *key) -> bool {
+    if (!key)
+      return false;
+    obs_data_array_t *other = obs_data_get_array(settings, key);
+    bool found = false;
     if (other) {
       size_t cn = obs_data_array_count(other);
-      for (size_t i = 0; i < cn && !conflict; ++i) {
+      for (size_t i = 0; i < cn && !found; ++i) {
         obs_data_t *it = obs_data_array_item(other, i);
         const char *v = obs_data_get_string(it, "value");
         if (v && _stricmp(v, sel) == 0)
-          conflict = true;
+          found = true;
         obs_data_release(it);
       }
       obs_data_array_release(other);
     }
-    if (conflict) {
-      blog(LOG_WARNING,
-           "[SecureCast] '%s' 은(는) 이미 '%s' 목록에 있어 '%s'에 추가하지 "
-           "않음 (블랙리스트 ↔ 화이트리스트 동시 등록 불가).",
-           sel, conflictKey, listKey);
-      obs_data_release(settings);
-      return false;
-    }
+    return found;
+  };
+  const char *hitKey = in_list(conflictKey)    ? conflictKey
+                       : in_list(conflictKey2) ? conflictKey2
+                                               : nullptr;
+  if (hitKey) {
+    blog(LOG_WARNING,
+         "[SecureCast] '%s' 은(는) 이미 '%s' 목록에 있어 '%s'에 추가하지 않음 "
+         "(블랙리스트 ↔ 화이트리스트 동시 등록 불가).",
+         sel, hitKey, listKey);
+    obs_data_release(settings);
+    return false;
   }
   obs_data_array_t *arr = obs_data_get_array(settings, listKey);
   if (!arr)
@@ -4053,7 +4061,9 @@ static bool add_picker_to_list(void *data, const char *listKey,
 
 static bool sc_add_to_normal_cb(obs_properties_t *, obs_property_t *,
                                 void *data) {
-  return add_picker_to_list(data, SC_SETTING_BLACKLIST);
+  // 일반 블랙리스트에 추가 — 단, 화이트리스트에 이미 있으면 거부.
+  return add_picker_to_list(data, SC_SETTING_BLACKLIST, "sc_app_picker",
+                            SC_SETTING_GM_WHITELIST);
 }
 static bool sc_add_to_game_cb(obs_properties_t *, obs_property_t *,
                               void *data) {
@@ -4065,9 +4075,9 @@ static bool sc_add_to_game_cb(obs_properties_t *, obs_property_t *,
 // (화이트리스트, sc_gm_whitelist)에 추가. 블랙리스트 Add 버튼과 동일 패턴.
 static bool sc_add_to_whitelist_cb(obs_properties_t *, obs_property_t *,
                                    void *data) {
-  // 화이트리스트에 추가 — 단, 게임 모드 블랙리스트에 이미 있으면 거부.
+  // 화이트리스트에 추가 — 단, 일반/게임 블랙리스트 어느 쪽에든 있으면 거부.
   return add_picker_to_list(data, SC_SETTING_GM_WHITELIST, "sc_app_picker",
-                            SC_SETTING_BLACKLIST_GM);
+                            SC_SETTING_BLACKLIST, SC_SETTING_BLACKLIST_GM);
 }
 
 // [게임 제외 목록] "게임 선택" picker(sc_user_game_picker)에서 선택한 항목을
@@ -4155,25 +4165,43 @@ static bool sc_games_autodetect_btn_cb(obs_properties_t *, obs_property_t *,
                                        void *data);
 #endif // _WIN32
 
-// 기본값으로 KakaoTalk/Discord/Slack 자동 추가 (사용자 설정 비어있을 때만).
-static obs_data_array_t *make_default_blacklist_array() {
+// exe 이름 배열 → editable_list용 obs_data_array (각 item의 "value"에 exe).
+static obs_data_array_t *make_blacklist_array_from(const char *const *exes,
+                                                   size_t count) {
   obs_data_array_t *arr = obs_data_array_create();
-  static const char *const kDefaults[] = {"KakaoTalk.exe", "Discord.exe",
-                                          "Slack.exe"};
-  for (const char *exe : kDefaults) {
+  for (size_t i = 0; i < count; ++i) {
     obs_data_t *item = obs_data_create();
-    obs_data_set_string(item, "value", exe);
+    obs_data_set_string(item, "value", exes[i]);
     obs_data_array_push_back(arr, item);
     obs_data_release(item);
   }
   return arr;
 }
 
+// 일반 모드 블랙리스트 기본값: 카카오톡/디스코드/슬랙 (사용자 설정 비어있을 때만).
+static obs_data_array_t *make_default_blacklist_array() {
+  static const char *const kDefaults[] = {"KakaoTalk.exe", "Discord.exe",
+                                          "Slack.exe"};
+  return make_blacklist_array_from(kDefaults,
+                                   sizeof(kDefaults) / sizeof(kDefaults[0]));
+}
+
+// 게임 모드 블랙리스트 기본값: 일반 블랙리스트(카카오톡/디스코드/슬랙) +
+// chrome/notepad. 게임 방송 중에는 브라우저·메모장도 기본적으로 가린다.
+// (매칭은 case-insensitive이므로 chrome.exe/notepad.exe 표기로 충분.)
+static obs_data_array_t *make_default_blacklist_gm_array() {
+  static const char *const kDefaults[] = {"KakaoTalk.exe", "Discord.exe",
+                                          "Slack.exe", "chrome.exe",
+                                          "notepad.exe"};
+  return make_blacklist_array_from(kDefaults,
+                                   sizeof(kDefaults) / sizeof(kDefaults[0]));
+}
+
 static void securecast_get_defaults(obs_data_t *settings) {
   obs_data_array_t *defNormal = make_default_blacklist_array();
   obs_data_set_default_array(settings, SC_SETTING_BLACKLIST, defNormal);
   obs_data_array_release(defNormal);
-  obs_data_array_t *defGame = make_default_blacklist_array();
+  obs_data_array_t *defGame = make_default_blacklist_gm_array();
   obs_data_set_default_array(settings, SC_SETTING_BLACKLIST_GM, defGame);
   obs_data_array_release(defGame);
 
