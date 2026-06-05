@@ -1487,8 +1487,17 @@ VisualTrackerManager::snapshot_for_push(uint32_t src_w, uint32_t src_h) const {
               {
                 const int64_t lastScroll =
                     securecast::last_scroll_motion_time_ms();
+                // [잔상 수정] 스크롤 신호(last_scroll_motion_time_ms)는 프로세스
+                // 전역이라 어느 창에서 휠을 굴려도 갱신된다. 이 때문에 다른 창으로
+                // 이동한 직후에도 이전 창(target)의 박스가 "창 전체"로 확장돼 블러
+                // 잔상이 남았다. owner 창이 실제 포그라운드(=지금 스크롤하는 창)일
+                // 때만 밴드를 적용해 전역 신호를 창별로 좁힌다. 배경 창은 사용자가
+                // 스크롤하지 않으므로 노출 위험이 없어 밴드 불필요.
+                const bool ownerIsForeground =
+                    (target == GetForegroundWindow());
                 const bool scrollBandActive =
-                    (lastScroll > 0) && ((nowMs - lastScroll) < kScrollSettleMs);
+                    ownerIsForeground && (lastScroll > 0) &&
+                    ((nowMs - lastScroll) < kScrollSettleMs);
                 if (scrollBandActive) {
                   boxScreen.left = cur.left;
                   boxScreen.top = cur.top;
