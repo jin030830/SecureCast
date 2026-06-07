@@ -86,8 +86,19 @@ public:
   // video_render thread에서 직접 동기 호출하면 프레임 드랍이 발생할 수 있다.
   // render thread가 아니라 별도 OCR worker thread에서 호출해야 한다.
   // ========================================================
+  // inputScale: 호출부가 적용한 업/다운스케일 배율(scaled/native). avgLineHeight_를
+  // 네이티브 공간으로 정규화하는 데 쓴다(스케일 피드백 진동 방지).
   std::vector<SecureCastOcrBox>
-  analyze_bgra_frame(const uint8_t *pixels, int width, int height, int stride);
+  analyze_bgra_frame(const uint8_t *pixels, int width, int height, int stride,
+                     float inputScale = 1.0f);
+
+  // 화면 일부(창 영역)만 따로 OCR+PII 탐지. busy 전체 프레임에서 Windows OCR이
+  // 작은 창 텍스트를 통째로 누락하는 문제를 보완 — 그 창 영역만 떼어 주면 엔진이
+  // full 주의로 읽는다(창 캡처와 같은 효과). dHash 캐시는 안 거치며(매번 직접 OCR),
+  // 반환 좌표는 입력 px 공간(rx/ry/rw/rh와 동일 좌표계) 기준이다.
+  std::vector<SecureCastOcrBox>
+  detect_pii_in_region(const uint8_t *px, int width, int height, int stride,
+                       int rx, int ry, int rw, int rh);
 
 private:
   struct Impl;
@@ -123,11 +134,18 @@ private:
   };
   std::vector<LineDHashCache> lastLineDhashes_;
   int consecutiveSkips_ = 0;
+  // [메모장 타이핑 고착 방지] 연속 L2 partial 횟수. L2 partial은 캐시된 라인 위치만
+  // 재검사하므로, 캐시 밖(새로 입력한 줄)에 나타난 PII는 못 보고, 타이핑으로 기존
+  // 라인이 계속 바뀌면 anyChanged가 지속돼 full OCR이 영영 안 돌아 탐지가 고착된다.
+  // N회 연속 partial 후 full OCR을 강제해 전체 프레임을 재스캔(multipass 포함)한다.
+  int consecutiveL2Partials_ = 0;
   // 2-C: 직전 full OCR 사이클의 라인 평균 높이. 적응형 스케일 계산에 사용.
   float avgLineHeight_ = 0.0f;
   // 연속 L1 히트 허용 횟수: 2 = 실제 1회 스킵(++후 1<2=true, 이후 full OCR).
   // OCR 워커 주기 포함 시 최대 ~250ms stale.
   static constexpr int kMaxConsecutiveSkips = 2;
+  // 연속 L2 부분 OCR 허용 횟수: 3 = 최대 2회 연속 partial 후 full OCR 강제.
+  static constexpr int kMaxConsecutiveL2Partials = 3;
 
   // dHash: 9×8 샘플 격자 → 행별 인접 밝기 비교(8비트 × 8행) → 64비트
   uint64_t compute_dhash_region(const uint8_t *px, int stride, int x, int y,
@@ -152,12 +170,28 @@ private:
   detect_pii(const std::vector<SecureCastOcrLine> &lines);
 
   // P3: 소형 글씨 다중 패스 OCR
-  // lines에서 높이 < 20px인 라인을 최대 MAX_PASSES개까지 2× 업스케일 재OCR.
-  // detect_pii에 넘기기 전에 호출한다. L2 캐시 갱신에는 원본 lines를 사용한다.
+  // 높이 < SMALL_H px 인 라인 전체를 Union BBox 한 영역으로 묶어 2×
+  // nearest-neighbor 업스케일 후 단일 batch recognize_text 호출. 8MP 초과나
+  // sparse 레이아웃이면 split_batch_multipass로 폴백. 결과는 IoU 매칭으로
+  // 원본 라인에 다시 투영. detect_pii에 넘기기 전 호출 (L2 캐시는 원본 lines).
   std::vector<SecureCastOcrLine>
   multipass_small_text(const std::vector<SecureCastOcrLine> &lines,
                        const uint8_t *pixels, int width, int height,
                        int stride);
+
+  std::vector<SecureCastOcrLine>
+  split_batch_multipass(const std::vector<SecureCastOcrLine> &lines,
+                        const std::vector<int> &smallIndices,
+                        const uint8_t *pixels, int width, int height,
+                        int stride);
+
+  // 2× nearest-neighbor 업스케일된 batch가 이 픽셀 수를 넘으면 단일 OCR이
+  // 위험하다고 판단해 분할/스킵한다. Windows.Media.Ocr이 ~16MP에서 stall
+  // 빈도가 급증하는 경험치 기반.
+  static constexpr size_t SC_MAX_OCR_BATCH_PX = 8000000u;
+  // 소형 라인이 Union BBox 내에 차지하는 비율이 이 값 미만이면 sparse 레이아웃
+  // 으로 간주, Y정렬 N분할로 폴백.
+  static constexpr float SC_SPARSE_THRESHOLD = 0.3f;
 
   // === OCR 오류 보정: O/o → 0, I/l → 1 ===
   std::string normalize_numeric_candidate(const std::string &text);

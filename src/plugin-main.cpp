@@ -19,6 +19,7 @@
 #include <obs-module.h>
 
 #include "plugin-support.h"   // obs_log 매크로/함수, PLUGIN_NAME 등
+#include "scroll_motion_hook.h" // 글로벌 휠/키 hook (스크롤 모션 인과 신호)
 
 // securecast-filter.cpp에 정의된 obs_source_info 인스턴스를 가져온다.
 // (필터의 lifecycle 콜백을 묶은 dispatch table)
@@ -42,7 +43,7 @@ OBS_MODULE_USE_DEFAULT_LOCALE("securecast", "en-US")
  * [개발 프로세스 안내]
  * 1. Role A (렌더링): obs_video_render() 과정에서 마스킹 셰이더를 적용합니다.
  * 2. Role B (AI): 분석 엔진을 통해 화면의 개인정보 영역을 탐지하고 MaskPayload를 생성합니다.
- * 3. Role C (파이프라인): FrameRingBuffer를 통해 프레임 지연을 관리하고, AtomicMaskChannel로 데이터를 중계합니다.
+ * 3. Role C (파이프라인): FrameRingBuffer로 프레임 지연을 관리하고, Visual Tracker(trackerMgr)로 마스킹 좌표를 중계합니다.
  * 4. Role D (설정/UI): 사용자 설정값을 관리하며 전체 모듈의 상태(SecurityState)를 제어합니다.
  */
 
@@ -58,6 +59,11 @@ bool obs_module_load(void)
     // Register our main filter
     // [Role C/A 협업] 여기서 등록된 소스가 필터링 파이프라인의 시작점이 됩니다.
     obs_register_source(&securecast_filter_info);
+
+    // 스크롤 모션 인과 신호: 글로벌 휠/키 hook 시작. 별도 thread에서 message
+    // pump 돌며 입력 가로채 시각 기록. visual-tracker가 박스 확장 hysteresis에
+    // 사용. 한 번만 시작 (idempotent).
+    securecast::start_scroll_motion_hooks();
 
     return true;  // false 반환 시 OBS가 모듈을 unload함
 }

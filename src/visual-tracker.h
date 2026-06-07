@@ -27,6 +27,21 @@ struct VtOcrBox {
   float x, y, w, h; // 픽셀 좌표 (top-left + 크기)
 };
 
+// [Window anchor] OCR 박스의 owner 창 정보. 렌더 시점에 송출 프레임의
+// windowSnapshot에서 같은 hwnd를 찾아 ref 좌표와의 delta만큼 블러를 평행이동.
+// 모니터 절대좌표(DWM bounds)를 사용 — register 시점에는 OCR 워커가 windowList
+// 스냅샷에서 추출해 채운다. hwnd == nullptr 이면 owner 없음(=NCC 좌표 그대로).
+struct VtBoxOwner {
+  void *hwnd = nullptr;
+  int32_t windowL = 0;
+  int32_t windowT = 0;
+  // [Anim guard] OCR 시점 owner 창의 right/bottom (모니터 절대좌표). 렌더 시
+  // 현재 크기와 비교해 maximize/restore 진행 중인지 감지하고 그동안 박스에
+  // 추가 padding을 입혀 OBS pipeline lag으로 인한 위·아래 노출 방지.
+  int32_t windowR = 0;
+  int32_t windowB = 0;
+};
+
 class VisualTrackerManager {
 public:
   static constexpr float SCORE_OK = 0.70f;   // 이 점수 이상이면 정상 추적
@@ -40,8 +55,12 @@ public:
       250; // lastScore <  SCORE_OK 일 때 반경 (P0-A: 60→250, 빠른 이동 대응)
 
   // P0-2: ghost-kill 상한
+  // [#6] 8 → 24: 다수 PII(폼/목록에서 10~20개 이상)가 동시에 보일 때 8개만
+  // 추적돼 나머지가 노출되던 문제 해결(계측: OCR 19~21 검출, 트래커 8 캡).
+  // 트래커당 NCC(30Hz)/owner DWM 조회 비용이 늘므로 관측 최대(21)+여유로 24.
+  // securecast-filter.cpp의 all_rects 사이징 kMaxTrackerSlots도 동일하게 유지.
   static constexpr int MAX_TRACKERS =
-      8; // 동시 트래커 최대 수 (초과 시 신규 등록 거부)
+      24; // 동시 트래커 최대 수 (초과 시 가장 stale한 트래커 evict)
   static constexpr int HARD_EXPIRY =
       30; // OCR 미확인 시 최대 수명 (30 cycles ≈ 1s @ 30Hz)
   // 1-A / 3-A: 동시성·안정성
@@ -81,10 +100,48 @@ public:
   void register_or_update_gray(const std::vector<VtOcrBox> &ocr_boxes,
                                const uint8_t *gray, int gw, int gh);
 
+  // [Window anchor] OCR worker가 각 PII 박스에 대해 owner 정보(HWND + DWM bounds
+  // top-left)를 함께 전달하는 오버로드. owners.size()가 ocr_boxes.size()와 같아야
+  // 하며 다르면 owner 정보 없음으로 처리(=기존 동작).
+  // ref 좌표/창 위치는 신규 등록 + 기존 매칭 모두에서 매번 갱신.
+  void register_or_update_gray(const std::vector<VtOcrBox> &ocr_boxes,
+                               const std::vector<VtBoxOwner> &owners,
+                               const uint8_t *gray, int gw, int gh);
+
   // 렌더 스레드에서 현재 블러 좌표 조회 (복사 반환)
   std::vector<VtOcrBox> active_boxes() const;
 
+  // 추적 중인 트래커가 하나라도 있는지(경량 — 벡터 복사 없이 락+empty만).
+  // 0개면 NCC 비교 대상이 없어 30Hz 그레이 readback을 생략하는 최적화에 사용.
+  // ghost-kill 게이트와 무관하게 트래커 존재 여부만 본다(ghost 박스의 NCC 회복을
+  // 막지 않기 위함).
+  bool hasActiveBoxes() const;
+
+  // 현재 활성 트래커들이 가지고 있는 owner HWND들의 unique 셋(void* 형태).
+  // 최소화 가드에서 비-블랙리스트 owner 창도 lingering 등록 대상에 포함시키기
+  // 위해 사용. 트래커가 없거나 모두 owner=nullptr면 빈 벡터 반환.
+  std::vector<void *> active_owner_windows() const;
+
+  // [Window anchor v4] pushFrame 직전에 호출. owner 창 바인딩된 트래커는
+  // refWindow(OCR 시점)와 현재 DWM bounds의 delta를 즉시 계산해 박스 좌표를
+  // 갱신. owner 없는 트래커는 NCC tr.x/tr.y 그대로. 결과는 슬롯에 저장되어
+  // 송출 시점에 그대로 사용 — 동일 프레임의 창 위치와 일치하므로 NCC lag도
+  // 사라진다. src_w/src_h는 트래커 좌표 공간(half-res 모드면 절반).
+  std::vector<VtOcrBox>
+  snapshot_for_push(uint32_t src_w, uint32_t src_h) const;
+
   void clear();
+
+  // [Freeze T05] sticky 보호 지속 시간(ms) 설정. Properties 슬라이더 값이
+  // securecast_update → 이 setter로 전달된다. snapshot_for_push의 sticky
+  // expansion 유지 기간 + 리사이즈 lookback에 함께 적용. 200~3000ms로 clamp.
+  void setStickyDurationMs(int ms) {
+    if (ms < 200)
+      ms = 200;
+    if (ms > 3000)
+      ms = 3000;
+    stickyDurationMs_.store(ms, std::memory_order_relaxed);
+  }
 
   // 재사용 버퍼 버전: 2× 박스-필터 다운샘플 (gray → gray/2, public static).
   // 렌더 스레드에서 트래커에 half-res gray를 전달할 때 직접 호출 가능.
@@ -117,6 +174,26 @@ private:
     // Phase C 커밋 시 이 값이 같아야만 템플릿 필드를 덮어쓴다 (충돌 방지).
     uint32_t templateTs = 0;
 
+    // [Window anchor] OCR 시점에 바인딩된 owner 창 (HWND, void*로 보관해
+    // 헤더에서 windows.h 의존 회피). nullptr이면 anchor 없이 NCC만 사용.
+    void *ownerWin = nullptr;
+    // OCR이 이 트래커를 등록/재확인한 시점의 박스 좌표(source-space, px).
+    // 렌더는 이 ref + (송출 프레임 창 위치 - refWindow) delta를 사용.
+    float refX = 0.0f, refY = 0.0f;
+    // OCR 등록/재확인 시점의 owner 창 DWM bounds top-left (모니터 절대좌표).
+    // 렌더 시 송출 슬롯의 windowSnapshot에서 같은 hwnd의 bounds와 비교해 delta 산출.
+    int32_t refWindowL = 0;
+    int32_t refWindowT = 0;
+    // [Anim guard] OCR 시점 right/bottom. snapshot_for_push에서 현재 크기와
+    // 비교해 maximize/restore 애니메이션 진행을 감지한다.
+    int32_t refWindowR = 0;
+    int32_t refWindowB = 0;
+
+    // [Fix #2] OCR worker가 register_or_update를 호출할 때마다 증가.
+    // Phase C에서 ocrRevision이 lt와 it에서 다르면
+    // 사이에 OCR이 리셋한 것이므로 framesSinceMatch 등 카운터를 보존.
+    uint32_t ocrRevision = 0;
+
     // Tier 3: AVX2 NCC 용 사전 계산 float 템플릿
     // tmpl_float[i] = (float)tmpl[i] - tmean  (centered)
     // tmpl_dT = Σ tmpl_float[i]²  (template variance × N)
@@ -142,6 +219,42 @@ private:
   // 3-A: register_or_update / register_or_update_gray 진입 시 갱신 (ms 단위).
   std::atomic<uint64_t> lastOcrUpdateTsMs_{0};
 
+  // 스크롤 모션 hysteresis: 글로벌 mouse/keyboard hook이 시각 기록
+  // (scroll_motion_hook 모듈). 박스 반환 함수가 다음 조건 만족 시 박스 h 확장:
+  //   1) 모션 후 MIN_HOLD_MS 이내 (즉시 종료 방지)
+  //   2) OR 활성 트래커 중 NCC unstable(lastScore<SCORE_OK 또는 framesSinceMatch>0)
+  //      → "완벽 추적 전까지 확장 유지"
+  //   3) MAX_HOLD_MS 초과 시 강제 종료 (safety cap)
+  // hook은 paint 이전 인과 신호라 첫 모션부터 즉시 활성.
+  static constexpr int64_t MOTION_MIN_HOLD_MS = 300;
+  static constexpr int64_t MOTION_MAX_HOLD_MS = 5000;
+  static constexpr float MOTION_BLUR_EXPAND_PX = 60.0f; // 위/아래 각각
+
+  // [스크롤 밴드 #6 C2] 스크롤 신호 기준 동작 구간 (steady_clock ms).
+  static constexpr int64_t kScrollActiveMs = 700;  // 밴드 ON + 트래커 보존
+  // 멈춘 뒤에도 창 전체 밴드를 유지하는 시간. 무작정 늘리면 옛 트래커 만료
+  // (owner-bound ~5초) 시점과 겹쳐 오히려 커버리지가 떨어지므로 2초 유지.
+  static constexpr int64_t kScrollSettleMs = 2000;
+  static constexpr int kScrollBandMaxPx = 1200; // (현재 미사용 — 창 전체 확장)
+
+  // update_all_gray가 매 사이클 갱신. 모든 활성 트래커가 lastScore>=SCORE_OK +
+  // framesSinceMatch==0이면 true. helper가 종료 조건으로 사용.
+  mutable std::atomic<bool> allTrackersStable_{true};
+
+  // [Anim guard sticky] snapshot_for_push에서 owner 창 크기 변화를 감지한
+  // 가장 최근 시각(ms, steady_clock). 한 번 감지되면 일정 시간 동안 maximize/
+  // restore 애니메이션 진행 중으로 간주해 padding boost를 유지한다.
+  mutable std::atomic<int64_t> lastResizeDetectedMs_{0};
+
+  // [Freeze T05] sticky 보호 지속 시간(ms). default 1500 (현재 동작 유지).
+  // GUI 스레드(setStickyDurationMs) store / 렌더 스레드(snapshot_for_push) load.
+  std::atomic<int> stickyDurationMs_{1500};
+
+  // 모션 hysteresis 활성 시 박스 h를 위아래로 확장. src_h>0이면 하단 clamp.
+  // src_w 인자는 미사용 (수직 확장만) — 인터페이스 일관성을 위해 받음.
+  void expand_boxes_if_motion(std::vector<VtOcrBox> &boxes, uint32_t src_w,
+                              uint32_t src_h) const;
+
   // NCC score: template top-left at (sx, sy) in gray frame (scalar fallback)
   float ncc_at(const uint8_t *gray, int gstride, int gw, int gh,
                const std::vector<uint8_t> &tmpl, int tw, int th, int sx,
@@ -156,6 +269,21 @@ private:
   // Tier 3: tmpl → tmpl_float/tmpl_dT/tmpl_sumCt 사전 계산.
   // tmpl 또는 tw/th 변경 시 반드시 호출한다.
   static void precompute_tmpl_stats(Tracker &tr);
+
+  // [Fix #5] 무상태 NCC 피라미드 검색 결과 구조체
+  struct NccSearchResult {
+    float score;
+    int x;
+    int y;
+  };
+
+  // [Fix #5] ncc_pyramid_search — tr은 const& (상태 변경 없음).
+  // update_one_pyramid가 이를 호출하며, fallback(NEAR→FAR) 도 이 함수로 처리.
+  // ncc_at/ncc_at_simd 호출이 필요해 const 비정적 메서드로 선언.
+  NccSearchResult ncc_pyramid_search(const Tracker &tr, const uint8_t *gray,
+                                     int gw, int gh, const uint8_t *quarterGray,
+                                     int qw, int qh, float predX, float predY,
+                                     int radius) const;
 
   // Tier 3: 2-Level 피라미드 매칭 (quarter coarse → full fine)
   // quarterGray: 1/4 다운샘플 gray (gw/4 × gh/4), qw/qh = 그 크기

@@ -18,22 +18,21 @@
 // C++ Standard Library Headers (MUST be included before OBS headers)
 // ----------------------------------------------------
 #include <array>
+#include <string>
+#include <unordered_set>
 #include <atomic>
 #include <condition_variable>
+#include <deque>
 #include <functional>
 #include <mutex>
 #include <stdint.h>
+#include <string>
 #include <thread>
 #include <vector>
-#include <string>
 
 #ifdef _WIN32
-#include "gpu-readback.h"
 #include "overlay-window.h"
-#include "selection-overlay.h"
 #endif
-#include "pipeline-health.h"
-#include "pixel-hash.h"
 #include "securecast-types.h"
 #include "visual-tracker.h"
 
@@ -67,8 +66,7 @@ class SecureCastOcrEngine;
 constexpr int SC_MAX_BLUR_RECTS =
     32; // 한 프레임에 동시에 마스킹 가능한 최대 영역 수
 constexpr int SC_RING_BUFFER_SLOTS =
-    15; // Bounded Exposure: OCR 레이턴시(≈250ms) / 프레임(16.7ms@60fps) = 15슬롯.
-        // 이 값 미만이면 새 PII가 OCR 탐지 전에 스트림에 출력된다 (보안 원시 위반).
+    60; // Bounded Exposure: OCR 최대 레이턴시(≈1000ms) 대비 여유 확보를 위해 60슬롯으로 증가 (1초 지연)
 
 // ----------------------------------------------------
 // Shared Types (Types) - Moved to securecast-types.h
@@ -83,11 +81,16 @@ struct MaskPayload {
 
 #ifdef _WIN32
 // 창이 사라진 후 ring buffer에 남은 N프레임 동안 마스킹을 유지하는 잔영 항목.
+// fromPreview: 작업표시줄 hover/peek 가드(마우스가 작업표시줄→썸네일 영역으로
+//   이동 시 발동)로 등록된 항목. 렌더 시 minimize cutoff(endNs) 대신
+//   filter->previewActiveNs로 slot.timestamp 컷오프 — peek이 끝난 후 캡처된
+//   슬롯에는 그려지지 않아 빈 영역에 잔상 박스가 남지 않음.
 struct LingeringWindow {
   TrackedWindow window; // 마지막으로 알려진 창 정보 (bounds 포함)
   int ticksRemaining;   // SC_RING_BUFFER_SLOTS에서 매 tick 카운트다운
+  bool fromPreview;     // taskbar 미리보기 가드용 (cutoff 분기)
 };
-constexpr int SC_MAX_LINGERING = SC_MAX_TRACKED_WINDOWS;
+constexpr int SC_MAX_LINGERING = SC_MAX_TRACKED_WINDOWS * 2;
 #endif
 
 // ----------------------------------------------------
@@ -109,12 +112,21 @@ public:
   struct Slot {
     gs_texrender_t *texrender = nullptr; // OBS 안전 렌더 타겟 관리자
     uint64_t timestamp = 0;
+    uint64_t frameId = 0;
+    uint64_t dependentOcrFrameId = 0; // 이 프레임 송출 전 완료되어야 할 대표 OCR 프레임 ID
 #ifdef _WIN32
     // 이 프레임이 캡처된 시점의 창 좌표 스냅샷.
-    // 렌더 시 delayedSlot->windowSnapshot을 사용해야 프레임 내용과 마스크
-    // 위치가 동기화됨.
+    // 렌더 시 출력 슬롯의 windowSnapshot을 사용해야 프레임 내용과 마스크 위치가
+    // 동기화됨.
     TrackedWindowList windowSnapshot{};
+    // 이 프레임 시점의 알림 영역 블러 rect (width 0 = 없음). windowSnapshot과
+    // 같은 이유로 슬롯에 저장 — 지연 송출 프레임과 동기화하기 위함.
+    BlurRect notifRect{};
 #endif
+    // [Window anchor v2] 이 프레임이 push될 시점의 트래커 박스 스냅샷
+    // (tracker 좌표 공간; render에서 trackerCoordScale_로 환산).
+    // 송출 프레임과 같이 지연되므로 텍스트와 블러가 동시에 움직임.
+    std::vector<VtOcrBox> trackerSnapshot;
 
     // gs_texrender에서 결과 텍스처를 꺼내는 헬퍼
     gs_texture_t *getTexture() const {
@@ -131,11 +143,28 @@ public:
 
   // gs_texrender_begin/end를 사용하여 안전하게 프레임을 캡처.
   // wlist: 이 프레임 캡처 시점의 창 좌표 스냅샷 (null 허용).
+  // trackerSnap: 이 프레임 시점의 트래커 박스 스냅샷 (null 허용; 트래커 좌표 공간).
 #ifdef _WIN32
   void pushFrame(uint64_t timestamp, obs_source_t *filter_context,
-                 const TrackedWindowList *wlist);
+                 const TrackedWindowList *wlist,
+                 const std::vector<VtOcrBox> *trackerSnap,
+                 uint64_t dependentOcrFrameId);
 #else
-  void pushFrame(uint64_t timestamp, obs_source_t *filter_context);
+  void pushFrame(uint64_t timestamp, obs_source_t *filter_context,
+                 const std::vector<VtOcrBox> *trackerSnap,
+                 uint64_t dependentOcrFrameId);
+#endif
+
+#ifdef _WIN32
+  // 최근 maxAgeNs(ns) 이내에 캡처된 슬롯들의 windowSnapshot에 win을 소급
+  // 추가한다. 새 블랙리스트 창은 감지 지연 동안 캡처된 슬롯의 스냅샷에서
+  // 빠져 있어, 그 슬롯이 송출될 때 마스킹 없이 노출된다. 이를 보정한다.
+  void backfillRecentSnapshots(const TrackedWindow &win, uint64_t nowNs,
+                               uint64_t maxAgeNs);
+  // 최근 maxAgeNs(ns) 이내에 캡처된 슬롯들의 notifRect를 rect로 설정한다.
+  // 알림 블러를 windowSnapshot과 동일하게 지연 송출 프레임과 동기화한다.
+  void backfillRecentNotifRect(const BlurRect &rect, uint64_t nowNs,
+                               uint64_t maxAgeNs);
 #endif
 
   const Slot *peekDelayedSlot() const;
@@ -143,6 +172,15 @@ public:
   // framesBack=SC_RING_BUFFER_SLOTS-1이면 한 프레임 더 최신 슬롯 (빠른 이동
   // 합집합용).
   const Slot *peekSlotAtOffset(int framesBack) const;
+
+  // [Bounded Exposure backfill]
+  // OCR worker가 새 frameId를 claim한 직후 호출. 링 내 모든 슬롯 중 frameId가
+  // newOcrFrameId 미만이고 dependentOcrFrameId가 그보다 작은 슬롯의 dependent를
+  // newOcrFrameId로 갱신한다. 새 PII가 등장한 후 push된 슬롯들이 "이 슬롯
+  // 이후의 OCR"이 완료될 때까지 unsafe로 게이트되도록 강제한다.
+  //
+  // 호출 thread: render thread 단독 (push/peek와 동일). 외부 동기화 불필요.
+  void backfillDependentOcr(uint64_t newOcrFrameId);
 
   bool isInitialized() const { return m_initialized; }
   uint32_t getWidth() const { return m_width; }
@@ -152,61 +190,43 @@ private:
   std::array<Slot, SC_RING_BUFFER_SLOTS> m_slots{};
   int m_head = 0;
   int m_frameCount = 0;
+  uint64_t m_nextFrameId = 1;
   uint32_t m_width = 0;
   uint32_t m_height = 0;
   bool m_initialized = false;
 };
 
 // ----------------------------------------------------
-// [Role C] Mock AI Worker Thread
+// [Freeze T01] PII 보호 강도 모드
+//
+// 사용자가 Properties에서 선택하는 3단계 모드. video_render의 게이트 마진
+// (delayedSlot->dependentOcrFrameId 와 safeWatermarkId 의 허용 차이, 프레임 단위)
+// 을 동적으로 결정한다. 값이 클수록 freeze는 줄지만 새 PII의 순간 노출 시간이
+// 늘어난다 (60fps 기준 1프레임 ≈ 16.6ms).
+//   MaxSecurity(+0): freeze 자주, 새 PII 노출 0
+//   Balanced(+10 ≈166ms): freeze 거의 없음, 노출 최대 ~166ms (default)
+//   Smooth(+30 ≈500ms): freeze 거의 0, 노출 최대 ~500ms
 // ----------------------------------------------------
-class MockAIWorker {
-public:
-  // resultCallback: AI 분석이 끝날 때마다 Render Thread에서 읽을 결과를
-  // 전달하는 함수
-  using ResultCallback = std::function<void(const MaskPayload &)>;
-
-  MockAIWorker() = default;
-  ~MockAIWorker() { stop(); }
-
-  // 워커 스레드 시작. frameWidth/Height로 가짜 중앙 좌표를 계산한다.
-  void start(uint32_t frameWidth, uint32_t frameHeight,
-             ResultCallback callback);
-  void stop();
-  void setPaused(bool paused);
-
-  bool isRunning() const { return m_running.load(); }
-  bool isPaused() const { return m_paused.load(); }
-
-private:
-  void workerLoop();
-
-  std::thread m_thread;
-  std::atomic<bool> m_running{false};
-  std::atomic<bool> m_paused{false};
-  std::mutex m_mutex;
-  std::condition_variable m_cv;
-
-  uint32_t m_frameWidth = 0;
-  uint32_t m_frameHeight = 0;
-  ResultCallback m_callback;
+enum class PiiProtectionMode : int8_t {
+  MaxSecurity = 0,
+  Balanced = 1, // default
+  Smooth = 2,
 };
 
 // ----------------------------------------------------
-// [Role C] Lock-Free Result Slot
+// [Freeze T06] OCR 입력 다운스케일 정책
+//
+// ocr_worker_loop의 적응형 스케일에서 하한(kScaleMin)을 결정한다. 하한이 1.0f면
+// 다운스케일 금지(작은 글씨 검출 우선), 0.5f면 큰 글씨 화면에서 다운스케일 허용
+// (OCR 빨라짐). 표/작은 데이터 행 누락 회귀 때문에 default는 금지(1.0f).
+//   NoDownscale(1.0f)     : 다운스케일 금지 (default)
+//   AllowDownscale(0.5f)  : 항상 허용
+//   AutoByResolution      : 4K 0.5f / 1440p 0.7f / 1080p 1.0f
 // ----------------------------------------------------
-class AtomicMaskChannel {
-public:
-  // AI 스레드에서 호출 (produce)
-  void publish(const MaskPayload &payload);
-
-  // 렌더 스레드에서 호출 (consume). 새 데이터가 없으면 false 반환
-  bool consume(MaskPayload &out);
-
-private:
-  std::mutex m_mutex; // m_pending 접근 보호 (torn read 방지)
-  alignas(64) MaskPayload m_pending{};
-  alignas(64) std::atomic<bool> m_ready{false};
+enum class AdaptScaleMode : int8_t {
+  NoDownscale = 0,      // default — 1.0f
+  AllowDownscale = 1,   // 0.5f
+  AutoByResolution = 2, // 해상도별 차등
 };
 
 // ----------------------------------------------------
@@ -225,47 +245,66 @@ struct SecureCastFilter {
   bool isActive = true; // 필터 활성화 여부
   std::atomic<bool> isGameMode{
       false}; // CPU 임계값 기반 자동 전환 (render/tick 크로스 스레드)
+
+  // [Freeze T01] PII 보호 강도 — securecast_update(GUI 스레드)가 store,
+  // video_render(렌더 스레드)가 매 프레임 load. 게이트 마진을 동적으로 결정.
+  std::atomic<PiiProtectionMode> protectionMode{PiiProtectionMode::Balanced};
+
+  // [Freeze T06] OCR 입력 다운스케일 정책 — GUI 스레드 store / OCR 워커 스레드가
+  // 매 사이클 load해 kScaleMin 결정. default는 다운스케일 금지(1.0f).
+  std::atomic<AdaptScaleMode> adaptScaleMode{AdaptScaleMode::NoDownscale};
+
+  // ----- [Game Mode v2] -----
+  // 게임 모드 ON 동안: OCR 완전 정지 (T01) + 게임/whitelist 외 fg 앱 silent
+  // blur (T02). dialog 없음. 게임 식별은 진입 시점 fg를 캡처하는 방식이며,
+  // 캡처 실패 시 gameModeGameExe는 비어있고 자동 블러는 안전하게 비활성된다.
+  std::mutex gameModeMutex;
+  // 게임 모드 진입 시 캡처한 게임 프로세스 exe (이 exe는 블러 안 함).
+  // 비어있으면 fg 자동 블러 비활성 — render-side empty 가드 참조.
+  std::wstring gameModeGameExe;
+
+  // ----- [Game Mode v2 — T07] Properties UI에서 조정 가능한 trigger 파라미터.
+  // settingsMutex 보호. video_tick이 매 사이클 atomic read 안 해도 되도록 plain
+  // int/bool — 값 변경은 securecast_update가 settingsMutex 안에서 수행.
+  bool gameModeAutoEnter = true; // false면 Primary/Secondary 둘 다 비활성
+  int gameModeCpuThreshold = 40; // Secondary 진입 임계값 (%)
+  int gameModeEnterSeconds = 3;  // 진입 hysteresis (초)
+  int gameModeExitSeconds = 8;   // 해제 hysteresis (초, CPU ≤ exit 임계값에서)
+
+  // [게임 목록 자동 갱신] 스토어(Steam/Epic/…) 설치 게임을 주기적으로 무인
+  // 스캔해 "내 게임 목록"에 자동 추가하기 위한 타이머. video_tick 단독 접근.
+  float gameAutodetectTimer = 0.0f;     // 경과 시간 누산(초)
+  bool gameAutodetectFirstDone = false; // 시작 직후 최초 1회 스캔 완료 여부
+
+  // [Game Mode v2 — T13] 최근 자동 블러된 fg 앱들의 ring buffer.
+  // 사용자가 "어떤 앱들이 가려졌는지 확인 후 화이트리스트에 추가할지 결정"하는
+  // 용도. render 스레드에서 push, GUI 스레드(get_properties)에서 snapshot.
+  struct RecentBlurredApp {
+    std::wstring exe;
+    std::wstring window_title;
+    uint64_t timestamp_ms; // GetTickCount64() 기준
+  };
+  static constexpr size_t kMaxRecentBlurred = 10;
+  std::mutex recentBlurredMutex;
+  std::deque<RecentBlurredApp> recentBlurredApps;
   SecurityState currentState =
       SecurityState::SAFE; // 현재 보안 등급 (SAFE/PARTIAL/RISK)
 
-  // ----- [Role C 담당: 렌더링 파이프라인 및 GPU Readback] -----
+  // ----- [Role C 담당: 렌더링 파이프라인 (N-Frame Ring Buffer)] -----
   FrameRingBuffer
       ringBuffer; // Bounded Exposure(송출 지연) 구현용 N-프레임 텍스처 버퍼
-  MockAIWorker mockWorker; // [Role B 작업용] Role B가 AI/OCR을 연결하기 전까지
-                           // 모의 데이터를 발생시키는 워커
-  AtomicMaskChannel maskChannel; // AI 스레드 -> 비디오 렌더 스레드로 마스크
-                                 // 데이터를 안전하게 전달하는 단방향 채널
-  MaskPayload lastMask{}; // AI가 마지막으로 검출하여 발행한 블러/블랙아웃 처리
-                          // 영역 정보
 
-#ifdef _WIN32
-  GpuReadback readback; // GPU 텍스처를 CPU 메모리로 지연 없이 복사하는 다중
-                        // 슬롯 텍스처 풀
-  OverlayWindow overlay; // [Role D] 스트리머 전용 보안 상태 HUD (OBS 캡처에서 제외됨)
-#endif
-  PixelHashCache fullScreenHash; // FNV-1a 기반으로 화면 변화(Smart Grid)를
-                                 // 감지하여 AI 동작을 제어하는 객체
-
-  std::vector<uint8_t> readbackBuffer; // Readback을 통해 수확한 픽셀 데이터를
-                                       // 저장하는 CPU 버퍼 (Slot 0 + Slot 1)
-  uint64_t frameCounter =
-      0;                 // GPU와 CPU 간의 프레임 정합성을 맞추기 위한 카운터
-  PipelineHealth health; // GPU 스톨 또는 쿼리 실패 감지 시 자가 치유(Reset)를
-                         // 담당하는 헬스 매니저
+  // [Role D] 보안 상태 경광등(HUD)은 BeaconManager 싱글톤이 프로세스 전역에서
+  // 단 하나만 보유한다. 필터는 securecast_create/destroy에서 acquire/release로
+  // 등록·해제하고, 상태는 reportState로 보고한다 (overlay-window.h 참조).
 
   // ----- [Role D] UI 설정 -----
-  mutable std::mutex settingsMutex; // GUI 스레드(update)와 렌더 스레드 간 data race 방지
+  mutable std::mutex
+      settingsMutex; // GUI 스레드(update)와 렌더 스레드 간 data race 방지
   std::string blacklistApps = ""; // 줄바꿈 구분 앱 이름 목록
-  float blurIntensity = 5.0f;
-  float sensitivity = 0.5f;
 
   // [C2-3 수정] 함수-scope static → 멤버 변수로 이동 (다중 필터 인스턴스 간
   // 공유 방지)
-  int logUnchangedFrames =
-      0; // 미변화 상태 로그 주기 카운터 (120프레임마다 1회)
-  int logStallCount =
-      0; // 파이프라인 포화 경고 로그 주기 카운터 (30프레임마다 1회)
-  int logEnqueueCount = 0; // enqueue 성공 로그 주기 카운터 (300프레임마다 1회)
   int logScanThrottle =
       0; // 블랙리스트 윈도우 스캔 로그 주기 카운터 (10틱 = 1.5초 주기)
 
@@ -273,6 +312,11 @@ struct SecureCastFilter {
   float trackerAccumulator =
       0.0f; // 윈도우 스캔 틱 조절(0.15초 단위)용 시간 누산기
   gs_effect_t *blurEffect = nullptr; // 컴파일된 HLSL 셰이더
+  gs_texrender_t *lastSafeRender_ =
+      nullptr; // 마스크까지 합성된 마지막 안전 출력 프레임
+  bool lastSafeReady_ = false;
+  uint32_t lastSafeW_ = 0;
+  uint32_t lastSafeH_ = 0;
   std::mutex blacklistMutex;   // video_tick(비디오)과 video_render(렌더) 간의
                                // 동시 접근을 막는 뮤텍스
   MaskPayload blacklistMask{}; // [우선순위 1] Role A가 추적한 블랙리스트 앱
@@ -285,8 +329,32 @@ struct SecureCastFilter {
   TrackedWindowList prevWindowList{};    // lingering 감지용 직전 스캔 결과
   TrackedWindowList recentlySeenList{};  // 과거에 추적했던 창 목록 (quick
                                          // restore용, 닫힐 때까지 유지)
+  TrackedWindowList prevPushedWindowList{}; // 직전 프레임에 push된 스냅샷
+                                            // (새 창 소급 보정 비교용)
   LingeringWindow lingeringWindows[SC_MAX_LINGERING]{};
   int lingeringCount = 0;
+  // 작업표시줄 hover 미리보기가 마지막으로 보였던 OBS 시각(나노초).
+  // fromPreview=true lingering의 컷오프 기준 — slot.timestamp가 이 값보다
+  // 크면(=preview가 끝난 뒤 캡처된 프레임) 그리지 않아 잔상 방지.
+  uint64_t previewActiveNs = 0;
+  // 마지막으로 마우스가 썸네일 영역(작업표시줄 바로 위 ~400px 띠) 위에
+  // 있었던 시각. peek 트리거 hysteresis용. mouse off 시에도 잠시 active 유지해
+  // 부드러운 전환.
+  uint64_t lastInThumbnailZoneTick = 0;
+  // 마지막으로 마우스가 작업표시줄 본체에 있었던 시각. peek 트리거의 사전조건:
+  // 썸네일이 실제로 떠 있다는 것은 직전에 마우스가 작업표시줄에 있었다는 뜻.
+  // 이 없이 zone만으로 판정하면 단순히 화면 하단을 지나가도 발동돼버림.
+  uint64_t lastOverTaskbarTick = 0;
+  // 마지막으로 마우스가 블랙리스트/비-블랙리스트 작업표시줄 버튼 위에 있었던 시각.
+  // 두 tick 중 큰(=최근) 쪽이 현재 hover 의도로 간주되며, hysteresis(1.5s) 안의
+  // 신호만 유효. previewActive 동안에는 매 frame refresh되어 미리보기를 보는 동안
+  // 의도가 만료되지 않는다(=메모장 peek 동안 카톡 블러가 끌려오는 회귀 차단).
+  uint64_t lastHoverBlacklistTick = 0;
+  uint64_t lastHoverNotBlacklistTick = 0;
+  // 마지막으로 BL hover가 인식된 시점의 매칭 exe(예: "KakaoTalk.exe"). lingering
+  // 등록 시 alive BL 중 이 exe와 일치하는 인스턴스만 통과시켜, 카톡 hover로 Discord
+  // 까지 가려지는 회귀를 막는다. blRecent가 만료되면 stale 방지를 위해 무시한다.
+  wchar_t lastHoverExe[64] = {0};
 
   // ----- [Game Mode] CPU 사용률 기반 자동 전환 -----
   float cpuSampleAccumulator = 0.0f; // 1초 샘플링 누산기
@@ -298,39 +366,27 @@ struct SecureCastFilter {
   FILETIME prevUserTime = {};
 #endif
 
-  // destroy 진입 즉시 true — 진행 중인 핫키 콜백이 해제된 멤버에 접근하지 못하도록
+  // destroy 진입 즉시 true — 진행 중인 핫키 콜백이 해제된 멤버에 접근하지
+  // 못하도록
   std::atomic<bool> isDestroying{false};
 
-  // ----- [Panic Button] Ctrl+Shift+F12 -----
-  std::atomic<bool> panicMode{false};
-  obs_hotkey_id panicHotkeyId = OBS_INVALID_HOTKEY_ID;
-
-#ifdef _WIN32
-  // ----- [Role D] 수동 드래그 블러 선택 오버레이 -----
-  SelectionOverlay selectionOverlay;
-  obs_hotkey_id selectHotkeyId = OBS_INVALID_HOTKEY_ID;
-#endif
+  // [단축키 전역화] 패닉/OCR 토글 상태와 모든 단축키 등록은 모듈 전역(.cpp의
+  // g_panicMode/g_ocrDisabled/g_*HotkeyId)으로 이동했다 — 필터가 여러 개여도 OBS
+  // 단축키 목록에 한 번만 보이고, 토글은 모든 필터에 동시 적용된다. 드래그 블러
+  // 선택 단축키는 제거됨. 그래서 여기엔 per-instance 핫키/토글 멤버가 없다.
 
   // ----- [Role D] 알림 영역 자동 블러 -----
-  // screenChanged 감지 시 우하단 알림 영역에 변화가 있으면 3초간 블러를 유지.
-  // video_tick에서 쿨다운 카운트다운, video_render에서 all_rects에 주입.
+  // 매 스캔 "현재 보이는" 토스트들의 union을 notifBlurRect에 반영한다.
+  // 토스트가 사라지면 union이 즉시 줄어든다. 송출 동기화·지연 노출 방지는
+  // video_render가 매 프레임 슬롯 notifRect에 기록하는 방식으로 처리한다.
   bool notifBlurActive = false;
-  float notifBlurCooldown = 0.0f; // 3.0f에서 카운트다운, 0에 도달하면 해제
-  BlurRect notifBlurRect{};       // 소스 픽셀 좌표 (변화 감지 시 갱신)
-
-  // ----- [Role D] 수동 드래그 블러 -----
-  // OBS 소스 프리뷰에서 좌클릭 드래그로 영역 지정 → 영구 블러.
-  // 우클릭 또는 Properties의 "Clear" 버튼으로 전체 초기화.
-  // settingsMutex로 UI 스레드(mouse 콜백) ↔ Render 스레드(video_render) 보호.
-  // sc_manual_rects 키로 OBS 씬 컬렉션에 자동 저장/로드됨.
-  static constexpr int SC_MAX_MANUAL_RECTS = 8;
-  MaskPayload manualBlurMask{};
-
-  bool dragActive = false; // 드래그 진행 중
-  int32_t dragStartX = 0;
-  int32_t dragStartY = 0;
-  int32_t dragCurX = 0;
-  int32_t dragCurY = 0;
+  BlurRect notifBlurRect{};          // 현재+최근 스캔 토스트 union (화면 좌표)
+  // 직전 N스캔의 토스트 union 기록. 현재 스캔과 합쳐, 토스트가 사라진 뒤에도
+  // 블러가 N스캔만큼 더 유지돼 송출 화면에서 "팝업 먼저, 블러 그다음"이 되고
+  // 스택 재배열 슬라이드 중 노출도 막는다.
+  static constexpr int SC_NOTIF_LINGER_SCANS = 3; // 0.1초 스캔 × 3 ≈ 0.3초
+  BlurRect notifScanHist[SC_NOTIF_LINGER_SCANS]{};
+  float notifScanAccumulator = 0.0f; // 토스트 탐지 throttle 누산기
 
   // 모니터→소스 좌표 변환용 캐시 (video_render에서 갱신, 원자적 접근)
   std::atomic<uint32_t> lastSourceW{0};
@@ -386,27 +442,66 @@ struct SecureCastFilter {
   // OCR 입력 프레임은 최신 1장만 유지한다. OCR이 render보다 느릴 때 큐 누적을
   // 막기 위함이다.
   bool ocrFramePending = false;
+  uint64_t ocrPendingFrameId = 0;
   std::vector<uint8_t> ocrPendingPixels;
   int ocrPendingWidth = 0;
   int ocrPendingHeight = 0;
   int ocrPendingStride = 0;
+#ifdef _WIN32
+  // [Window anchor] OCR 프레임 push 시점의 windowList 스냅샷. OCR worker가
+  // PII 박스→owner HWND 매칭에 사용한다 (video_tick과의 race 회피).
+  TrackedWindowList ocrPendingWindowSnapshot{};
+  // [Window anchor v6] OCR 프레임 캡처 시점의 모든 가시 top-level 창 enum.
+  // WindowFromPoint 실시간 호출 대신 이걸로 owner를 매칭해야 OCR 실행 지연 동안
+  // 창이 움직였어도 정확한 owner를 잡는다.
+  TrackedWindowList ocrPendingAllWindows{};
+#endif
 
   // back-pressure: idle이면 즉시 새 프레임 수용, busy면 GPU readback 건너뜀
   std::atomic<bool> ocrWorkerIdle{true};
+  std::atomic<uint64_t> lastSubmittedOcrFrameId{0};
+  std::atomic<uint64_t> lastCompletedOcrFrameId{0};
+  int unverifiedFrameLogCounter = 0;
 
-  // dHash 캐시 무효화 요청 — GUI 스레드가 set, OCR 워커가 다음 사이클 진입 시 clear.
-  // clearDHashCache()를 GUI 스레드에서 직접 호출하면 data race 발생하므로
-  // 이 플래그를 경유해 워커 스레드에서 안전하게 실행한다.
+  // dHash 캐시 무효화 요청 — GUI 스레드가 set, OCR 워커가 다음 사이클 진입 시
+  // clear. clearDHashCache()를 GUI 스레드에서 직접 호출하면 data race
+  // 발생하므로 이 플래그를 경유해 워커 스레드에서 안전하게 실행한다.
   std::atomic<bool> ocrClearCachePending{false};
 
   // M8: OCR 엔진 초기화 영구 실패 여부. 렌더 루프에서 확인 후 RISK 상태로 전환.
   std::atomic<bool> ocrIsDown{false};
 
+  // [Freeze T02] Smart Backfill — OCR 워커가 직전 사이클 대비 박스 수 증가를
+  // 감지하면 set, 렌더 스레드가 backfill 분기에서 exchange(false)로 소비.
+  // 생산자=OCR 워커 단독, 소비자=렌더 스레드 단독.
+  std::atomic<bool> newPiiDetectedFlag{false};
+
   // 직전 OCR 사이클의 박스 수. 변경 시에만 LOG_INFO, 매 사이클은 LOG_DEBUG.
   int lastLoggedOcrCount = -1;
 
+  // [Freeze T02] 직전 OCR 사이클의 박스 수 (newPii 증가 감지용). OCR 워커
+  // 스레드 단독 접근 — 함수-scope static 대신 멤버로 두어 다중 필터 인스턴스
+  // 간 상태 공유 방지 ([C2-3]와 동일 이유).
+  int lastOcrBoxCount = 0;
+
   // [SC-tracker] 주기 로그 카운터 (150 readback ≈ 5초마다 1회 @ 30Hz)
   int trackerLogCounter = 0;
+
+  // [Freeze T07] freeze 진단 (효과 측정용). 모두 video_render(렌더 스레드)
+  // 단독 접근이라 atomic 불필요.
+  int freezeFrameCount = 0;    // 진행 중 freeze 프레임 수 (0 = freeze 아님)
+  uint64_t freezeStartMs = 0;  // 현재 freeze 시작 시각 (ms, obs 프레임 시계)
+  // 1분 통계 창 누적값.
+  uint64_t statsWindowStartMs = 0;     // 통계 창 시작 시각 (0 = 미초기화)
+  int statsFreezeEvents = 0;           // 창 내 완료된 freeze 횟수
+  uint64_t statsFreezeFramesTotal = 0; // 창 내 누적 freeze 프레임
+  uint64_t statsFreezeDurTotalMs = 0;  // 창 내 freeze 지속 시간 합 (평균 계산용)
+  uint64_t statsFreezeDurMaxMs = 0;    // 창 내 최대 freeze 지속 시간
+
+  // [backfill 빈도 제어] OCR claim 성공 4번에 1번만 backfill 호출.
+  // 매번 호출 시 링 내 모든 슬롯 dependent를 새 frameId로 끌어올려 freeze가
+  // 자주 발생하던 문제 완화. render thread 단독 사용이라 atomic 불필요.
+  int ocrBackfillCounter_ = 0;
 
   // ----- [P1] 30Hz Visual Tracker Thread -----
   // NCC 연산(CPU-only)을 렌더 스레드에서 분리. GPU readback은 렌더 스레드,

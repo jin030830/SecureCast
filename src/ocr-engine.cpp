@@ -1,3 +1,32 @@
+// =============================================================================
+// ocr-engine.cpp — 화면 텍스트 인식(OCR) + 개인정보(PII) 탐지 엔진
+//
+// 이 파일이 하는 일:
+//   캡처된 한 프레임의 픽셀(BGRA)을 받아 "이 화면에 가려야 할 개인정보가
+//   어디에 있는지"를 사각형 좌표 목록(SecureCastOcrBox)으로 돌려준다.
+//   네트워크 전송 없이 전부 PC 안에서만 처리한다.
+//
+// 처리 단계 (analyze_bgra_frame 기준, 위 → 아래 순서):
+//   1) Dirty Skip (변화 감지): 직전 프레임과 거의 같으면(dHash 해밍거리 ≤ 2)
+//      OCR을 통째로 건너뛰고 이전 결과를 재사용한다 — 매 프레임 OCR은 비싸므로
+//      "바뀐 화면만" 인식해 CPU를 아낀다. 2단계 캐시:
+//        · L1: 전체 프레임 coarse 해시로 "프레임이 바뀌었나" 판정
+//        · L2: 라인 단위 해시로 "바뀐 줄만" 잘라서 다시 인식
+//   2) recognize_text: Windows.Media.Ocr(OS 내장 OCR)로 글자와 줄 좌표 추출
+//   3) multipass_small_text: 키가 작은 글씨(메모장 등)는 2× 업스케일해 한 번 더
+//      인식 — 작은 PII 누락 방지(작은 글씨를 그대로 두면 OS OCR이 자주 놓침)
+//   4) detect_pii: 인식된 텍스트를 Google RE2 정규식으로 검사해 주민등록번호·
+//      전화·이메일·카드·IP·계좌 등 패턴을 찾아 그 줄의 좌표를 박스로 변환
+//
+// 스레드 주의:
+//   recognize_text는 내부에서 RecognizeAsync(...).get()으로 블로킹한다.
+//   따라서 이 엔진은 OBS 렌더 스레드가 아니라 별도 OCR 워커 스레드에서만
+//   호출해야 한다(렌더 스레드에서 부르면 송출 프레임이 끊긴다).
+//
+// 출력 좌표계:
+//   반환 박스는 입력 픽셀(width×height) 좌표 기준. 호출부(securecast-filter)가
+//   업/다운스케일 배율을 되돌려 원본 송출 해상도로 환산한다.
+// =============================================================================
 #include "ocr-engine.h"
 #include <algorithm>
 #include <chrono>
@@ -6,6 +35,7 @@
 #include <initializer_list>
 #include <mutex>
 #include <string>
+#include <string_view> // [Fix #6] std::string_view
 #include <unordered_set>
 #include <vector>
 
@@ -139,6 +169,7 @@ void SecureCastOcrEngine::clearDHashCache() {
   lastRoiDhash_ = 0;
   lastLineDhashes_.clear();
   consecutiveSkips_ = 0;
+  consecutiveL2Partials_ = 0;
 }
 
 SecureCastOcrEngine::~SecureCastOcrEngine() = default;
@@ -148,6 +179,7 @@ bool SecureCastOcrEngine::init() {
   try {
     hasLastRoiDhash_ = false;
     consecutiveSkips_ = 0;
+    consecutiveL2Partials_ = 0;
     avgLineHeight_ = 0.0f;
     lastBoxes_.clear();
     lastLineDhashes_.clear();
@@ -189,7 +221,8 @@ bool SecureCastOcrEngine::available() const { return available_; }
 
 std::vector<SecureCastOcrBox>
 SecureCastOcrEngine::analyze_bgra_frame(const uint8_t *pixels, int width,
-                                        int height, int stride) {
+                                        int height, int stride,
+                                        float inputScale) {
   FrameTimer frame_timer(&profile_);
 
   if (!available_ || pixels == nullptr || width <= 0 || height <= 0 ||
@@ -206,14 +239,18 @@ SecureCastOcrEngine::analyze_bgra_frame(const uint8_t *pixels, int width,
     lastLineDhashes_.clear();
     hasLastRoiDhash_ = false;
     consecutiveSkips_ = 0;
+    consecutiveL2Partials_ = 0;
   }
 
   // ── L1: ROI dHash ─────────────────────────────────────────────
   // PII 박스 영역만 해시 → 시계·커서 등 ROI 외부 변화는 완전히 무시.
   // hamming_distance ≤ 2 → 안티앨리어싱·압축 노이즈 허용 → OCR 생략.
-  if (sameRes && hasLastRoiDhash_) {
-    const uint64_t roiHash =
-        compute_roi_dhash(pixels, stride, width, height);
+  //
+  // ★ lastBoxes_가 비어있으면 L1 hit 안 함. 정적 화면에서 OCR이 한 번
+  //   실패해 0박스 캐싱되면 그 화면 내내 영원히 0박스가 반환되는 영구화
+  //   문제 차단. 빈 결과면 다음 사이클에서 full OCR 강제로 재시도 기회 보장.
+  if (sameRes && hasLastRoiDhash_ && !lastBoxes_.empty()) {
+    const uint64_t roiHash = compute_roi_dhash(pixels, stride, width, height);
     if (hamming_distance(roiHash, lastRoiDhash_) <= 2) {
       if (++consecutiveSkips_ < kMaxConsecutiveSkips)
         return lastBoxes_; // L1 hit
@@ -288,7 +325,12 @@ SecureCastOcrEngine::analyze_bgra_frame(const uint8_t *pixels, int width,
       lastBoxes_ = merged;
       // L2 hit이지만 부분 OCR을 실제로 실행했으므로 L1 skip 카운터는 리셋한다.
       consecutiveSkips_ = 0;
-      return merged; // L2 hit (partial)
+      // [메모장 타이핑 고착 방지] N회 연속 L2 partial 후엔 아래 full OCR로 강제
+      // 진행해 전체 프레임을 재스캔(새 입력 줄 발견 + 기존 PII를 multipass로 정확히
+      // 재검출). 카운터는 full OCR 경로에서 리셋.
+      if (++consecutiveL2Partials_ < kMaxConsecutiveL2Partials)
+        return merged; // L2 hit (partial)
+      // 도달 → full OCR로 fall through (전체 재스캔)
     }
     // 모든 라인 불변이지만 L1 실패 → ROI 외부에 새 텍스트 가능 → full OCR
   }
@@ -302,15 +344,52 @@ SecureCastOcrEngine::analyze_bgra_frame(const uint8_t *pixels, int width,
   // 다음 사이클의 adaptScale = kOcrTargetH / avgLineHeight_가 역방향 스케일
   // 을 적용해 2-사이클 진동이 발생할 수 있다(#TODO: coordScale로 정규화 필요).
   if (!lines.empty()) {
-    float sumH = 0.0f;
-    for (const auto &l : lines)
-      sumH += l.h;
-    avgLineHeight_ = sumH / static_cast<float>(lines.size());
+    // [작은 글씨 우선] adaptScale 기준을 "평균"이 아니라 "가장 작은 실제 텍스트 줄
+    // 높이"로 삼는다. 한 화면에 큰 글씨가 많아도(OBS UI 등 비중 큰 앱) 평균에
+    // 끌려가지 않고, 작은 비중 앱(메모장)의 작은 글씨까지 충분히 업스케일돼 OCR에
+    // 읽히게 한다. 노이즈/파편(h<8 또는 w<30)은 제외해 한두 점 outlier로 과도 확대
+    // 되는 것을 막는다. 상한은 caller의 kScaleMax(2.5)가 건다.
+    float minH = 0.0f;
+    for (const auto &l : lines) {
+      if (l.h < 8.0f || l.w < 30.0f)
+        continue; // 노이즈/파편 제외
+      if (minH <= 0.0f || l.h < minH)
+        minH = l.h;
+    }
+    if (minH <= 0.0f) { // 전부 제외되면 평균으로 폴백
+      float sumH = 0.0f;
+      for (const auto &l : lines)
+        sumH += l.h;
+      minH = sumH / static_cast<float>(lines.size());
+    }
+    float current = minH;
+    // [진동 방지] 측정값은 inputScale이 적용된 스케일 공간 값이다. 네이티브 공간으로
+    // 정규화(÷inputScale)해야 다음 사이클 adaptScale=kTarget/avgLineHeight_가 한
+    // 값으로 수렴한다.
+    if (inputScale > 0.0f)
+      current /= inputScale;
+    // EMA smoothing: 갑작스러운 변동을 완화. 0.7×prev + 0.3×current로 부드럽게.
+    avgLineHeight_ = (avgLineHeight_ > 0.0f)
+                         ? avgLineHeight_ * 0.7f + current * 0.3f
+                         : current;
   }
 
   auto updatedLines =
       multipass_small_text(lines, pixels, width, height, stride);
   auto boxes = detect_pii(updatedLines);
+
+  // 좌표 sanity check: frame 경계를 벗어나거나 비현실적으로 작은 박스 제거.
+  // multipass batch/split의 IoU 좌표 역투영 실패나 메타 캡처로 들어온 이상
+  // 박스 차단. 사용자 로그에서 bbox=(2138, ...) > frame width 868 같은 OOB가
+  // 관찰됨.
+  boxes.erase(std::remove_if(boxes.begin(), boxes.end(),
+                             [width, height](const SecureCastOcrBox &b) {
+                               return b.x < 0.0f || b.y < 0.0f ||
+                                      b.x + b.w > static_cast<float>(width) ||
+                                      b.y + b.h > static_cast<float>(height) ||
+                                      b.w < 2.0f || b.h < 2.0f;
+                             }),
+              boxes.end());
 
   // L1 캐시 갱신 (VisualTracker가 좌표 추적 담당, OCR은 탐지/확인만 수행)
   lastRoiDhash_ = compute_roi_dhash(pixels, stride, width, height);
@@ -318,6 +397,8 @@ SecureCastOcrEngine::analyze_bgra_frame(const uint8_t *pixels, int width,
   impl_->lastFrameWidth = width;
   impl_->lastFrameHeight = height;
   lastBoxes_ = boxes;
+  // 전체 프레임을 재스캔했으므로 L2 강제 full OCR 카운터 리셋.
+  consecutiveL2Partials_ = 0;
 
   // L2 라인 캐시 재구성 (multipass 보정된 lines 사용)
   lastLineDhashes_.clear();
@@ -391,8 +472,33 @@ int SecureCastOcrEngine::hamming_distance(uint64_t a, uint64_t b) {
   return static_cast<int>(__popcnt64(a ^ b));
 }
 
-// L2 crop OCR: 원본 프레임 (cx,cy,cw,ch) 영역을 복사 후 OCR 실행.
-// 반환 라인 좌표에 (cx, cy) 오프셋 적용.
+// [영역 OCR] 창 영역만 떼어 OCR + PII 탐지 (busy 전체 프레임에서 작은 창 텍스트
+// 누락 보완). recognize_text_crop + multipass + detect_pii 조합.
+std::vector<SecureCastOcrBox>
+SecureCastOcrEngine::detect_pii_in_region(const uint8_t *px, int width,
+                                          int height, int stride, int rx, int ry,
+                                          int rw, int rh) {
+  if (!available_ || !px)
+    return {};
+  // 1) 영역만 crop OCR (좌표는 입력 px 공간으로 복원돼 반환됨)
+  auto lines = recognize_text_crop(px, width, height, stride, rx, ry, rw, rh);
+  if (lines.empty())
+    return {};
+  // 2) 작은 글씨 보강(multipass) 후 PII 탐지
+  auto updated = multipass_small_text(lines, px, width, height, stride);
+  auto boxes = detect_pii(updated);
+  // 3) 좌표 sanity (frame 경계 밖/너무 작은 박스 제거)
+  boxes.erase(std::remove_if(boxes.begin(), boxes.end(),
+                             [width, height](const SecureCastOcrBox &b) {
+                               return b.x < 0.0f || b.y < 0.0f ||
+                                      b.x + b.w > static_cast<float>(width) ||
+                                      b.y + b.h > static_cast<float>(height) ||
+                                      b.w < 2.0f || b.h < 2.0f;
+                             }),
+              boxes.end());
+  return boxes;
+}
+
 std::vector<SecureCastOcrLine>
 SecureCastOcrEngine::recognize_text_crop(const uint8_t *px, int width,
                                          int height, int stride, int cx, int cy,
@@ -465,9 +571,12 @@ SecureCastOcrEngine::recognize_text(const uint8_t *pixels, int width,
 
       auto buffer = CryptographicBuffer::CreateFromByteArray(packed);
 
+      // OBS BGRA는 Straight Alpha(미리 곱해지지 않음).
+      // Premultiplied 지정 시 Alpha=0 픽셀의 RGB가 0(검정)으로 처리되어
+      // OCR에 빈 이미지가 전달 → effLines=0, avg_ms≈9ms 로 탐지 완전 실패.
       bitmap = SoftwareBitmap::CreateCopyFromBuffer(
           buffer, BitmapPixelFormat::Bgra8, width, height,
-          BitmapAlphaMode::Premultiplied);
+          BitmapAlphaMode::Ignore);
     }
 
     // === STEP 2-1: OCR 실행 ===
@@ -668,6 +777,88 @@ static int count_hangul_syllables(const std::string &text) {
   return count;
 }
 
+static bool looks_like_korean_address_text(const std::string &text) {
+  // 방향·이동 표현이 포함된 경우 주소가 아님 ("서울 쪽으로", "서울 방향")
+  if (contains_any(text, {"쪽으로", "방향으로", "방면으로", "쪽방향", "가는 길",
+                          "오는 길", "방향", "근처", "부근"}))
+    return false;
+
+  // 명시 라벨 → 단독으로 충분
+  if (contains_any(text,
+                   {"주소", "주소지", "거주지", "소재지", "사는곳", "배송지"}))
+    return true;
+
+  // [Fix #6] PAT_DISTRICT: 자치구·시·군 단독 포함 ("강남구", "수원시")
+  if (contains_any(
+          text, {"강남구", "강동구",   "강북구", "강서구", "관악구",   "광진구",
+                 "구로구", "금천구",   "노원구", "도봉구", "동대문구", "동작구",
+                 "마포구", "서대문구", "서초구", "성동구", "성북구",   "송파구",
+                 "양천구", "영등포구", "용산구", "은평구", "종로구",   "중구",
+                 "중랑구", "해운대구", "수성구", "달서구", "남구",     "북구",
+                 "연제구", "사상구",   "금정구", "기장군"}))
+    return true;
+
+  // [Fix #6] PAT_REGION_GENERIC: 도명 직접 포함 (충청남도, 경기도 등)
+  const bool hasRegion = contains_any(
+      text, {"서울", "부산", "대구", "인천", "광주", "대전", "울산", "세종",
+             "경기", "강원", "충북", "충남", "충청", "전북", "전남", "전라",
+             "경북", "경남", "경상", "제주",
+             // [Fix #6] 도명 전체 문자열
+             "서울특별시", "부산광역시", "대구광역시", "인천광역시",
+             "광주광역시", "대전광역시", "충청남도", "충청북도", "경기도",
+             "강원도", "전라남도", "전라북도", "경상남도", "경상북도"});
+
+  // [Fix #6] PAT_ROAD_BASIC: 기본 도로명 (테헤란로 152, 강남대로 396)
+  {
+    static const re2::RE2 PAT_ROAD_BASIC(R"([가-힣]{2,}(?:로|길)\s*\d+)");
+    if (RE2::PartialMatch(text, PAT_ROAD_BASIC)) {
+      // 단위어(분, 시간, m, km) 후처리: 해당 단위가 있으면 주소가 아님
+      // 예: "5로 10분", "2길 3km"
+      if (contains_any(text, {"분 ", "분\n", "시간", " m ", " km", "m 거리",
+                              "km 거리", "개 ", " 개\n"}))
+        return false;
+      return true;
+    }
+  }
+
+  // [Fix #6] PAT_ROAD_NUMBERED: 숫자 도로명 (불당 25로 8)
+  {
+    static const re2::RE2 PAT_ROAD_NUMBERED(
+        R"([가-힣]{1,}\s+\d+(?:로|길)\s+\d+)");
+    if (RE2::PartialMatch(text, PAT_ROAD_NUMBERED)) {
+      if (contains_any(text, {"분 ", "분\n", "시간", " m ", " km"}))
+        return false;
+      return true;
+    }
+  }
+
+  // B-2: 지역어 + 도로명 주소 ("서울 테헤란로 152")
+  if (hasRegion) {
+    static const re2::RE2 PAT_ROAD(R"([가-힣]{2,}(?:로|길)\s*\d+)");
+    if (RE2::PartialMatch(text, PAT_ROAD))
+      return true;
+  }
+
+  // B-3: 동·읍·면 + 번지 ("역삼동 736-1") — 지역어 없어도 충분한 시그널
+  {
+    static const re2::RE2 PAT_LOT(
+        R"([가-힣]{2,}(?:동|읍|면)\s*\d+(?:-\d+)?(?:번지)?)");
+    if (RE2::PartialMatch(text, PAT_LOT))
+      return true;
+  }
+
+  if (!hasRegion)
+    return false;
+
+  const std::string hangulOnly = extract_hangul_syllables_utf8(text);
+  if (count_hangul_syllables(hangulOnly) < 3)
+    return false;
+
+  return ends_with(hangulOnly, "시") || ends_with(hangulOnly, "군") ||
+         ends_with(hangulOnly, "구") || ends_with(hangulOnly, "동") ||
+         ends_with(hangulOnly, "읍") || ends_with(hangulOnly, "면");
+}
+
 static int count_ascii_digits(const std::string &text) {
   int count = 0;
   for (char c : text) {
@@ -723,51 +914,6 @@ static bool has_adjacent_name_label(const std::vector<SecureCastOcrLine> &lines,
   }
 
   return false;
-}
-
-static bool looks_like_korean_address_text(const std::string &text) {
-  // 방향·이동 표현이 포함된 경우 주소가 아님 ("서울 쪽으로", "서울 방향")
-  // "쪽" 단독은 "양쪽", "이쪽" 등 정상 주소 컨텍스트를 억압하므로 제외.
-  if (contains_any(text, {"쪽으로", "방향으로", "방면으로", "쪽방향", "가는 길",
-                           "오는 길", "방향", "근처", "부근"}))
-    return false;
-
-  // 명시 라벨 → 단독으로 충분
-  if (contains_any(text,
-                   {"주소", "주소지", "거주지", "소재지", "사는곳", "배송지"}))
-    return true;
-
-  // 시·도 광역권 키워드 AND 행정구역 접미사 — 둘 다 만족해야 ADDRESS
-  const bool hasRegion = contains_any(
-      text, {"서울", "부산", "대구", "인천", "광주", "대전", "울산",
-             "세종", "경기", "강원", "충북", "충남", "충청", "전북",
-             "전남", "전라", "경북", "경남", "경상", "제주"});
-
-  // B-2: 지역어 + 도로명 주소 ("서울 테헤란로 152")
-  if (hasRegion) {
-    static const re2::RE2 PAT_ROAD(R"([가-힣]{2,}(?:로|길)\s*\d+)");
-    if (RE2::PartialMatch(text, PAT_ROAD))
-      return true;
-  }
-
-  // B-3: 동·읍·면 + 번지 ("역삼동 736-1") — 지역어 없어도 충분한 시그널
-  {
-    static const re2::RE2 PAT_LOT(
-        R"([가-힣]{2,}(?:동|읍|면)\s*\d+(?:-\d+)?(?:번지)?)");
-    if (RE2::PartialMatch(text, PAT_LOT))
-      return true;
-  }
-
-  if (!hasRegion)
-    return false;
-
-  const std::string hangulOnly = extract_hangul_syllables_utf8(text);
-  if (count_hangul_syllables(hangulOnly) < 3)
-    return false;
-
-  return ends_with(hangulOnly, "시") || ends_with(hangulOnly, "군") ||
-         ends_with(hangulOnly, "구") || ends_with(hangulOnly, "동") ||
-         ends_with(hangulOnly, "읍") || ends_with(hangulOnly, "면");
 }
 
 static bool starts_with_common_korean_surname(const std::string &hangulOnly) {
@@ -1004,12 +1150,12 @@ static bool valid_email(const std::string &e) {
   const auto at = e.find('@');
   if (at == std::string::npos || at < 1)
     return false;
-  // RFC 5321: local-part 최대 64자
+  // RFC 5321: local-part 최대 64자.
+  // (이전엔 바로 뒤에 at>40 검사가 있어 41~64자 local-part 이메일이 EMAIL로
+  //  분류되지 않아 마스킹에서 누락됐다. 죽은 코드였던 40자 상한을 제거하고
+  //  RFC 5321 상한(64)만 적용한다. 나머지 형식 검증(점 위치/TLD 길이/연속점
+  //  금지)이 오탐을 막으므로 상한 완화로 인한 false positive 위험은 미미.)
   if (at > 64)
-    return false;
-  // 전체 이메일 주소가 지나치게 길면(> 254자) 유효하지 않음 (RFC 5321)
-  // 또는 local-part 자체가 비현실적으로 길면 더미/스팸으로 간주
-  if (at > 40)
     return false;
   const auto dot = e.rfind('.');
   if (dot == std::string::npos || dot < at + 2 || dot >= e.size() - 2)
@@ -1080,13 +1226,15 @@ SecureCastOcrEngine::detect_pii(const std::vector<SecureCastOcrLine> &lines) {
 
   // 1) 주민등록번호: 6자리-7자리, 뒷자리 첫 글자 1~8 (외국인 포함)
   // [-/·\s]?: OCR이 슬래시·중간점·공백으로 구분자를 잘못 읽는 경우까지 허용.
-  static const re2::RE2 PATTERN_RRN(
-      R"(\b(\d{6})\s?[-/·]?\s?([1-8]\d{6})\b)");
+  static const re2::RE2 PATTERN_RRN(R"(\b(\d{6})\s?[-/·]?\s?([1-8]\d{6})\b)");
 
   // 2) 전화번호: 국내(010/011/016~019, 02~06x) + 국제(+1-xxx, +44-xx...)
   // 국제번호는 \b 없이 +로 시작하므로 별도 alt 추가.
+  // OCR이 들쭉날쭉한 공백/구분자를 출력하는 케이스 흡수: [-\s]? → [-\s]{0,3}
+  // (단일 → 0~3개 허용). "010 - 0002 - 0014" 같은 긴 공백 패턴도 매칭.
+  // 마지막 \b → (?:\b|$): 라인 끝(boundary 없음)도 허용.
   static const re2::RE2 PATTERN_PHONE(
-      R"((?:\+82[-\s]?1[016-9]|\b01[016-9])[-\s]?\d{3,4}[-\s]?\d{4}\b|\b0(?:2[-\s]?\d{3,4}|[3-9]\d[-\s]?\d{3,4}|[3-9]\d{2}[-\s]?\d{3,4})[-\s]?\d{4}\b|\+[1-9]\d{0,2}[-\s]?(?:\d[-\s]?){6,13}\d)");
+      R"((?:\+82[-\s]{0,3}1[016-9]|\b01[016-9])[-\s]{0,3}\d{3,4}[-\s]{0,3}\d{4}(?:\b|$)|\b0(?:2[-\s]{0,3}\d{3,4}|[3-9]\d[-\s]{0,3}\d{3,4}|[3-9]\d{2}[-\s]{0,3}\d{3,4})[-\s]{0,3}\d{4}(?:\b|$)|\+[1-9]\d{0,2}[-\s]{0,3}(?:\d[-\s]{0,3}){6,13}\d)");
 
   // 3) 이메일: 전체를 그룹 1로 캡처 (valid_email 검증에 사용)
   static const re2::RE2 PATTERN_EMAIL(
@@ -1129,10 +1277,15 @@ SecureCastOcrEngine::detect_pii(const std::vector<SecureCastOcrLine> &lines) {
 
     // === STEP 2-2: 이메일은 문자 기반이므로 먼저 검사 ===
     {
-      std::string emailMatch;
-      if (re2::RE2::PartialMatch(rawText, PATTERN_EMAIL, &emailMatch) &&
-          valid_email(emailMatch)) {
-        type = "EMAIL";
+      // [CRT-fix] RE2가 std::string 출력에 직접 쓰면 그 버퍼가 re2.dll 힙(Release
+      // /MD)에 할당되고, 플러그인(Debug /MDd) 힙에서 해제될 때
+      // _CrtIsValidHeapPointer assertion이 난다. 입력을 가리키는 뷰(StringPiece,
+      // 할당 없음)로 캡처한 뒤 std::string은 플러그인 힙에서 직접 만든다.
+      re2::StringPiece m;
+      if (re2::RE2::PartialMatch(rawText, PATTERN_EMAIL, &m)) {
+        const std::string emailMatch(m.data(), m.size());
+        if (valid_email(emailMatch))
+          type = "EMAIL";
       }
     }
 
@@ -1143,20 +1296,24 @@ SecureCastOcrEngine::detect_pii(const std::vector<SecureCastOcrLine> &lines) {
       if (!rawText.empty() && rawText[0] == '@' && i > 0) {
         // 현재 라인이 @-파트 → 직전 라인과 결합
         const std::string combined = lines[i - 1].text + rawText;
-        std::string emailMatch;
-        if (RE2::PartialMatch(combined, PATTERN_EMAIL, &emailMatch) &&
-            valid_email(emailMatch))
-          type = "EMAIL";
+        re2::StringPiece m;
+        if (RE2::PartialMatch(combined, PATTERN_EMAIL, &m)) {
+          const std::string emailMatch(m.data(), m.size());
+          if (valid_email(emailMatch))
+            type = "EMAIL";
+        }
       }
       if (type == nullptr && i + 1 < static_cast<int>(lines.size())) {
         const std::string &nextText = lines[i + 1].text;
         // 다음 라인이 @-파트 → 현재 라인과 결합
         if (!nextText.empty() && nextText[0] == '@') {
           const std::string combined = rawText + nextText;
-          std::string emailMatch;
-          if (RE2::PartialMatch(combined, PATTERN_EMAIL, &emailMatch) &&
-              valid_email(emailMatch))
-            type = "EMAIL";
+          re2::StringPiece m;
+          if (RE2::PartialMatch(combined, PATTERN_EMAIL, &m)) {
+            const std::string emailMatch(m.data(), m.size());
+            if (valid_email(emailMatch))
+              type = "EMAIL";
+          }
         }
       }
     }
@@ -1186,8 +1343,9 @@ SecureCastOcrEngine::detect_pii(const std::vector<SecureCastOcrLine> &lines) {
     // 성씨 시작 + 블랙리스트 통과 조건으로 "고객님", "선생님" 등 일반 호칭
     // 배제.
     if (type == nullptr) {
-      std::string honorName;
-      if (RE2::PartialMatch(rawText, PATTERN_NAME_HONORIFIC, &honorName)) {
+      re2::StringPiece honorPiece;
+      if (RE2::PartialMatch(rawText, PATTERN_NAME_HONORIFIC, &honorPiece)) {
+        const std::string honorName(honorPiece.data(), honorPiece.size());
         const std::string h = extract_hangul_syllables_utf8(honorName);
         const int hc = count_hangul_syllables(h);
         if (hc >= 2 && hc <= 4 && starts_with_common_korean_surname(h) &&
@@ -1233,13 +1391,16 @@ SecureCastOcrEngine::detect_pii(const std::vector<SecureCastOcrLine> &lines) {
     if (type == nullptr) {
       // (f) 숫자 cluster 추출 → normalize → 각 cluster에 대해 패턴 검사
       re2::StringPiece input(rawText);
-      std::string cluster;
+      re2::StringPiece cluster; // [CRT-fix] StringPiece 캡처 (재할당 없음)
       std::string normalizedLine; // cluster를 붙여 재조합한 보정 텍스트
       while (RE2::FindAndConsume(&input, PATTERN_NUMERIC_CLUSTER, &cluster)) {
-        normalizedLine += normalize_numeric_candidate(cluster) + " ";
+        normalizedLine += normalize_numeric_candidate(
+                              std::string(cluster.data(), cluster.size())) +
+                          " ";
       }
       // 클러스터 추출 실패 시(OCR 오류 문자 포함): rawText 전체를 직접 정규화
-      // 예: "O1O-1234-5678" → 클러스터 미추출 → normalize 직접 적용 → "010-1234-5678"
+      // 예: "O1O-1234-5678" → 클러스터 미추출 → normalize 직접 적용 →
+      // "010-1234-5678"
       if (normalizedLine.empty())
         normalizedLine = normalize_numeric_candidate(rawText);
       if (normalizedLine.empty())
@@ -1247,9 +1408,10 @@ SecureCastOcrEngine::detect_pii(const std::vector<SecureCastOcrLine> &lines) {
 
       // (d) RRN: 패턴 매칭 후 체크섬 검증
       {
-        std::string d1, d2;
+        re2::StringPiece d1, d2;
         if (RE2::PartialMatch(normalizedLine, PATTERN_RRN, &d1, &d2)) {
-          std::string digits13 = d1 + d2;
+          const std::string digits13 = std::string(d1.data(), d1.size()) +
+                                        std::string(d2.data(), d2.size());
           static const auto rrn_checksum = [](const std::string &d) -> bool {
             if (d.size() != 13)
               return false;
@@ -1271,11 +1433,14 @@ SecureCastOcrEngine::detect_pii(const std::vector<SecureCastOcrLine> &lines) {
         }
       }
 
-      // (b) PHONE: 기술 문서 맥락(버전·빌드·코드 등)에서만 제외, 나머지는 모두 탐지
-      // 🚨 보안 원칙: 화이트리스트가 아닌 블랙리스트로 통제 — 차단 범위를 최소화해
-      //    "전화 010-", "담당 010-", "본가 010-" 같은 실제 개인정보를 놓치지 않는다.
+      // (b) PHONE: 기술 문서 맥락(버전·빌드·코드 등)에서만 제외, 나머지는 모두
+      // 탐지 🚨 보안 원칙: 화이트리스트가 아닌 블랙리스트로 통제 — 차단 범위를
+      // 최소화해
+      //    "전화 010-", "담당 010-", "본가 010-" 같은 실제 개인정보를 놓치지
+      //    않는다.
       if (type == nullptr && RE2::PartialMatch(normalizedLine, PATTERN_PHONE)) {
-        // 기술 문서 키워드가 전화번호 바로 앞에 있을 때만 제외 (정확한 블랙리스트)
+        // 기술 문서 키워드가 전화번호 바로 앞에 있을 때만 제외 (정확한
+        // 블랙리스트)
         static const re2::RE2 PAT_PHONE_TECH_BLOCK(
             R"((?:빌드|버전|version|v\.|build|patch|패치|품번|코드|code|모델|model|ref|rev|번호[가-힣]{0,2}(?=\s*(?!\d{3})))\s*(?:010|01[16-9]|02|0[3-9]))");
         if (!RE2::PartialMatch(rawText, PAT_PHONE_TECH_BLOCK))
@@ -1284,19 +1449,24 @@ SecureCastOcrEngine::detect_pii(const std::vector<SecureCastOcrLine> &lines) {
 
       // CARD: 4-4-4-4(일반) 또는 4-6-5(AmEx) + Luhn + IIN 검증
       if (type == nullptr) {
-        std::string g1, g2, g3, g4;
+        re2::StringPiece g1, g2, g3, g4;
         if (RE2::PartialMatch(normalizedLine, PATTERN_CARD, &g1, &g2, &g3,
                               &g4)) {
-          const std::string digits = g1 + g2 + g3 + g4;
+          const std::string digits = std::string(g1.data(), g1.size()) +
+                                      std::string(g2.data(), g2.size()) +
+                                      std::string(g3.data(), g3.size()) +
+                                      std::string(g4.data(), g4.size());
           if (luhn_check(digits) && valid_card_iin(digits))
             type = "CARD";
         }
         // AmEx: 4-6-5 구조, 15자리, Luhn 검증
         if (type == nullptr) {
-          std::string a1, a2, a3;
+          re2::StringPiece a1, a2, a3;
           if (RE2::PartialMatch(normalizedLine, PATTERN_CARD_AMEX, &a1, &a2,
                                 &a3)) {
-            const std::string digits15 = a1 + a2 + a3;
+            const std::string digits15 = std::string(a1.data(), a1.size()) +
+                                         std::string(a2.data(), a2.size()) +
+                                         std::string(a3.data(), a3.size());
             // AmEx는 34 또는 37로 시작
             if ((digits15[0] == '3' &&
                  (digits15[1] == '4' || digits15[1] == '7')) &&
@@ -1306,7 +1476,8 @@ SecureCastOcrEngine::detect_pii(const std::vector<SecureCastOcrLine> &lines) {
                     int v = d[d.size() - 1 - k] - '0';
                     if (k % 2 == 1) {
                       v *= 2;
-                      if (v > 9) v -= 9;
+                      if (v > 9)
+                        v -= 9;
                     }
                     sum += v;
                   }
@@ -1319,11 +1490,13 @@ SecureCastOcrEngine::detect_pii(const std::vector<SecureCastOcrLine> &lines) {
 
       // (a) IP: 옥텟 범위 + 사설/예약/멀티캐스트 대역 제외 검증
       if (type == nullptr) {
-        std::string oa, ob, oc, od;
+        re2::StringPiece oa, ob, oc, od;
         re2::StringPiece ipInput(normalizedLine);
         while (RE2::FindAndConsume(&ipInput, PATTERN_IP, &oa, &ob, &oc, &od)) {
-          int a = std::stoi(oa), b = std::stoi(ob), c = std::stoi(oc),
-              d = std::stoi(od);
+          int a = std::stoi(std::string(oa.data(), oa.size())),
+              b = std::stoi(std::string(ob.data(), ob.size())),
+              c = std::stoi(std::string(oc.data(), oc.size())),
+              d = std::stoi(std::string(od.data(), od.size()));
           if (a > 255 || b > 255 || c > 255 || d > 255)
             continue;
           if (a == 10)
@@ -1401,11 +1574,12 @@ SecureCastOcrEngine::detect_pii(const std::vector<SecureCastOcrLine> &lines) {
       if (type == nullptr && sameLineLabel) {
         static const re2::RE2 PAT_ENG_NAME(
             R"((?:[A-Z][a-z]{1,14}\s){1,2}[A-Z][a-z]{1,14})");
-        std::string engName;
-        if (RE2::PartialMatch(rawText, PAT_ENG_NAME, &engName)) {
+        re2::StringPiece engPiece;
+        if (RE2::PartialMatch(rawText, PAT_ENG_NAME, &engPiece)) {
+          const std::string engName(engPiece.data(), engPiece.size());
           static const std::unordered_set<std::string> ENG_NAME_BLOCKLIST = {
-              "Full Name", "First Name", "Last Name", "User Name",
-              "Error Code", "Build Version"};
+              "Full Name", "First Name", "Last Name",
+              "User Name", "Error Code", "Build Version"};
           if (ENG_NAME_BLOCKLIST.find(engName) == ENG_NAME_BLOCKLIST.end())
             type = "NAME";
         }
@@ -1456,96 +1630,319 @@ SecureCastOcrEngine::detect_pii(const std::vector<SecureCastOcrLine> &lines) {
 }
 
 // ============================================================
-// P3: 소형 글씨 다중 패스 OCR
-// 높이 < SMALL_H px 라인을 최대 MAX_PASSES개 2× nearest-neighbor 업스케일 후
-// 재OCR하여 detect_pii 입력 라인을 개선한다.
+// multipass_small_text / split_batch_multipass 공용 헬퍼
+// ============================================================
+namespace {
+
+struct UnionBBox {
+  int x0;
+  int y0;
+  int x1;
+  int y1;
+  float sumArea; // indices가 차지하는 박스 면적 합 (Union 면적 아님)
+};
+
+// indices가 가리키는 라인들의 PAD-팽창 Union BBox를 [0, width)×[0, height)
+// 범위로 클램핑하여 반환한다. sumArea는 각 라인 면적의 단순 합(겹침 무시).
+static UnionBBox compute_union_bbox(const std::vector<SecureCastOcrLine> &lines,
+                                    const std::vector<int> &indices, int pad,
+                                    int width, int height) {
+  UnionBBox b{width, height, 0, 0, 0.0f};
+  for (int idx : indices) {
+    const auto &l = lines[idx];
+    b.x0 = std::min(b.x0, std::max(0, static_cast<int>(l.x) - pad));
+    b.y0 = std::min(b.y0, std::max(0, static_cast<int>(l.y) - pad));
+    b.x1 = std::max(b.x1, std::min(static_cast<int>(l.x + l.w) + pad, width));
+    b.y1 = std::max(b.y1, std::min(static_cast<int>(l.y + l.h) + pad, height));
+    b.sumArea += l.w * l.h;
+  }
+  return b;
+}
+
+// multipass 업스케일 배율. 2 → 3으로 늘려 매우 작은 글씨(특히 한글) 검출 강화.
+// 비용: batch 픽셀 수 4× → 9× (2.25배). SC_MAX_OCR_BATCH_PX 가드에 더 자주
+// 걸려 split fallback 발동 빈도 증가. 정확도 우선 trade-off.
+constexpr int kMpUpscale = 3;
+constexpr float kMpUpscaleInv = 1.0f / static_cast<float>(kMpUpscale);
+
+// kMpUpscale× 업스케일된 batch 좌표(batchLines)를 (ux0, uy0) 원본 좌표계로
+// 역투영하여 indices에 대응하는 가장 잘 맞는 라인을 IoU 매칭으로 result[idx]에
+// 반영. IoU가 임계치 미만이면 result[idx]는 유지된다(원본 라인 보존).
+static void apply_iou_match(std::vector<SecureCastOcrLine> &result,
+                            const std::vector<int> &indices,
+                            const std::vector<SecureCastOcrLine> &batchLines,
+                            int ux0, int uy0, float iouThreshold = 0.4f) {
+  for (int idx : indices) {
+    const auto &orig = result[idx];
+    float bestIou = iouThreshold;
+    int bestJ = -1;
+    for (int j = 0; j < static_cast<int>(batchLines.size()); ++j) {
+      const auto &bl = batchLines[j];
+      const float bx = ux0 + bl.x * kMpUpscaleInv;
+      const float by = uy0 + bl.y * kMpUpscaleInv;
+      const float bw = bl.w * kMpUpscaleInv, bh = bl.h * kMpUpscaleInv;
+      const float ix = std::max(orig.x, bx);
+      const float iy = std::max(orig.y, by);
+      const float ix2 = std::min(orig.x + orig.w, bx + bw);
+      const float iy2 = std::min(orig.y + orig.h, by + bh);
+      if (ix2 <= ix || iy2 <= iy)
+        continue;
+      const float inter = (ix2 - ix) * (iy2 - iy);
+      const float uni = orig.w * orig.h + bw * bh - inter;
+      const float iou = uni > 0.0f ? inter / uni : 0.0f;
+      if (iou > bestIou) {
+        bestIou = iou;
+        bestJ = j;
+      }
+    }
+    if (bestJ >= 0) {
+      const auto &bl = batchLines[bestJ];
+      SecureCastOcrLine mapped;
+      mapped.text = bl.text;
+      mapped.x = ux0 + bl.x * kMpUpscaleInv;
+      mapped.y = uy0 + bl.y * kMpUpscaleInv;
+      mapped.w = bl.w * kMpUpscaleInv;
+      mapped.h = bl.h * kMpUpscaleInv;
+      result[idx] = mapped;
+    }
+  }
+}
+
+} // namespace
+
+// ============================================================
+// P3: 소형 글씨 다중 패스 OCR (Union BBox 평탄화)
+// 높이 < SMALL_H px 라인 전체를 Union BBox 한 영역으로 묶어 2× nearest-neighbor
+// 업스케일 후 단일 batch recognize_text를 호출한다. 결과는 IoU 매칭으로 원본
+// 라인에 다시 투영하여 detect_pii 입력을 개선한다.
+//
+// 안전 가드:
+//   - batch 픽셀 수 > SC_MAX_OCR_BATCH_PX → split_batch_multipass로 분할
+//   - sumArea / unionArea < SC_SPARSE_THRESHOLD (sparse) → 분할 폴백
+//   - 분할도 안전하지 못한 서브셋은 개별 crop OCR로 핀포인트 폴백
 // L2 캐시 갱신용 원본 lines는 호출부에서 따로 유지한다.
 // ============================================================
 std::vector<SecureCastOcrLine> SecureCastOcrEngine::multipass_small_text(
     const std::vector<SecureCastOcrLine> &lines, const uint8_t *pixels,
     int width, int height, int stride) {
   PhaseTimer t_mp(&profile_.acc.multipass);
-  // MAX_PASSES = 6: 성능/OCR 스레드 예산 상한.
-  // 커밋 메시지 "MAX_PASSES 32"는 실험값이며 실제로는 6으로 확정.
-  // 소형 라인 7개 초과분은 Phase 2 union bbox batch OCR로 처리.
-  static constexpr int MAX_PASSES = 6;
   static constexpr int PAD = 4;
 
-  // 2-D: SMALL_H를 직전 사이클 평균 라인 높이 기반으로 동적 결정.
-  const float SMALL_H = avgLineHeight_ > 0.0f ? avgLineHeight_ * 0.7f : 20.0f;
+  // 표 케이스: 큰 헤더 + 작은 데이터 행이 섞이면 avgLineHeight가 중간값이라
+  // 0.7배 임계로는 데이터 행이 multipass 대상에서 빠짐. 0.9배 + 22px floor로
+  // 작은 데이터 셀까지 업스케일 OCR 대상에 포함.
+  const float SMALL_H = avgLineHeight_ > 0.0f
+                            ? std::max(avgLineHeight_ * 0.9f, 22.0f)
+                            : 24.0f;
 
   auto result = lines;
-  int passes = 0;
-
-  // Phase 1: 최대 MAX_PASSES개까지 개별 2× 업스케일 재OCR
-  std::vector<int> remaining; // MAX_PASSES 초과분 인덱스
+  std::vector<int> small;
   for (int i = 0; i < static_cast<int>(result.size()); ++i) {
-    if (result[i].h >= SMALL_H)
-      continue;
-
-    if (passes >= MAX_PASSES) {
-      remaining.push_back(i);
-      continue;
+    if (result[i].h < SMALL_H) {
+      small.push_back(i);
     }
-
-    const auto &l = result[i];
-    const int cx = std::max(0, static_cast<int>(l.x) - PAD);
-    const int cy = std::max(0, static_cast<int>(l.y) - PAD);
-    const int cr = std::min(static_cast<int>(l.x + l.w) + PAD, width);
-    const int cb = std::min(static_cast<int>(l.y + l.h) + PAD, height);
-    const int cw = cr - cx, ch = cb - cy;
-    if (cw <= 0 || ch <= 0)
-      continue;
-
-    const int upW = cw * 2, upH = ch * 2;
-    std::vector<uint8_t> up(static_cast<size_t>(upW) * upH * 4);
-    for (int uy = 0; uy < upH; ++uy) {
-      for (int ux = 0; ux < upW; ++ux) {
-        const uint8_t *s =
-            pixels + (ptrdiff_t)(cy + uy / 2) * stride + (cx + ux / 2) * 4;
-        uint8_t *d = up.data() + (ptrdiff_t)uy * upW * 4 + ux * 4;
-        d[0] = s[0];
-        d[1] = s[1];
-        d[2] = s[2];
-        d[3] = s[3];
-      }
-    }
-
-    auto reLines = recognize_text(up.data(), upW, upH, upW * 4);
-    ++passes;
-    if (reLines.empty())
-      continue;
-
-    for (auto &rl : reLines) {
-      rl.x = cx + rl.x * 0.5f;
-      rl.y = cy + rl.y * 0.5f;
-      rl.w *= 0.5f;
-      rl.h *= 0.5f;
-    }
-    result[i] = reLines[0];
   }
 
-  // Phase 2: 초과분 → union bbox 2× 업스케일 1회 batch OCR
-  if (!remaining.empty()) {
-    int ux0 = width, uy0 = height, ux1 = 0, uy1 = 0;
-    for (int idx : remaining) {
-      const auto &l = result[idx];
-      ux0 = std::min(ux0, std::max(0, static_cast<int>(l.x) - PAD));
-      uy0 = std::min(uy0, std::max(0, static_cast<int>(l.y) - PAD));
-      ux1 = std::max(ux1, std::min(static_cast<int>(l.x + l.w) + PAD, width));
-      uy1 = std::max(uy1, std::min(static_cast<int>(l.y + l.h) + PAD, height));
-    }
-    const int ucw = ux1 - ux0, uch = uy1 - uy0;
+  if (small.empty())
+    return result;
 
-    // 8 MP 이하 가드 (안전)
-    if (ucw > 0 && uch > 0 &&
-        static_cast<size_t>(ucw * 2) * (uch * 2) <= 8000000u) {
-      const int bW = ucw * 2, bH = uch * 2;
+  // [메모장 PII 회귀 수정 — 0da5b0c 동작 복원]
+  //   작은 라인 앞 MAX_INDIVIDUAL개는 "개별 crop + 2× 업스케일 재OCR + 무조건 교체"로
+  //   처리한다. 0445836 이후 모든 작은 라인을 Union batch로 묶어 IoU≥threshold일 때만
+  //   교체하도록 바뀌었는데, 메모장 주소 한 줄 같은 단일/소수 라인은 batch 재OCR이
+  //   라인을 다르게 분할해 IoU 미달 → 교체 누락 → 작은 글씨를 못 읽은 원본이 그대로
+  //   남아 detect_pii가 ADDRESS로 분류 못 하는 회귀가 있었다. 개별 무조건 교체는 그
+  //   줄을 통째로 재OCR한 결과로 항상 갈아끼워 신뢰도가 높다. 업스케일은 2×(3× nearest
+  //   는 메모장의 sharp/하드엣지 글리프에 계단현상이 심해 불리). 초과분(>6)만 아래
+  //   기존 batch/split 경로로 넘긴다(다수 라인 표 케이스 성능/정확도 유지).
+  {
+    static constexpr int MAX_INDIVIDUAL = 6;
+    static constexpr int IND_UP = 2;
+    static constexpr float IND_INV = 0.5f;
+    std::vector<int> overflow;
+    int passes = 0;
+    for (int idx : small) {
+      if (passes >= MAX_INDIVIDUAL) {
+        overflow.push_back(idx);
+        continue;
+      }
+      const auto &l = result[idx];
+      const int cx = std::max(0, static_cast<int>(l.x) - PAD);
+      const int cy = std::max(0, static_cast<int>(l.y) - PAD);
+      const int cr = std::min(static_cast<int>(l.x + l.w) + PAD, width);
+      const int cb = std::min(static_cast<int>(l.y + l.h) + PAD, height);
+      const int cw = cr - cx, ch = cb - cy;
+      if (cw <= 0 || ch <= 0)
+        continue;
+      const int upW = cw * IND_UP, upH = ch * IND_UP;
+      std::vector<uint8_t> up(static_cast<size_t>(upW) * upH * 4);
+      for (int uy = 0; uy < upH; ++uy) {
+        for (int ux = 0; ux < upW; ++ux) {
+          const uint8_t *s = pixels +
+                             (ptrdiff_t)(cy + uy / IND_UP) * stride +
+                             (cx + ux / IND_UP) * 4;
+          uint8_t *d = up.data() + (ptrdiff_t)uy * upW * 4 + ux * 4;
+          d[0] = s[0];
+          d[1] = s[1];
+          d[2] = s[2];
+          d[3] = s[3];
+        }
+      }
+      auto reLines = recognize_text(up.data(), upW, upH, upW * 4);
+      ++passes;
+      if (reLines.empty())
+        continue;
+      for (auto &rl : reLines) {
+        rl.x = cx + rl.x * IND_INV;
+        rl.y = cy + rl.y * IND_INV;
+        rl.w *= IND_INV;
+        rl.h *= IND_INV;
+      }
+      result[idx] = reLines[0]; // 무조건 교체
+    }
+    small.swap(overflow); // 초과분만 아래 batch 경로로
+  }
+
+  if (small.empty())
+    return result;
+
+  // 1단계: Union BBox 계산
+  const UnionBBox ub = compute_union_bbox(result, small, PAD, width, height);
+  const int ucw = ub.x1 - ub.x0, uch = ub.y1 - ub.y0;
+  if (ucw <= 0 || uch <= 0)
+    return result;
+
+  const size_t batchPx =
+      static_cast<size_t>(ucw * kMpUpscale) * (uch * kMpUpscale);
+  const float unionArea = static_cast<float>(ucw * uch);
+  const bool isSparse =
+      (unionArea > 0.0f) && (ub.sumArea / unionArea < SC_SPARSE_THRESHOLD);
+
+  // 2단계: 안전 가드 - 배치 픽셀 임계치 초과이거나 sparse 레이아웃이면
+  // split_batch_multipass로 분할 폴백.
+  if (batchPx > SC_MAX_OCR_BATCH_PX || isSparse) {
+    return split_batch_multipass(result, small, pixels, width, height, stride);
+  }
+
+  // 3단계: 기본 밀집/안전 단일 Batch OCR (kMpUpscale× nearest-neighbor)
+  const int bW = ucw * kMpUpscale, bH = uch * kMpUpscale;
+  std::vector<uint8_t> batch(static_cast<size_t>(bW) * bH * 4);
+  for (int by = 0; by < bH; ++by) {
+    for (int bx = 0; bx < bW; ++bx) {
+      const uint8_t *s = pixels +
+                         (ptrdiff_t)(ub.y0 + by / kMpUpscale) * stride +
+                         (ub.x0 + bx / kMpUpscale) * 4;
+      uint8_t *d = batch.data() + (ptrdiff_t)by * bW * 4 + bx * 4;
+      d[0] = s[0];
+      d[1] = s[1];
+      d[2] = s[2];
+      d[3] = s[3];
+    }
+  }
+
+  auto batchLines = recognize_text(batch.data(), bW, bH, bW * 4);
+  // 빈 결과면 IoU 매칭이 no-op이 되어 result[idx] 갱신을 건너뛰는 것과
+  // 동일하므로 명시적으로 조기 반환한다. (split_batch_multipass와 정책 통일)
+  if (batchLines.empty())
+    return result;
+
+  apply_iou_match(result, small, batchLines, ub.x0, ub.y0);
+  return result;
+}
+
+std::vector<SecureCastOcrLine> SecureCastOcrEngine::split_batch_multipass(
+    const std::vector<SecureCastOcrLine> &lines,
+    const std::vector<int> &smallIndices, const uint8_t *pixels, int width,
+    int height, int stride) {
+  static constexpr int PAD = 4;
+  auto result = lines;
+  if (smallIndices.empty())
+    return result;
+
+  // 1단계: Y축 좌표 기준 공간 정렬
+  std::vector<int> sortedSmall = smallIndices;
+  std::sort(sortedSmall.begin(), sortedSmall.end(),
+            [&](int a, int b) { return result[a].y < result[b].y; });
+
+  // 2단계: 공간적 N분할 (최대 3분할)
+  int numSplits = 3;
+  size_t itemsPerSplit = (sortedSmall.size() + numSplits - 1) / numSplits;
+
+  for (int s = 0; s < numSplits; ++s) {
+    size_t start = s * itemsPerSplit;
+    if (start >= sortedSmall.size())
+      break;
+    size_t end = std::min(sortedSmall.size(), start + itemsPerSplit);
+
+    std::vector<int> subset(sortedSmall.begin() + start,
+                            sortedSmall.begin() + end);
+    if (subset.empty())
+      continue;
+
+    // 3단계: 서브셋에 대한 union bbox 계산
+    const UnionBBox ub = compute_union_bbox(result, subset, PAD, width, height);
+    const int ucw = ub.x1 - ub.x0, uch = ub.y1 - ub.y0;
+    if (ucw <= 0 || uch <= 0)
+      continue;
+
+    const float subsetArea = static_cast<float>(ucw * uch);
+    const bool subsetSparse =
+        (subsetArea > 0.0f) && (ub.sumArea / subsetArea < SC_SPARSE_THRESHOLD);
+
+    // 4단계: 계층적 sparse fallback
+    // 서브셋 내 원소가 1개이거나, 분할 후에도 여전히 sparse한 경우 개별 crop
+    // OCR로 핀포인트 fallback
+    if (subset.size() == 1 || subsetSparse) {
+      for (int idx : subset) {
+        const auto &l = result[idx];
+        const int cx = std::max(0, static_cast<int>(l.x) - PAD);
+        const int cy = std::max(0, static_cast<int>(l.y) - PAD);
+        const int cr = std::min(static_cast<int>(l.x + l.w) + PAD, width);
+        const int cb = std::min(static_cast<int>(l.y + l.h) + PAD, height);
+        const int cw = cr - cx, ch = cb - cy;
+        if (cw <= 0 || ch <= 0)
+          continue;
+
+        const int upW = cw * kMpUpscale, upH = ch * kMpUpscale;
+        std::vector<uint8_t> up(static_cast<size_t>(upW) * upH * 4);
+        for (int uy = 0; uy < upH; ++uy) {
+          for (int ux = 0; ux < upW; ++ux) {
+            const uint8_t *src = pixels +
+                                 (ptrdiff_t)(cy + uy / kMpUpscale) * stride +
+                                 (cx + ux / kMpUpscale) * 4;
+            uint8_t *d = up.data() + (ptrdiff_t)uy * upW * 4 + ux * 4;
+            d[0] = src[0];
+            d[1] = src[1];
+            d[2] = src[2];
+            d[3] = src[3];
+          }
+        }
+
+        auto reLines = recognize_text(up.data(), upW, upH, upW * 4);
+        if (reLines.empty())
+          continue;
+
+        for (auto &rl : reLines) {
+          rl.x = cx + rl.x * kMpUpscaleInv;
+          rl.y = cy + rl.y * kMpUpscaleInv;
+          rl.w *= kMpUpscaleInv;
+          rl.h *= kMpUpscaleInv;
+        }
+        result[idx] = reLines[0];
+      }
+    } else {
+      // 배치 픽셀 임계치 초과 시 최종 안전 장치(이 서브셋 OCR 포기).
+      if (static_cast<size_t>(ucw * kMpUpscale) * (uch * kMpUpscale) >
+          SC_MAX_OCR_BATCH_PX)
+        continue;
+
+      const int bW = ucw * kMpUpscale, bH = uch * kMpUpscale;
       std::vector<uint8_t> batch(static_cast<size_t>(bW) * bH * 4);
       for (int by = 0; by < bH; ++by) {
         for (int bx = 0; bx < bW; ++bx) {
-          const uint8_t *s =
-              pixels + (ptrdiff_t)(uy0 + by / 2) * stride + (ux0 + bx / 2) * 4;
+          const uint8_t *s = pixels +
+                             (ptrdiff_t)(ub.y0 + by / kMpUpscale) * stride +
+                             (ub.x0 + bx / kMpUpscale) * 4;
           uint8_t *d = batch.data() + (ptrdiff_t)by * bW * 4 + bx * 4;
           d[0] = s[0];
           d[1] = s[1];
@@ -1555,43 +1952,10 @@ std::vector<SecureCastOcrLine> SecureCastOcrEngine::multipass_small_text(
       }
 
       auto batchLines = recognize_text(batch.data(), bW, bH, bW * 4);
+      if (batchLines.empty())
+        continue;
 
-      // IoU≥0.4 기준으로 batch 결과를 remaining 라인에 매칭
-      for (int idx : remaining) {
-        const auto &orig = result[idx];
-        float bestIou = 0.4f;
-        int bestJ = -1;
-        for (int j = 0; j < static_cast<int>(batchLines.size()); ++j) {
-          const auto &bl = batchLines[j];
-          // batch 좌표 → 원본 좌표
-          const float bx = ux0 + bl.x * 0.5f;
-          const float by = uy0 + bl.y * 0.5f;
-          const float bw = bl.w * 0.5f, bh = bl.h * 0.5f;
-          const float ix = std::max(orig.x, bx);
-          const float iy = std::max(orig.y, by);
-          const float ix2 = std::min(orig.x + orig.w, bx + bw);
-          const float iy2 = std::min(orig.y + orig.h, by + bh);
-          if (ix2 <= ix || iy2 <= iy)
-            continue;
-          const float inter = (ix2 - ix) * (iy2 - iy);
-          const float uni = orig.w * orig.h + bw * bh - inter;
-          const float iou = uni > 0.0f ? inter / uni : 0.0f;
-          if (iou > bestIou) {
-            bestIou = iou;
-            bestJ = j;
-          }
-        }
-        if (bestJ >= 0) {
-          const auto &bl = batchLines[bestJ];
-          SecureCastOcrLine mapped;
-          mapped.text = bl.text;
-          mapped.x = ux0 + bl.x * 0.5f;
-          mapped.y = uy0 + bl.y * 0.5f;
-          mapped.w = bl.w * 0.5f;
-          mapped.h = bl.h * 0.5f;
-          result[idx] = mapped;
-        }
-      }
+      apply_iou_match(result, subset, batchLines, ub.x0, ub.y0);
     }
   }
 

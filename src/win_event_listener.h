@@ -28,6 +28,7 @@
 
 #include <windows.h>
 #include <atomic>
+#include <cstdint>
 #include <thread>
 
 class WinEventListener {
@@ -46,6 +47,14 @@ public:
         return m_needRescan.exchange(false, std::memory_order_acq_rel);
     }
 
+    // [Freeze T04] 현재 윈도우 이벤트 세대. 어떤 top-level 창의 생성/소멸/표시/
+    // 숨김/z-order/포그라운드/위치 변화가 있을 때마다 증가한다. VisibleSubrectsCache
+    // 가 캐시 유효성 판정에 사용 — 세대가 달라진 캐시 항목은 stale로 간주해 재계산.
+    // 프로세스 전역(단일 인스턴스 가정과 동일). 어느 스레드에서나 호출 가능.
+    static uint64_t eventGeneration() {
+        return s_eventGeneration.load(std::memory_order_acquire);
+    }
+
 private:
     void run();
 
@@ -56,13 +65,20 @@ private:
     std::thread       m_thread;
     std::atomic<bool> m_running{false};
     DWORD             m_threadId    = 0;
-    HWINEVENTHOOK     m_hookGroup1  = nullptr; // SHOW / HIDE / DESTROY
+    HWINEVENTHOOK     m_hookGroup1  = nullptr; // CREATE/DESTROY/SHOW/HIDE/REORDER
     HWINEVENTHOOK     m_hookGroup2  = nullptr; // SYSTEM_FOREGROUND (포그라운드 전환)
+    // [Freeze T04] LOCATIONCHANGE(창 위치 이동). 캐시 무효화(세대 증가)에만 쓰고
+    // 풀 스캔 rescan은 트리거하지 않는다 — 기존 설계가 CPU 때문에 피한 "위치
+    // 이동마다 풀 스캔"을 재발시키지 않으면서 stale 노출 구멍만 닫기 위함.
+    HWINEVENTHOOK     m_hookGroup3  = nullptr; // EVENT_OBJECT_LOCATIONCHANGE
 
     std::atomic<bool> m_needRescan{false};
 
     // 콜백에서 도달하기 위한 스레드별 self 포인터 (한 프로세스에 instance 1개 가정).
     static std::atomic<WinEventListener*> s_active;
+
+    // [Freeze T04] 이벤트 세대 카운터 (전역). eventProc에서 증가.
+    static std::atomic<uint64_t> s_eventGeneration;
 };
 
 #endif // _WIN32

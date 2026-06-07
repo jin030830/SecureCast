@@ -3,6 +3,7 @@ cmake_minimum_required(VERSION 3.28)
 # test_pii 실행 파일
 add_executable(test_pii
     test_detect_pii.cpp
+    obs_stub.cpp
     ../src/ocr-engine.cpp
 )
 
@@ -10,6 +11,12 @@ target_compile_features(test_pii PRIVATE cxx_std_17)
 
 # SC_ENABLE_TESTS 매크로로 detect_pii_for_test 진입점 활성화
 target_compile_definitions(test_pii PRIVATE SC_ENABLE_TESTS)
+
+# ocr-engine.cpp 가 <obs-module.h> 를 포함하므로 OBS SDK 헤더 경로가 필요하다.
+# obs.dll 런타임 의존을 피하기 위해 라이브러리는 링크하지 않고 헤더 경로만
+# 가져온다 — 링크에 필요한 blog() 심볼은 obs_stub.cpp 가 대체 정의한다.
+target_include_directories(test_pii PRIVATE
+    $<TARGET_PROPERTY:OBS::libobs,INTERFACE_INCLUDE_DIRECTORIES>)
 
 # RE2 링크 (루트 CMakeLists에서 이미 탐색됨)
 if(TARGET re2::re2)
@@ -71,13 +78,46 @@ add_test(
 # ──────────────────────────────────────────────
 add_executable(test_tracker
     test_tracker.cpp
+    obs_stub.cpp
     ../src/visual-tracker.cpp
 )
 
 target_compile_features(test_tracker PRIVATE cxx_std_17)
 
+# visual-tracker.cpp 가 <util/base.h> 를 포함하므로 OBS SDK 헤더 경로가 필요하다
+# (test_pii 와 동일하게 헤더만, 링크 없이 — blog() 는 obs_stub.cpp 가 정의).
+target_include_directories(test_tracker PRIVATE
+    $<TARGET_PROPERTY:OBS::libobs,INTERFACE_INCLUDE_DIRECTORIES>)
+
+# [Window anchor] visual-tracker.cpp 가 DwmGetWindowAttribute 호출 → dwmapi link 필요.
+if(WIN32)
+    target_link_libraries(test_tracker PRIVATE dwmapi)
+endif()
+
 add_test(
     NAME tracker
     COMMAND test_tracker
     WORKING_DIRECTORY "$<TARGET_FILE_DIR:test_tracker>"
+)
+
+# ──────────────────────────────────────────────
+# [T15] test_steam_parser: Valve VDF/ACF 파서 단위 테스트
+# ──────────────────────────────────────────────
+add_executable(test_steam_parser
+    test_steam_parser.cpp
+    obs_stub.cpp
+    ../src/steam_parser.cpp
+)
+
+target_compile_features(test_steam_parser PRIVATE cxx_std_17)
+
+# steam_parser.cpp 가 <obs.h> 를 include (blog 사용) → OBS SDK 헤더 경로 필요.
+# 런타임 라이브러리는 링크 안 함 — blog 심볼은 obs_stub.cpp 가 정의.
+target_include_directories(test_steam_parser PRIVATE
+    $<TARGET_PROPERTY:OBS::libobs,INTERFACE_INCLUDE_DIRECTORIES>)
+
+add_test(
+    NAME steam_parser
+    COMMAND test_steam_parser
+    WORKING_DIRECTORY "$<TARGET_FILE_DIR:test_steam_parser>"
 )

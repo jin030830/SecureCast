@@ -31,6 +31,7 @@
 # (프로젝트 문서 — 빌드와 무관하지만 git에 포함시키고 싶음)
 !/SecureCast_통합_구현가이드.md
 !/중간보고서_final.md
+!/docs
 
 # Exclude lock files
 # (의존성 잠금 파일은 자동 생성, 머지 컨플릭트만 유발)
