@@ -30,40 +30,47 @@
 
 설치 방법은 두 가지입니다. 대부분은 **방법 A(미리 빌드된 파일 받기)** 면 충분합니다.
 
-### 방법 A — 배포 파일(Release) 받아서 설치 (권장)
+### 방법 A — — GitHub Actions 빌드 결과물(아티팩트) 받아서 설치 (권장)
+아직 정식 Release 가 없으므로, GitHub Actions 가 만든 빌드 결과물(아티팩트)을 받아 OBS 설치 폴더에 직접 복사하는 방식으로 설치합니다. 아래 경로의 기준이 되는 OBS 설치 폴더는 기본 설치 시 C:\Program Files\obs-studio\ 이며, 이 글에서는 이를 obs-studio\ 로 줄여 씁니다.
 
-1. GitHub 저장소의 **Releases** 페이지로 이동합니다:
-   `https://github.com/jin030830/SecureCast/releases`
-2. 최신 버전의 `securecast-windows-x64.zip` 을 내려받습니다.
-3. 압축을 풀면 아래와 같은 `securecast` 폴더가 나옵니다:
-   ```
-   securecast/
-    ├─ bin/64bit/
-    │    ├─ securecast.dll      ← 플러그인 본체
-    │    ├─ re2.dll             ← 정규식 라이브러리
-    │    └─ absl_*.dll          ← re2가 쓰는 런타임
-    └─ data/
-         ├─ locale/en-US.ini
-         ├─ securecast_blur.effect
-         └─ downsample.effect
-   ```
-4. 이 `securecast` 폴더를 **통째로** 아래 위치에 복사합니다:
-   ```
-   C:\ProgramData\obs-studio\plugins\
-   ```
-   > `ProgramData`는 숨김 폴더입니다. 탐색기 주소창에 `%ProgramData%\obs-studio\plugins` 를
-   > 붙여넣으면 바로 열립니다. 최종 경로는
-   > `C:\ProgramData\obs-studio\plugins\securecast\bin\64bit\securecast.dll` 모양이 되어야 합니다.
-5. OBS를 **완전히 종료했다가 다시 실행**합니다.
+GitHub 저장소의 Actions 탭으로 이동합니다: https://github.com/jin030830/SecureCast/actions
 
-> 💡 `bin/64bit` 안에 `re2.dll`과 `absl_*.dll`이 함께 없으면 OBS 시작 시
-> "Failed to load plugin" 오류가 납니다. 이 DLL들이 같이 들어갔는지 꼭 확인하세요.
-> (백신이 경고할 수 있습니다 — 아래 *6. 보안·백신 안내* 참고)
+성공한(초록 체크) 최신 빌드(Build Project 워크플로)를 클릭하고, 실행 페이지 맨 아래 Artifacts 에서 securecast-<버전>-windows-x64-<커밋해시> 를 내려받습니다.
+
+GitHub가 아티팩트를 zip으로 한 번 더 감싸므로, 받은 zip 안의 zip까지 두 번 풀어야 할 수 있습니다.
+
+압축을 끝까지 풀면 아래와 같은 securecast 폴더가 나옵니다:
+
+securecast/
+ ├─ bin/64bit/
+ │    ├─ securecast.dll        ← 플러그인 본체 (dll)
+ │    ├─ re2.dll               ← 정규식 런타임 (dll)
+ │    └─ abseil_dll.dll        ← re2가 쓰는 런타임 (dll)
+ └─ data/
+      ├─ securecast_blur.effect   ← 셰이더 (effect)
+      ├─ downsample.effect        ← 셰이더 (effect)
+      └─ locale/
+           └─ en-US.ini           ← 언어 파일 (ini)
+위 파일들을 OBS 설치 폴더 안의 아래 위치에 각각 복사합니다.
+
+① 플러그인 dll → obs-studio\obs-plugins\64bit\ securecast.dll 을 이 폴더에 복사합니다.
+
+② effect 파일 → obs-studio\data\obs-plugins\securecast\ obs-studio\data\obs-plugins\ 안에 securecast 폴더를 새로 만들고, 그 안에 securecast_blur.effect 와 downsample.effect 를 복사합니다. → 이렇게 하면 obs-studio\data\obs-plugins\securecast\ 폴더가 새로 생깁니다.
+
+③ 런타임 dll → obs-studio\bin\64bit\ re2.dll 과 abseil_dll.dll 을 이 폴더에 복사합니다. (OBS가 이 DLL들을 찾지 못하면 플러그인 로딩에 실패합니다. securecast.dll 도 함께 넣어 두면 더 안전합니다.)
+
+④ ini(언어) 파일 → 아래 두 폴더 모두에 복사 en-US.ini 를 다음 두 곳 모두에 복사합니다.
+
+obs-studio\obs-plugins\64bit\locales\
+obs-studio\obs-plugins\data\obs-studio\locale\
+OBS를 완전히 종료했다가 다시 실행합니다.
+
+💡 re2.dll 과 abseil_dll.dll(위 ③ 런타임 dll)이 빠지면 OBS 시작 시 "Failed to load plugin" 오류가 납니다. 이 두 DLL을 꼭 넣었는지 확인하세요. 그래도 안 되면 이 두 DLL을 obs-studio\obs-plugins\64bit\ 의 securecast.dll 옆에도 같이 넣어 보세요. (백신이 경고할 수 있습니다 — 아래 8. 보안·백신 안내 참고)
 
 ### 방법 B — 직접 빌드해서 설치
 
 소스를 직접 확인하고 빌드하고 싶다면 *7. 개발 환경 / 빌드 가이드* 를 따르세요.
-로컬 빌드는 위 설치 경로로 **자동 배포**되므로 별도 복사가 필요 없습니다.
+로컬 빌드는 `%ProgramData%\obs-studio\plugins\securecast\` 로 **자동 배포**되므로 별도 복사가 필요 없습니다.
 
 ---
 
